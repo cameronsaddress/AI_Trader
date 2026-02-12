@@ -1,0 +1,238 @@
+services:
+  backend:
+    build:
+      context: ../
+      dockerfile: apps/backend/Dockerfile
+      target: installer
+    ports:
+      - "5114:5114"
+    environment:
+      - NODE_ENV=development
+      - PORT=5114
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/ai_trader
+      - REDIS_URL=redis://redis:6379
+      - CONTROL_PLANE_TOKEN=${CONTROL_PLANE_TOKEN}
+      - LIVE_ORDER_POSTING_ENABLED=${LIVE_ORDER_POSTING_ENABLED:-false}
+      - PRIVATE_KEY=${PRIVATE_KEY:-}
+      - POLY_PRIVATE_KEY=${POLY_PRIVATE_KEY:-}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS:-}
+      - POLY_FUNDER_ADDRESS=${POLY_FUNDER_ADDRESS:-}
+      - POLY_RPC_URL=${POLY_RPC_URL:-}
+      - POLY_AUTO_REDEEM_ENABLED=${POLY_AUTO_REDEEM_ENABLED:-false}
+      - POLY_SETTLEMENT_POLL_MS=${POLY_SETTLEMENT_POLL_MS:-30000}
+      - POLY_REDEEM_RETRY_COOLDOWN_MS=${POLY_REDEEM_RETRY_COOLDOWN_MS:-60000}
+      - POLY_MIN_REDEEMABLE_SHARES=${POLY_MIN_REDEEMABLE_SHARES:-0.01}
+      - POLY_SETTLEMENT_STALE_MS=${POLY_SETTLEMENT_STALE_MS:-3600000}
+      - POLY_COLLATERAL_TOKEN_ADDRESS=${POLY_COLLATERAL_TOKEN_ADDRESS:-}
+      - POLY_CONDITIONAL_TOKENS_ADDRESS=${POLY_CONDITIONAL_TOKENS_ADDRESS:-}
+      - INTELLIGENCE_GATE_ENABLED=${INTELLIGENCE_GATE_ENABLED:-true}
+      - INTELLIGENCE_GATE_MAX_STALENESS_MS=${INTELLIGENCE_GATE_MAX_STALENESS_MS:-3000}
+      - INTELLIGENCE_GATE_MIN_MARGIN=${INTELLIGENCE_GATE_MIN_MARGIN:-0}
+    env_file:
+      - ../apps/backend/.env
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ../apps/backend:/app/apps/backend
+      - ../packages:/app/packages
+    command: npm run dev --workspace=@ai-trader/backend
+
+  frontend:
+    build:
+      context: ../
+      dockerfile: apps/frontend/Dockerfile
+      target: installer
+    ports:
+      - "3112:3112"
+    environment:
+      - VITE_API_URL=http://100.83.153.43:5114
+    volumes:
+      - ../apps/frontend:/app/apps/frontend
+      - ../packages:/app/packages
+    command: npm run dev --workspace=@ai-trader/frontend
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ai_trader
+    ports:
+      - "5544:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6491:6379"
+    volumes:
+      - redis_data:/data
+
+  ml-service:
+    build:
+      context: ../apps/ml-service
+      dockerfile: Dockerfile
+    ports:
+      - "8112:8112"
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    volumes:
+      - ../apps/ml-service:/app
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8112 --reload
+
+  # --- Swarm Strategy Containers ---
+
+  arb-scanner-btc:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=BTC_15M
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+    dns:
+      - 8.8.8.8
+    depends_on:
+      - redis
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - /usr/src/app/target
+    command: cargo run
+
+  arb-scanner-eth:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=ETH_15M
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+    dns:
+      - 8.8.8.8
+    depends_on:
+      - redis
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - /usr/src/app/target
+    command: cargo run
+
+  arb-scanner-sol:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=SOL_15M
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+    dns:
+      - 8.8.8.8
+    depends_on:
+      - redis
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - /usr/src/app/target
+    command: cargo run
+
+  arb-scanner-cex:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=CEX_ARB
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+    dns:
+      - 8.8.8.8
+    depends_on:
+      - redis
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - /usr/src/app/target
+    command: cargo run
+
+  arb-scanner-copy:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=COPY_BOT
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+    dns:
+      - 8.8.8.8
+    depends_on:
+      - redis
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - /usr/src/app/target
+    command: cargo run
+
+  arb-scanner-atomic:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=ATOMIC_ARB
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+    dns:
+      - 8.8.8.8
+    depends_on:
+      - redis
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - /usr/src/app/target
+    command: cargo run
+
+  arb-scanner-obi:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=OBI_SCALPER
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+    dns:
+      - 8.8.8.8
+    depends_on:
+      - redis
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - /usr/src/app/target
+    command: cargo run
+
+volumes:
+  postgres_data:
+  redis_data:

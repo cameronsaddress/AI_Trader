@@ -1,0 +1,33 @@
+{
+    "name": "ai-trader-v2",
+    "version": "2.0.0",
+    "private": true,
+    "description": "Institutional-grade AI cryptocurrency trading platform",
+    "workspaces": [
+        "apps/*",
+        "packages/*"
+    ],
+    "scripts": {
+        "dev:backend": "npm run dev --workspace=@ai-trader/backend",
+        "dev:frontend": "npm run dev --workspace=@ai-trader/frontend",
+        "build": "npm run build --workspaces",
+        "lint": "eslint . --ext .ts,.tsx",
+        "test": "jest",
+        "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules"
+    },
+    "devDependencies": {
+        "@types/node": "^20.11.19",
+        "@types/jest": "^29.5.12",
+        "typescript": "^5.3.3",
+        "eslint": "^8.56.0",
+        "jest": "^29.7.0",
+        "ts-jest": "^29.1.2",
+        "ts-node": "^10.9.2",
+        "prettier": "^3.2.5",
+        "turbo": "^1.12.4"
+    },
+    "engines": {
+        "node": ">=20.0.0"
+    },
+    "packageManager": "npm@10.2.4"
+}
