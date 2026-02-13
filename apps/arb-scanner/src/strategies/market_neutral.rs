@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
+use uuid::Uuid;
 
 use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
@@ -214,6 +215,7 @@ fn parse_coinbase_message_sequence(payload: &str) -> Option<u64> {
 
 #[derive(Debug, Clone)]
 struct Position {
+    execution_id: String,
     entry_price: f64,
     size: f64,
     timestamp_ms: i64,
@@ -709,7 +711,9 @@ impl Strategy for MarketNeutralStrategy {
                                     params.max_position_fraction,
                                 ).await;
                                 if size > 0.0 {
+                                    let execution_id = Uuid::new_v4().to_string();
                                     let preview_msg = serde_json::json!({
+                                        "execution_id": execution_id,
                                         "market": format!("Long {}", self.asset),
                                         "side": "LIVE_DRY_RUN",
                                         "price": book.yes.best_ask,
@@ -822,7 +826,9 @@ impl Strategy for MarketNeutralStrategy {
                             }
 
                             let net_return = if pos.size > 0.0 { pnl / pos.size } else { 0.0 };
+                            let execution_id = pos.execution_id.clone();
                             let pnl_msg = serde_json::json!({
+                                "execution_id": execution_id,
                                 "strategy": strategy_id,
                                 "variant": variant.as_str(),
                                 "pnl": pnl,
@@ -869,22 +875,28 @@ impl Strategy for MarketNeutralStrategy {
                                 continue;
                             }
                             let mut accepted = false;
+                            let mut execution_id: Option<String> = None;
                             {
                                 let mut pos_lock = self.open_position.write().await;
                                 if pos_lock.is_none() {
+                                    let id = Uuid::new_v4().to_string();
                                     *pos_lock = Some(Position {
+                                        execution_id: id.clone(),
                                         entry_price,
                                         size,
                                         timestamp_ms: now_ms,
                                     });
                                     accepted = true;
+                                    execution_id = Some(id);
                                 }
                             }
 
                             if accepted {
                                 last_entry_ms = now_ms;
                                 trades_this_window = trades_this_window.saturating_add(1);
+                                let exec_id = execution_id.unwrap_or_else(|| Uuid::new_v4().to_string());
                                 let exec_msg = serde_json::json!({
+                                    "execution_id": exec_id,
                                     "market": format!("Long {}", self.asset),
                                     "side": "ENTRY",
                                     "price": entry_price,

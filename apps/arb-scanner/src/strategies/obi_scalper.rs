@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
+use uuid::Uuid;
 
 use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
@@ -106,6 +107,7 @@ enum PositionSide {
 
 #[derive(Debug, Clone)]
 struct Position {
+    execution_id: String,
     side: PositionSide,
     entry_mid: f64,
     size: f64,
@@ -674,7 +676,9 @@ impl Strategy for ObiScalperStrategy {
                                     MAX_POSITION_FRACTION,
                                 ).await;
                                 if size > 0.0 {
+                                    let execution_id = Uuid::new_v4().to_string();
                                     let dry_run_msg = serde_json::json!({
+                                        "execution_id": execution_id,
                                         "market": "OBI Scalper",
                                         "side": if matches!(side, PositionSide::Long) { "LIVE_DRY_RUN_LONG" } else { "LIVE_DRY_RUN_SHORT" },
                                         "price": entry_price,
@@ -759,7 +763,9 @@ impl Strategy for ObiScalperStrategy {
                                     let new_bankroll = settle_sim_position_for_strategy(&mut conn, "OBI_SCALPER", pos.size, pnl).await;
 
                                     let net_return = if pos.size > 0.0 { pnl / pos.size } else { 0.0 };
+                                    let execution_id = pos.execution_id.clone();
                                     let pnl_msg = serde_json::json!({
+                                        "execution_id": execution_id.clone(),
                                         "strategy": "OBI_SCALPER",
                                         "variant": variant.as_str(),
                                         "pnl": pnl,
@@ -787,6 +793,7 @@ impl Strategy for ObiScalperStrategy {
                                     let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
 
                                     let exec_msg = serde_json::json!({
+                                        "execution_id": execution_id,
                                         "market": "OBI Scalper",
                                         "side": "CLOSE",
                                         "price": mark_price,
@@ -837,7 +844,9 @@ impl Strategy for ObiScalperStrategy {
                                 continue;
                             }
 
+                            let execution_id = Uuid::new_v4().to_string();
                             open_position = Some(Position {
+                                execution_id: execution_id.clone(),
                                 side,
                                 entry_mid: entry_price,
                                 size,
@@ -846,6 +855,7 @@ impl Strategy for ObiScalperStrategy {
                             });
 
                             let exec_msg = serde_json::json!({
+                                "execution_id": execution_id,
                                 "market": "OBI Scalper",
                                 "side": if matches!(side, PositionSide::Long) { "ENTRY_LONG" } else { "ENTRY_SHORT" },
                                 "price": entry_price,

@@ -6,6 +6,7 @@ use redis::AsyncCommands;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
+use uuid::Uuid;
 
 use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
@@ -37,6 +38,7 @@ const MAX_LEG_PRICE: f64 = 0.99;
 
 #[derive(Debug, Clone)]
 struct PendingPaperTrade {
+    execution_id: String,
     entry_ts_ms: i64,
     notional_usd: f64,
     ask_sum: f64,
@@ -280,7 +282,9 @@ impl Strategy for AtomicArbStrategy {
                                     let yes_notional = shares * book.yes.best_ask;
                                     let no_notional = shares * book.no.best_ask;
                                     let expected_pnl = investment_usd * net_edge;
+                                    let execution_id = Uuid::new_v4().to_string();
                                     let dry_run_msg = serde_json::json!({
+                                        "execution_id": execution_id,
                                         "market": "Atomic Arb",
                                         "side": "LIVE_DRY_RUN",
                                         "price": ask_sum,
@@ -355,8 +359,10 @@ impl Strategy for AtomicArbStrategy {
 
                             let shares = investment_usd / ask_sum;
                             let expected_profit = investment_usd * net_edge;
+                            let execution_id = Uuid::new_v4().to_string();
 
                             pending_settlements.push(PendingPaperTrade {
+                                execution_id: execution_id.clone(),
                                 entry_ts_ms: now_ms,
                                 notional_usd: investment_usd,
                                 ask_sum,
@@ -364,6 +370,7 @@ impl Strategy for AtomicArbStrategy {
                             });
 
                             let exec_msg = serde_json::json!({
+                                "execution_id": execution_id,
                                 "market": "Atomic Arb",
                                 "side": "ENTRY",
                                 "price": ask_sum,
@@ -397,8 +404,10 @@ impl Strategy for AtomicArbStrategy {
                             let settled_pnl = pending.notional_usd * pending.net_edge;
                             let new_bankroll = settle_sim_position_for_strategy(&mut conn, "ATOMIC_ARB", pending.notional_usd, settled_pnl).await;
                             settled_count = settled_count.saturating_add(1);
+                            let execution_id = pending.execution_id.clone();
 
                             let pnl_msg = serde_json::json!({
+                                "execution_id": execution_id.clone(),
                                 "strategy": "ATOMIC_ARB",
                                 "variant": variant.as_str(),
                                 "pnl": settled_pnl,
@@ -417,6 +426,7 @@ impl Strategy for AtomicArbStrategy {
                             let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
 
                             let settle_msg = serde_json::json!({
+                                "execution_id": execution_id,
                                 "market": "Atomic Arb",
                                 "side": "SETTLEMENT",
                                 "price": pending.ask_sum,

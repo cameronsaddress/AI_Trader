@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
+use uuid::Uuid;
 
 use crate::engine::PolymarketClient;
 use crate::strategies::control::{
@@ -58,6 +59,7 @@ struct TrackedTrade {
 
 #[derive(Debug, Clone)]
 struct Position {
+    execution_id: String,
     entry_price: f64,
     size: f64,
     timestamp: i64,
@@ -252,8 +254,10 @@ impl Strategy for SyndicateStrategy {
                             if let Some((pos, pnl_pct, reason)) = close_candidate {
                                 let realized = realized_pnl(pos.size, pnl_pct, event_cost_model);
                                 let new_bankroll = settle_sim_position_for_strategy(&mut event_conn, "SYNDICATE", pos.size, realized).await;
+                                let execution_id = pos.execution_id.clone();
 
                                 let pnl_msg = serde_json::json!({
+                                    "execution_id": execution_id,
                                     "strategy": "SYNDICATE",
                                     "variant": event_variant.as_str(),
                                     "pnl": realized,
@@ -404,8 +408,10 @@ impl Strategy for SyndicateStrategy {
                     let ts_ms = Utc::now().timestamp_millis();
                     let hold_secs = now.saturating_sub(pos.timestamp);
                     let net_return = if pos.size > 0.0 { realized / pos.size } else { 0.0 };
+                    let execution_id = pos.execution_id.clone();
 
                     let pnl_msg = serde_json::json!({
+                        "execution_id": execution_id.clone(),
                         "strategy": "SYNDICATE",
                         "variant": variant.as_str(),
                         "pnl": realized,
@@ -429,6 +435,7 @@ impl Strategy for SyndicateStrategy {
                     let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
 
                     let exec_msg = serde_json::json!({
+                        "execution_id": execution_id,
                         "market": "Syndicate",
                         "side": "CLOSE",
                         "price": exit_price,
@@ -679,7 +686,9 @@ impl Strategy for SyndicateStrategy {
                 let _: () = conn.publish("arbitrage:scan", scan_msg.to_string()).await.unwrap_or_default();
 
                 if trading_mode == TradingMode::Live {
+                    let execution_id = Uuid::new_v4().to_string();
                     let preview_msg = serde_json::json!({
+                        "execution_id": execution_id,
                         "market": "Syndicate",
                         "side": "LIVE_DRY_RUN",
                         "price": avg_price,
@@ -724,12 +733,14 @@ impl Strategy for SyndicateStrategy {
                     continue;
                 }
 
+                let execution_id = Uuid::new_v4().to_string();
                 let inserted = {
                     let mut positions = self.open_positions.write().await;
                     if positions.contains_key(token_id) {
                         false
                     } else {
                         positions.insert(*token_id, Position {
+                            execution_id: execution_id.clone(),
                             entry_price: avg_price,
                             size: bet_size,
                             timestamp: now,
@@ -749,6 +760,7 @@ impl Strategy for SyndicateStrategy {
                 }
 
                 let exec_msg = serde_json::json!({
+                    "execution_id": execution_id,
                     "market": "Syndicate",
                     "side": "ENTRY",
                     "price": avg_price,

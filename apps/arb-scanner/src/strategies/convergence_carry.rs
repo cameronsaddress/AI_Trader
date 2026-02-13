@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
+use uuid::Uuid;
 
 use crate::engine::{MarketTarget, PolymarketClient, WS_URL};
 use crate::strategies::control::{
@@ -53,6 +54,7 @@ enum Side {
 
 #[derive(Debug, Clone)]
 struct Position {
+    execution_id: String,
     market_id: String,
     question: String,
     side: Side,
@@ -351,6 +353,7 @@ impl Strategy for ConvergenceCarryStrategy {
                                 let pnl = realized_pnl(pos.size, gross_return, cost_model);
                                 let bankroll = settle_sim_position_for_strategy(&mut conn, "CONVERGENCE_CARRY", pos.size, pnl).await;
                                 let pnl_msg = serde_json::json!({
+                                    "execution_id": pos.execution_id,
                                     "strategy": "CONVERGENCE_CARRY",
                                     "variant": variant.as_str(),
                                     "pnl": pnl,
@@ -504,7 +507,9 @@ impl Strategy for ConvergenceCarryStrategy {
                                     } else {
                                         market.no_token.clone()
                                     };
+                                    let execution_id = Uuid::new_v4().to_string();
                                     let preview_msg = serde_json::json!({
+                                        "execution_id": execution_id,
                                         "market": "Convergence Carry",
                                         "side": "LIVE_DRY_RUN",
                                         "price": entry_price,
@@ -554,7 +559,9 @@ impl Strategy for ConvergenceCarryStrategy {
                             0.12,
                         ).await;
                         if size > 0.0 && reserve_sim_notional_for_strategy(&mut conn, "CONVERGENCE_CARRY", size).await {
+                            let execution_id = Uuid::new_v4().to_string();
                             open_positions.push(Position {
+                                execution_id: execution_id.clone(),
                                 market_id: market.market_id.clone(),
                                 question: market.question.clone(),
                                 side,
@@ -564,6 +571,7 @@ impl Strategy for ConvergenceCarryStrategy {
                             });
                             last_entry_ms = now_ms;
                             let exec_msg = serde_json::json!({
+                                "execution_id": execution_id,
                                 "market": "Convergence Carry",
                                 "side": "ENTRY",
                                 "price": entry_price,

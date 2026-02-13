@@ -499,7 +499,9 @@ impl Strategy for CexArbStrategy {
                                 if preview_size > 0.0 {
                                     let preview_price = if eligible_long { book.yes.best_ask } else { book.no.best_ask };
                                     if preview_price > 0.0 {
+                                        let execution_id = Uuid::new_v4().to_string();
                                         let preview_msg = serde_json::json!({
+                                            "execution_id": execution_id,
                                             "market": "CEX Sniper",
                                             "side": "LIVE_DRY_RUN",
                                             "price": preview_price,
@@ -644,8 +646,10 @@ impl Strategy for CexArbStrategy {
                         for (pos, exit_price, gross_return, hold_ms, reason) in closed {
                             let pnl = realized_pnl(pos.size, gross_return, cost_model);
                             let new_bankroll = settle_sim_position_for_strategy(&mut conn, "CEX_SNIPER", pos.size, pnl).await;
+                            let execution_id = pos.id.clone();
 
                             let pnl_msg = serde_json::json!({
+                                "execution_id": execution_id.clone(),
                                 "strategy": "CEX_SNIPER",
                                 "variant": variant.as_str(),
                                 "pnl": pnl,
@@ -669,6 +673,23 @@ impl Strategy for CexArbStrategy {
                                 }
                             });
                             let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+
+                            let exec_msg = serde_json::json!({
+                                "execution_id": execution_id,
+                                "market": "CEX Sniper",
+                                "side": "CLOSE",
+                                "price": exit_price,
+                                "size": pos.size,
+                                "timestamp": now_ms,
+                                "mode": "PAPER",
+                                "details": {
+                                    "reason": reason,
+                                    "gross_return": gross_return,
+                                    "net_return": if pos.size > 0.0 { pnl / pos.size } else { 0.0 },
+                                    "hold_ms": hold_ms,
+                                }
+                            });
+                            let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
                         }
 
                         if let Some(mut pos) = new_entry {
@@ -704,7 +725,9 @@ impl Strategy for CexArbStrategy {
                             }
 
                             let direction = match pos.side { Side::Yes => "YES", Side::No => "NO" };
+                            let execution_id = pos.id.clone();
                             let exec_msg = serde_json::json!({
+                                "execution_id": execution_id,
                                 "market": "CEX Sniper",
                                 "side": "ENTRY",
                                 "price": pos.entry_poly,

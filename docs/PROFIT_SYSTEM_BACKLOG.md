@@ -164,7 +164,7 @@ Backlog below includes adding dedicated pages for each strategy (required for �
 - [x] P1.6.1 Mode toggle + confirmation + arm flag
   - Verified by `scripts/run_live_paper_checklist.sh`
 
-- [ ] P1.6.2 Unified execution provenance id
+- [x] P1.6.2 Unified execution provenance id
   - Add `execution_id` (UUID) to all `ENTRY` / `WIN` / `LOSS` / `SETTLEMENT` events and `strategy:pnl`.
   - Backend stores and shows a trace:
     - scan -> gate -> sizing -> execution -> pnl
@@ -204,7 +204,7 @@ Backlog below includes adding dedicated pages for each strategy (required for �
     - “Strategy Intelligence” = portfolio-level summary + sortable list
   - Make them linked (click strategy row -> deep dive page).
 
-- [ ] P1.7.2 System stats are never misleading
+- [x] P1.7.2 System stats are never misleading
   - Ensure any “pass rate”, “avg threshold”, etc is clearly labeled:
     - system-wide
     - per-family

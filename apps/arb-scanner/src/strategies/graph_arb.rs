@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
+use uuid::Uuid;
 
 use crate::engine::{MarketTarget, PolymarketClient, WS_URL};
 use crate::strategies::control::{
@@ -42,6 +43,7 @@ const LIVE_PREVIEW_COOLDOWN_MS: i64 = 2_000;
 
 #[derive(Debug, Clone)]
 struct PendingPaperTrade {
+    execution_id: String,
     market_id: String,
     question: String,
     entry_ts_ms: i64,
@@ -257,7 +259,9 @@ impl Strategy for GraphArbStrategy {
 
                             let settled_pnl = pending.notional_usd * pending.net_edge;
                             let new_bankroll = settle_sim_position_for_strategy(&mut conn, "GRAPH_ARB", pending.notional_usd, settled_pnl).await;
+                            let execution_id = pending.execution_id.clone();
                             let settle_msg = serde_json::json!({
+                                "execution_id": execution_id.clone(),
                                 "strategy": "GRAPH_ARB",
                                 "variant": variant.as_str(),
                                 "pnl": settled_pnl,
@@ -278,6 +282,7 @@ impl Strategy for GraphArbStrategy {
                             let _: () = conn.publish("strategy:pnl", settle_msg.to_string()).await.unwrap_or_default();
 
                             let exec_msg = serde_json::json!({
+                                "execution_id": execution_id,
                                 "market": "Graph Arb",
                                 "side": "SETTLEMENT",
                                 "price": pending.ask_sum,
@@ -424,7 +429,9 @@ impl Strategy for GraphArbStrategy {
 
                                 if investment_usd > 0.0 {
                                     let shares = investment_usd / ask_sum;
+                                    let execution_id = Uuid::new_v4().to_string();
                                     let preview_msg = serde_json::json!({
+                                        "execution_id": execution_id,
                                         "market": "Graph Arb",
                                         "side": "LIVE_DRY_RUN",
                                         "price": ask_sum,
@@ -484,7 +491,9 @@ impl Strategy for GraphArbStrategy {
                             ).await;
 
                             if investment_usd > 0.0 && reserve_sim_notional_for_strategy(&mut conn, "GRAPH_ARB", investment_usd).await {
+                                let execution_id = Uuid::new_v4().to_string();
                                 pending_settlements.push(PendingPaperTrade {
+                                    execution_id: execution_id.clone(),
                                     market_id: market.market_id.clone(),
                                     question: market.question.clone(),
                                     entry_ts_ms: now_ms,
@@ -494,6 +503,7 @@ impl Strategy for GraphArbStrategy {
                                     net_edge,
                                 });
                                 let exec_msg = serde_json::json!({
+                                    "execution_id": execution_id,
                                     "market": "Graph Arb",
                                     "side": "ENTRY",
                                     "price": ask_sum,

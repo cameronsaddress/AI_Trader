@@ -1,11 +1,11 @@
 # Profit System Tracker
 
-Last updated: 2026-02-12
+Last updated: 2026-02-13
 
 Detailed backlog: `docs/PROFIT_SYSTEM_BACKLOG.md`
 
 ## Overall Progress
-- Phase 1 (Standard techniques): ~78% complete
+- Phase 1 (Standard techniques): ~82% complete
 - Phase 2 (ML + safe deployment): ~41% complete
 - Phase 3 (Novel alpha layers): ~25% complete
 
@@ -67,6 +67,7 @@ Detailed backlog: `docs/PROFIT_SYSTEM_BACKLOG.md`
   - Paper checklist automation covering key safety flows.
   - Added `BTC_5M` window-resolve execution lifecycle (reserve -> hold -> settle) in PAPER, and LIVE preflight dry-run payloads.
   - Simulation reset now preserves operator strategy toggles by default (optional `force_defaults` for deterministic benchmarks).
+  - Unified `execution_id` across strategy execution + PnL events, with backend trace capture and UI drill-down.
 - Remaining:
   - More rigorous ledger reconciliation tolerances + anomaly escalation policy.
   - End-to-end invariants across reserve/release/settle on all strategy paths.
@@ -78,9 +79,11 @@ Detailed backlog: `docs/PROFIT_SYSTEM_BACKLOG.md`
   - Intelligence block visibility, risk allocator view, quality and governance views.
   - Cost drag and integrity alerts surfaced in live UI.
   - New `/btc-5m-engine` page showing BTC 5m loop telemetry (spot, EV, Kelly advisory, order feed, positions, equity curve, heatmap).
+  - Scoped intelligence summary stats (asset/family) to prevent misleading cross-asset aggregates.
+  - Execution trace drill-down: click an execution row to fetch/view scan -> gate -> exec -> pnl provenance (raw JSON for now).
 - Remaining:
   - Alert severity rollups and operator playbook links in-panel.
-  - Compact per-strategy provenance timeline (scan -> gate -> execution -> pnl).
+  - Curated per-strategy provenance timeline view (not raw JSON) + cross-linking to strategy pages.
 
 ## Phase 2 Status (ML)
 

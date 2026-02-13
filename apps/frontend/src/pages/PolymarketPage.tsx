@@ -348,6 +348,23 @@ type ExecutionLog = {
     market: string;
     price: string;
     size: string;
+    execution_id?: string;
+};
+
+type ExecutionTraceEvent = {
+    type: string;
+    timestamp: number;
+    payload: unknown;
+};
+
+type ExecutionTrace = {
+    execution_id: string;
+    strategy: string | null;
+    market_key: string | null;
+    created_at: number;
+    updated_at: number;
+    scan_snapshot: unknown | null;
+    events: ExecutionTraceEvent[];
 };
 
 type StrategyPnlPayload = {
@@ -381,6 +398,8 @@ type StrategyLiveExecutionEvent = {
     timestamp?: number;
 };
 
+type IntelligenceAssetScope = 'ALL' | 'BTC' | 'ETH' | 'SOL' | 'OTHER';
+
 const DEFAULT_SIM_BANKROLL = 1000;
 const STRATEGY_NAME_MAP: Record<string, string> = {
     BTC_5M: 'BTC 5m Engine',
@@ -396,6 +415,20 @@ const STRATEGY_NAME_MAP: Record<string, string> = {
     MAKER_MM: 'Maker Micro-MM',
 };
 
+function inferAssetScope(strategy: string): Exclude<IntelligenceAssetScope, 'ALL'> {
+    const upper = (strategy || '').trim().toUpperCase();
+    if (upper.startsWith('BTC_') || upper === 'CEX_SNIPER' || upper === 'OBI_SCALPER' || upper === 'ATOMIC_ARB') {
+        return 'BTC';
+    }
+    if (upper.startsWith('ETH_')) {
+        return 'ETH';
+    }
+    if (upper.startsWith('SOL_')) {
+        return 'SOL';
+    }
+    return 'OTHER';
+}
+
 function formatUsd(value: number): string {
     return `$${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
@@ -406,6 +439,14 @@ function parseNumber(value: unknown): number | null {
     }
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseText(value: unknown): string | null {
+    if (typeof value !== 'string') {
+        return null;
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
 }
 
 function normalizeUnit(value: unknown): string {
@@ -1243,11 +1284,20 @@ function toExecutionLog(input: unknown): ExecutionLog {
             market: 'SYSTEM',
             price: 'UNKNOWN',
             size: '--',
+            execution_id: undefined,
         };
     }
 
-    const payload = input as Partial<ExecutionLog>;
+    const payload = input as Record<string, unknown>;
     const ts = parseNumber(payload.timestamp) ?? Date.now();
+    const details = (payload.details && typeof payload.details === 'object' && !Array.isArray(payload.details))
+        ? payload.details as Record<string, unknown>
+        : null;
+    const executionId = parseText(payload.execution_id)
+        || parseText(payload.executionId)
+        || parseText(details?.execution_id)
+        || parseText(details?.executionId)
+        || undefined;
 
     return {
         timestamp: ts,
@@ -1255,6 +1305,7 @@ function toExecutionLog(input: unknown): ExecutionLog {
         market: typeof payload.market === 'string' ? payload.market : 'SYSTEM',
         price: typeof payload.price === 'string' ? payload.price : String(payload.price ?? '---'),
         size: typeof payload.size === 'string' ? payload.size : String(payload.size ?? '--'),
+        execution_id: executionId,
     };
 }
 
@@ -1272,6 +1323,10 @@ export const PolymarketPage: React.FC = () => {
         realizedPnl: 0,
     });
     const [execLogs, setExecLogs] = React.useState<ExecutionLog[]>([]);
+    const [traceExecutionId, setTraceExecutionId] = React.useState<string | null>(null);
+    const [executionTrace, setExecutionTrace] = React.useState<ExecutionTrace | null>(null);
+    const [executionTraceError, setExecutionTraceError] = React.useState<string | null>(null);
+    const [executionTraceLoading, setExecutionTraceLoading] = React.useState(false);
     const [strategySignals, setStrategySignals] = React.useState<StrategySignalState[]>([]);
     const [comparableGroups, setComparableGroups] = React.useState<ComparableGroupState[]>([]);
     const [strategyAllocator, setStrategyAllocator] = React.useState<Record<string, StrategyAllocatorEntry>>({});
@@ -1400,19 +1455,52 @@ export const PolymarketPage: React.FC = () => {
 
     const isPaperMode = tradingMode === 'PAPER';
     const canConfirmReset = resetText.trim().toUpperCase() === 'RESET';
-    const strategySignalPassRate = strategySignals.length > 0
-        ? (strategySignals.filter((signal) => signal.passes_threshold).length / strategySignals.length) * 100
+    const [intelligenceAssetScope, setIntelligenceAssetScope] = React.useState<IntelligenceAssetScope>('ALL');
+    const [intelligenceFamilyScope, setIntelligenceFamilyScope] = React.useState<string>('ALL');
+
+    const intelligenceFamilyOptions = React.useMemo(() => {
+        const families = new Set<string>();
+        for (const signal of strategySignals) {
+            families.add(signal.metric_family);
+        }
+        return ['ALL', ...Array.from(families).sort()];
+    }, [strategySignals]);
+
+    const scopedStrategySignals = React.useMemo(() => {
+        return strategySignals.filter((signal) => {
+            if (intelligenceAssetScope !== 'ALL' && inferAssetScope(signal.strategy) !== intelligenceAssetScope) {
+                return false;
+            }
+            if (intelligenceFamilyScope !== 'ALL' && signal.metric_family !== intelligenceFamilyScope) {
+                return false;
+            }
+            return true;
+        });
+    }, [intelligenceAssetScope, intelligenceFamilyScope, strategySignals]);
+
+    const scopedPassFractionPct = scopedStrategySignals.length > 0
+        ? (scopedStrategySignals.filter((signal) => signal.passes_threshold).length / scopedStrategySignals.length) * 100
         : 0;
+    const intelligenceScopeLabel = React.useMemo(() => {
+        const parts: string[] = [];
+        if (intelligenceAssetScope !== 'ALL') {
+            parts.push(intelligenceAssetScope);
+        }
+        if (intelligenceFamilyScope !== 'ALL') {
+            parts.push(intelligenceFamilyScope);
+        }
+        return parts.length > 0 ? parts.join(' \u00b7 ') : 'ALL';
+    }, [intelligenceAssetScope, intelligenceFamilyScope]);
     const medianSignalAgeMs = React.useMemo(() => {
-        if (strategySignals.length === 0) {
+        if (scopedStrategySignals.length === 0) {
             return 0;
         }
-        const sorted = [...strategySignals].map((signal) => signal.age_ms).sort((a, b) => a - b);
+        const sorted = [...scopedStrategySignals].map((signal) => signal.age_ms).sort((a, b) => a - b);
         return sorted[Math.floor(sorted.length / 2)] ?? 0;
-    }, [strategySignals]);
+    }, [scopedStrategySignals]);
     const metricFamilyCoverage = React.useMemo(
-        () => new Set(strategySignals.map((signal) => signal.metric_family)).size,
-        [strategySignals],
+        () => new Set(scopedStrategySignals.map((signal) => signal.metric_family)).size,
+        [scopedStrategySignals],
     );
     const topComparableGroups = React.useMemo(
         () => [...comparableGroups]
@@ -1678,12 +1766,22 @@ export const PolymarketPage: React.FC = () => {
 
             const pnl = parseNumber(data.pnl) ?? 0;
             const exit = parseNumber(data.details?.exit);
+            const rawPnl = data as unknown as Record<string, unknown>;
+            const rawPnlDetails = (rawPnl.details && typeof rawPnl.details === 'object' && !Array.isArray(rawPnl.details))
+                ? rawPnl.details as Record<string, unknown>
+                : null;
+            const executionId = parseText(rawPnl.execution_id)
+                || parseText(rawPnl.executionId)
+                || parseText(rawPnlDetails?.execution_id)
+                || parseText(rawPnlDetails?.executionId)
+                || undefined;
             const logEntry: ExecutionLog = {
                 timestamp: parseNumber(data.timestamp) ?? Date.now(),
                 side: pnl >= 0 ? 'WIN' : 'LOSS',
                 market: typeof data.strategy === 'string' ? data.strategy : 'UNKNOWN',
                 price: `${data.details?.action || 'CLOSE'} @ ${exit !== null ? exit.toFixed(2) : '---'}`,
                 size: `$${Math.abs(pnl).toFixed(2)}`,
+                execution_id: executionId,
             };
             setExecLogs((prev) => [logEntry, ...prev].slice(0, 50));
         };
@@ -2056,6 +2154,37 @@ export const PolymarketPage: React.FC = () => {
         });
     };
 
+    const closeExecutionTrace = React.useCallback(() => {
+        setTraceExecutionId(null);
+        setExecutionTrace(null);
+        setExecutionTraceError(null);
+        setExecutionTraceLoading(false);
+    }, []);
+
+    const openExecutionTrace = React.useCallback(async (executionId: string) => {
+        if (!executionId) {
+            return;
+        }
+        setTraceExecutionId(executionId);
+        setExecutionTrace(null);
+        setExecutionTraceError(null);
+        setExecutionTraceLoading(true);
+        try {
+            const response = await fetch(`/api/arb/execution-trace/${encodeURIComponent(executionId)}`);
+            if (!response.ok) {
+                const payload = await response.json().catch(() => null) as { error?: string } | null;
+                setExecutionTraceError(payload?.error || `Trace lookup failed (${response.status})`);
+                return;
+            }
+            const data = await response.json() as ExecutionTrace;
+            setExecutionTrace(data);
+        } catch (error) {
+            setExecutionTraceError(error instanceof Error ? error.message : String(error));
+        } finally {
+            setExecutionTraceLoading(false);
+        }
+    }, []);
+
     return (
         <DashboardLayout>
             <div className="p-6 space-y-6">
@@ -2149,7 +2278,17 @@ export const PolymarketPage: React.FC = () => {
                                 </div>
                             )}
                             {execLogs.map((log, i) => (
-                                <div key={`${log.timestamp}-${i}`} className="flex gap-2 border-b border-white/5 pb-1 mb-1">
+                                <div
+                                    key={`${log.timestamp}-${i}`}
+                                    className={`flex gap-2 border-b border-white/5 pb-1 mb-1 ${log.execution_id ? 'cursor-pointer hover:bg-white/5' : ''}`}
+                                    role={log.execution_id ? 'button' : undefined}
+                                    onClick={() => {
+                                        if (log.execution_id) {
+                                            void openExecutionTrace(log.execution_id);
+                                        }
+                                    }}
+                                    title={log.execution_id ? `Open trace: ${log.execution_id}` : undefined}
+                                >
                                     <span className="text-gray-600">[{new Date(log.timestamp).toLocaleTimeString()}]</span>
                                     <span className={`font-bold ${(log.side === 'BUY' || log.side === 'WIN') ? 'text-green-400' : 'text-red-400'}`}>
                                         {log.side}
@@ -2158,6 +2297,11 @@ export const PolymarketPage: React.FC = () => {
                                     <span className="text-gray-500">
                                         {log.price} | Size: {log.size}
                                     </span>
+                                    {log.execution_id && (
+                                        <span className="text-gray-700 font-mono ml-auto">
+                                            #{log.execution_id.slice(0, 8)}
+                                        </span>
+                                    )}
                                 </div>
                             ))}
                         </div>
@@ -2244,12 +2388,43 @@ export const PolymarketPage: React.FC = () => {
                     </div>
 
                     <div className="bg-white/5 border border-white/10 rounded-xl p-6">
-                        <h3 className="text-sm font-medium text-gray-300 mb-4">Intelligence Control Plane</h3>
+                        <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
+                            <h3 className="text-sm font-medium text-gray-300">Intelligence Control Plane</h3>
+                            <div className="flex items-center gap-2 text-[10px] font-mono">
+                                <select
+                                    value={intelligenceAssetScope}
+                                    onChange={(e) => setIntelligenceAssetScope(e.target.value as IntelligenceAssetScope)}
+                                    className="bg-black/40 border border-white/10 rounded px-2 py-1 text-gray-200"
+                                    title="Scope these summary stats by asset. Some strategies are not asset-specific."
+                                >
+                                    <option value="ALL">All Assets</option>
+                                    <option value="BTC">BTC</option>
+                                    <option value="ETH">ETH</option>
+                                    <option value="SOL">SOL</option>
+                                    <option value="OTHER">Other</option>
+                                </select>
+                                <select
+                                    value={intelligenceFamilyScope}
+                                    onChange={(e) => setIntelligenceFamilyScope(e.target.value)}
+                                    className="bg-black/40 border border-white/10 rounded px-2 py-1 text-gray-200"
+                                    title="Scope these summary stats by signal family."
+                                >
+                                    {intelligenceFamilyOptions.map((family) => (
+                                        <option key={family} value={family}>
+                                            {family === 'ALL' ? 'All Families' : family}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+                        </div>
                         <div className="space-y-4">
                             <div className="grid grid-cols-3 gap-2 text-[11px] font-mono">
                                 <div className="rounded border border-white/10 bg-black/30 p-2">
-                                    <div className="text-gray-500">Pass Rate</div>
-                                    <div className="text-emerald-300">{formatPercent(strategySignalPassRate)}</div>
+                                    <div className="text-gray-500">Passing (Snapshot)</div>
+                                    <div className="text-emerald-300">{formatPercent(scopedPassFractionPct)}</div>
+                                    <div className="text-[10px] text-gray-600 mt-1">
+                                        {intelligenceScopeLabel} | n={scopedStrategySignals.length}
+                                    </div>
                                 </div>
                                 <div className="rounded border border-white/10 bg-black/30 p-2">
                                     <div className="text-gray-500">Median Age</div>
@@ -2817,6 +2992,40 @@ export const PolymarketPage: React.FC = () => {
                                 Confirm Reset
                             </button>
                         </div>
+                    </div>
+                </div>
+            )}
+
+            {traceExecutionId && (
+                <div className="fixed inset-0 z-[110] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+                    <div className="w-full max-w-4xl bg-[#0b0b0b] border border-white/10 rounded-xl p-6 shadow-2xl">
+                        <div className="flex items-center justify-between gap-3 mb-4">
+                            <div>
+                                <h3 className="text-sm font-medium text-gray-200 font-mono">Execution Trace</h3>
+                                <div className="text-[10px] font-mono text-gray-500 mt-1">
+                                    execution_id: <span className="text-gray-200">{traceExecutionId}</span>
+                                </div>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={closeExecutionTrace}
+                                className="px-3 py-2 text-xs rounded border border-white/20 text-gray-300 hover:bg-white/5 font-mono"
+                            >
+                                Close
+                            </button>
+                        </div>
+
+                        {executionTraceLoading && (
+                            <div className="text-xs font-mono text-cyan-300">Loading trace...</div>
+                        )}
+                        {executionTraceError && (
+                            <div className="text-xs font-mono text-rose-300">{executionTraceError}</div>
+                        )}
+                        {executionTrace && (
+                            <pre className="mt-3 text-[11px] font-mono text-gray-200 bg-black/40 border border-white/10 rounded p-3 overflow-auto max-h-[70vh]">
+{JSON.stringify(executionTrace, null, 2)}
+                            </pre>
+                        )}
                     </div>
                 </div>
             )}

@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
+use uuid::Uuid;
 
 use crate::engine::{MarketTarget, PolymarketClient, WS_URL};
 use crate::strategies::control::{
@@ -246,6 +247,7 @@ enum Side {
 
 #[derive(Debug, Clone)]
 struct Position {
+    execution_id: String,
     side: Side,
     entry_price: f64,
     notional_usd: f64,
@@ -549,8 +551,10 @@ impl Strategy for Btc5mLagStrategy {
                                     let ts_ms = Utc::now().timestamp_millis();
                                     let hold_ms = ts_ms - pos.entry_ts_ms;
                                     let side_label = match pos.side { Side::Up => "UP", Side::Down => "DOWN" };
+                                    let execution_id = pos.execution_id.clone();
 
                                     let pnl_msg = serde_json::json!({
+                                        "execution_id": execution_id.clone(),
                                         "strategy": self.strategy_id(),
                                         "variant": variant.as_str(),
                                         "pnl": pnl,
@@ -582,6 +586,7 @@ impl Strategy for Btc5mLagStrategy {
                                     let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
 
                                     let settle_msg = serde_json::json!({
+                                        "execution_id": execution_id,
                                         "market": "BTC 5m Engine",
                                         "side": if won { "WIN" } else { "LOSS" },
                                         "price": pos.entry_price,
@@ -799,8 +804,10 @@ impl Strategy for Btc5mLagStrategy {
                                     Self::max_position_fraction(),
                                 ).await;
                                 if size > 0.0 {
+                                    let execution_id = Uuid::new_v4().to_string();
                                     let side_label = match best_side { Side::Up => "UP", Side::Down => "DOWN" };
                                     let preview_msg = serde_json::json!({
+                                        "execution_id": execution_id,
                                         "market": "BTC 5m Engine",
                                         "side": format!("LIVE_DRY_RUN_{}", side_label),
                                         "price": best_price,
@@ -855,7 +862,9 @@ impl Strategy for Btc5mLagStrategy {
                             ).await;
                             if size > 0.0 && reserve_sim_notional_for_strategy(&mut conn, self.strategy_id(), size).await {
                                 let side_label = match best_side { Side::Up => "UP", Side::Down => "DOWN" };
+                                let execution_id = Uuid::new_v4().to_string();
                                 open_position = Some(Position {
+                                    execution_id: execution_id.clone(),
                                     side: best_side,
                                     entry_price: best_price,
                                     notional_usd: size,
@@ -870,6 +879,7 @@ impl Strategy for Btc5mLagStrategy {
                                 });
 
                                 let exec_msg = serde_json::json!({
+                                    "execution_id": execution_id,
                                     "market": "BTC 5m Engine",
                                     "side": "ENTRY",
                                     "price": best_price,

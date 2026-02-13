@@ -7,6 +7,7 @@ import helmet from 'helmet';
 import dotenv from 'dotenv';
 import fs from 'fs/promises';
 import path from 'path';
+import { randomUUID } from 'crypto';
 import { Side } from '@polymarket/clob-client';
 
 import { MarketDataService } from './services/MarketDataService';
@@ -419,6 +420,30 @@ type ModelPredictionTrace = {
     model_loaded: boolean;
 };
 
+type ExecutionTraceEventType =
+    | 'EXECUTION_EVENT'
+    | 'INTELLIGENCE_GATE'
+    | 'MODEL_GATE'
+    | 'PREFLIGHT'
+    | 'LIVE_EXECUTION'
+    | 'PNL';
+
+type ExecutionTraceEvent = {
+    type: ExecutionTraceEventType;
+    timestamp: number;
+    payload: unknown;
+};
+
+type ExecutionTrace = {
+    execution_id: string;
+    strategy: string | null;
+    market_key: string | null;
+    created_at: number;
+    updated_at: number;
+    scan_snapshot: StrategyScanState | null;
+    events: ExecutionTraceEvent[];
+};
+
 const STRATEGY_IDS = [
     'BTC_5M',
     'BTC_15M',
@@ -432,6 +457,10 @@ const STRATEGY_IDS = [
     'CONVERGENCE_CARRY',
     'MAKER_MM',
 ];
+
+const EXECUTION_TRACE_TTL_MS = Math.max(60_000, Number(process.env.EXECUTION_TRACE_TTL_MS || String(6 * 60 * 60 * 1000)));
+const EXECUTION_TRACE_MAX_EVENTS = Math.max(10, Number(process.env.EXECUTION_TRACE_MAX_EVENTS || '80'));
+const executionTraces = new Map<string, ExecutionTrace>();
 const SCANNER_HEARTBEAT_IDS = [
     'scanner_swarms',
     'btc_5m',
@@ -1451,6 +1480,103 @@ function extractExecutionMarketKey(payload: unknown): string | null {
         || asString(record.symbol)
         || asString(record.market),
     );
+}
+
+function extractExecutionId(payload: unknown): string | null {
+    const record = asRecord(payload);
+    if (!record) {
+        return null;
+    }
+    const direct = asString(record.execution_id) || asString(record.executionId);
+    if (direct) {
+        return direct;
+    }
+    const details = asRecord(record.details);
+    return asString(details?.execution_id) || asString(details?.executionId);
+}
+
+function ensureExecutionId(payload: unknown): string {
+    const existing = extractExecutionId(payload);
+    if (existing) {
+        return existing;
+    }
+    const id = randomUUID();
+    if (payload && typeof payload === 'object') {
+        const record = payload as Record<string, unknown>;
+        record.execution_id = id;
+        const details = asRecord(record.details);
+        if (details) {
+            details.execution_id = id;
+        }
+    }
+    return id;
+}
+
+function pruneExecutionTraces(now = Date.now()): void {
+    for (const [id, trace] of executionTraces.entries()) {
+        if (now - trace.updated_at > EXECUTION_TRACE_TTL_MS) {
+            executionTraces.delete(id);
+        }
+    }
+}
+
+function snapshotScanForExecution(strategy: string | null, marketKey: string | null): StrategyScanState | null {
+    if (!strategy) {
+        return null;
+    }
+    if (marketKey) {
+        return latestStrategyScansByMarket.get(buildStrategyMarketKey(strategy, marketKey)) || null;
+    }
+    return latestStrategyScans.get(strategy) || null;
+}
+
+function upsertExecutionTrace(executionId: string, meta: {
+    strategy: string | null;
+    market_key: string | null;
+    scan_snapshot: StrategyScanState | null;
+}): ExecutionTrace {
+    const now = Date.now();
+    const existing = executionTraces.get(executionId);
+    if (existing) {
+        existing.strategy = existing.strategy || meta.strategy;
+        existing.market_key = existing.market_key || meta.market_key;
+        existing.scan_snapshot = existing.scan_snapshot || meta.scan_snapshot;
+        existing.updated_at = now;
+        return existing;
+    }
+
+    const created: ExecutionTrace = {
+        execution_id: executionId,
+        strategy: meta.strategy,
+        market_key: meta.market_key,
+        created_at: now,
+        updated_at: now,
+        scan_snapshot: meta.scan_snapshot,
+        events: [],
+    };
+    executionTraces.set(executionId, created);
+    pruneExecutionTraces(now);
+    return created;
+}
+
+function pushExecutionTraceEvent(
+    executionId: string,
+    type: ExecutionTraceEventType,
+    payload: unknown,
+    meta: { strategy: string | null; market_key: string | null } = { strategy: null, market_key: null },
+): void {
+    const trace = upsertExecutionTrace(executionId, {
+        strategy: meta.strategy,
+        market_key: meta.market_key,
+        scan_snapshot: snapshotScanForExecution(meta.strategy, meta.market_key),
+    });
+    const now = Date.now();
+    trace.events.push({ type, timestamp: now, payload });
+    if (trace.events.length > EXECUTION_TRACE_MAX_EVENTS) {
+        trace.events = trace.events.slice(-EXECUTION_TRACE_MAX_EVENTS);
+    }
+    trace.updated_at = now;
+    pruneExecutionTraces(now);
 }
 
 function computeScanMargin(scan: StrategyScanState): number {
@@ -4179,15 +4305,27 @@ redisSubscriber.subscribe('arbitrage:opportunities', (message) => {
 redisSubscriber.subscribe('arbitrage:execution', (message) => {
     try {
         const parsed = JSON.parse(message);
+        const executionId = ensureExecutionId(parsed);
+        const parsedStrategy = extractExecutionStrategy(parsed);
+        const parsedMarketKey = extractExecutionMarketKey(parsed);
+        pushExecutionTraceEvent(executionId, 'EXECUTION_EVENT', parsed, {
+            strategy: parsedStrategy,
+            market_key: parsedMarketKey,
+        });
         io.emit('execution_log', parsed);
 
         void (async () => {
             try {
                 const currentTradingMode = await getTradingMode();
                 const intelligenceGate = evaluateIntelligenceGate(parsed, currentTradingMode);
+                const gateMeta = {
+                    strategy: intelligenceGate.strategy || parsedStrategy,
+                    market_key: intelligenceGate.marketKey || parsedMarketKey,
+                };
                 if (!intelligenceGate.ok) {
                     touchRuntimeModule('INTELLIGENCE_GATE', 'DEGRADED', intelligenceGate.reason || 'execution blocked');
                     const blockPayload = {
+                        execution_id: executionId,
                         timestamp: Date.now(),
                         strategy: intelligenceGate.strategy || 'UNKNOWN',
                         market_key: intelligenceGate.marketKey || intelligenceGate.scan?.market_key || null,
@@ -4200,8 +4338,10 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                         peer_consensus: intelligenceGate.peerConsensus ?? 0,
                         peer_strategies: intelligenceGate.peerStrategies || [],
                     };
+                    pushExecutionTraceEvent(executionId, 'INTELLIGENCE_GATE', blockPayload, gateMeta);
                     io.emit('strategy_intelligence_block', blockPayload);
                     io.emit('execution_log', {
+                        execution_id: executionId,
                         timestamp: Date.now(),
                         side: 'INTEL_BLOCK',
                         market: asString(asRecord(parsed)?.market) || 'Polymarket',
@@ -4212,6 +4352,24 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                     });
                     return;
                 }
+                pushExecutionTraceEvent(
+                    executionId,
+                    'INTELLIGENCE_GATE',
+                    {
+                        execution_id: executionId,
+                        ok: true,
+                        timestamp: Date.now(),
+                        strategy: intelligenceGate.strategy || parsedStrategy,
+                        market_key: intelligenceGate.marketKey || parsedMarketKey,
+                        margin: intelligenceGate.margin,
+                        normalized_margin: intelligenceGate.normalizedMargin,
+                        age_ms: intelligenceGate.ageMs,
+                        peer_signals: intelligenceGate.peerSignals ?? 0,
+                        peer_consensus: intelligenceGate.peerConsensus ?? 0,
+                        peer_strategies: intelligenceGate.peerStrategies || [],
+                    },
+                    gateMeta,
+                );
                 touchRuntimeModule('INTELLIGENCE_GATE', 'ONLINE', `execution allowed for ${intelligenceGate.strategy || 'UNKNOWN'}`);
                 const modelGate = evaluateModelProbabilityGate(parsed, currentTradingMode);
                 if (!modelGate.ok) {
@@ -4221,6 +4379,7 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                         `${modelGate.strategy || 'UNKNOWN'} blocked: ${modelGate.reason}`,
                     );
                     const modelBlockPayload = {
+                        execution_id: executionId,
                         timestamp: Date.now(),
                         strategy: modelGate.strategy || intelligenceGate.strategy || 'UNKNOWN',
                         market_key: modelGate.market_key || intelligenceGate.marketKey || intelligenceGate.scan?.market_key || null,
@@ -4230,10 +4389,15 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                         model_loaded: modelGate.model_loaded,
                         mode: currentTradingMode,
                     };
+                    pushExecutionTraceEvent(executionId, 'MODEL_GATE', modelBlockPayload, {
+                        strategy: modelBlockPayload.strategy,
+                        market_key: modelBlockPayload.market_key,
+                    });
                     io.emit('strategy_model_block', modelBlockPayload);
                     // Reuse existing UI intelligence block stream for visibility.
                     io.emit('strategy_intelligence_block', modelBlockPayload);
                     io.emit('execution_log', {
+                        execution_id: executionId,
                         timestamp: Date.now(),
                         side: 'MODEL_BLOCK',
                         market: asString(asRecord(parsed)?.market) || 'Polymarket',
@@ -4244,6 +4408,25 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                     });
                     return;
                 }
+                pushExecutionTraceEvent(
+                    executionId,
+                    'MODEL_GATE',
+                    {
+                        execution_id: executionId,
+                        ok: true,
+                        timestamp: Date.now(),
+                        strategy: modelGate.strategy || intelligenceGate.strategy || parsedStrategy,
+                        market_key: modelGate.market_key || intelligenceGate.marketKey || parsedMarketKey,
+                        probability: modelGate.probability,
+                        gate: modelGate.gate,
+                        model_loaded: modelGate.model_loaded,
+                        mode: currentTradingMode,
+                    },
+                    {
+                        strategy: modelGate.strategy || intelligenceGate.strategy || parsedStrategy,
+                        market_key: modelGate.market_key || intelligenceGate.marketKey || parsedMarketKey,
+                    },
+                );
                 touchRuntimeModule(
                     'UNCERTAINTY_GATE',
                     'ONLINE',
@@ -4253,10 +4436,29 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                 const preflight = await polymarketPreflight.preflightFromExecution(parsed);
                 if (!preflight) {
                     touchRuntimeModule('EXECUTION_PREFLIGHT', 'ONLINE', 'preflight bypassed (no polymarket order payload)');
+                    pushExecutionTraceEvent(
+                        executionId,
+                        'PREFLIGHT',
+                        {
+                            execution_id: executionId,
+                            timestamp: Date.now(),
+                            bypassed: true,
+                            mode: currentTradingMode,
+                        },
+                        {
+                            strategy: modelGate.strategy || intelligenceGate.strategy || parsedStrategy,
+                            market_key: modelGate.market_key || intelligenceGate.marketKey || parsedMarketKey,
+                        },
+                    );
                     const liveExecution = await polymarketPreflight.executeFromExecution(parsed, currentTradingMode);
                     if (!liveExecution) {
                         return;
                     }
+                    (liveExecution as unknown as Record<string, unknown>).execution_id = executionId;
+                    pushExecutionTraceEvent(executionId, 'LIVE_EXECUTION', liveExecution, {
+                        strategy: liveExecution.strategy || modelGate.strategy || intelligenceGate.strategy || parsedStrategy,
+                        market_key: parsedMarketKey,
+                    });
                     io.emit('strategy_live_execution', liveExecution);
                     io.emit('execution_log', PolymarketPreflightService.toLiveExecutionLog(liveExecution));
                     const settlementEvents = await settlementService.registerAtomicExecution(liveExecution);
@@ -4265,6 +4467,11 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                 }
 
                 touchRuntimeModule('EXECUTION_PREFLIGHT', preflight.ok ? 'ONLINE' : 'DEGRADED', `${preflight.strategy} preflight ${preflight.ok ? 'ok' : 'failed'}`);
+                (preflight as unknown as Record<string, unknown>).execution_id = executionId;
+                pushExecutionTraceEvent(executionId, 'PREFLIGHT', preflight, {
+                    strategy: preflight.strategy || modelGate.strategy || intelligenceGate.strategy || parsedStrategy,
+                    market_key: parsedMarketKey,
+                });
                 io.emit('strategy_preflight', preflight);
                 io.emit('execution_log', PolymarketPreflightService.toExecutionLog(preflight));
 
@@ -4272,6 +4479,11 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                 if (!liveExecution) {
                     return;
                 }
+                (liveExecution as unknown as Record<string, unknown>).execution_id = executionId;
+                pushExecutionTraceEvent(executionId, 'LIVE_EXECUTION', liveExecution, {
+                    strategy: liveExecution.strategy || preflight.strategy || modelGate.strategy || intelligenceGate.strategy || parsedStrategy,
+                    market_key: parsedMarketKey,
+                });
                 io.emit('strategy_live_execution', liveExecution);
                 io.emit('execution_log', PolymarketPreflightService.toLiveExecutionLog(liveExecution));
                 const settlementEvents = await settlementService.registerAtomicExecution(liveExecution);
@@ -4288,10 +4500,12 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
 redisSubscriber.subscribe('strategy:pnl', (message) => {
     try {
         const parsed = JSON.parse(message);
+        const executionId = ensureExecutionId(parsed);
+        const pnlStrategy = asString(asRecord(parsed)?.strategy) || null;
+        pushExecutionTraceEvent(executionId, 'PNL', parsed, { strategy: pnlStrategy, market_key: null });
         io.emit('strategy_pnl', parsed);
         strategyTradeRecorder.record(parsed);
-        const pnlStrategy = asString(asRecord(parsed)?.strategy) || 'UNKNOWN';
-        touchRuntimeModule('PNL_LEDGER', 'ONLINE', `${pnlStrategy} pnl event recorded`);
+        touchRuntimeModule('PNL_LEDGER', 'ONLINE', `${pnlStrategy || 'UNKNOWN'} pnl event recorded`);
 
         const mode = normalizeTradingMode(parsed?.mode) || 'PAPER';
         if (mode !== 'PAPER') {
@@ -4779,6 +4993,21 @@ app.get('/api/arb/stats', async (_req, res) => {
         strategy_governance: governancePayload(),
         feature_registry: featureRegistrySummary(),
     });
+});
+
+app.get('/api/arb/execution-trace/:execution_id', (req, res) => {
+    pruneExecutionTraces();
+    const executionId = String(req.params.execution_id || '').trim();
+    if (!executionId) {
+        res.status(400).json({ error: 'Missing execution_id' });
+        return;
+    }
+    const trace = executionTraces.get(executionId);
+    if (!trace) {
+        res.status(404).json({ error: 'Trace not found' });
+        return;
+    }
+    res.json(trace);
 });
 
 app.get('/api/arb/intelligence', (_req, res) => {
