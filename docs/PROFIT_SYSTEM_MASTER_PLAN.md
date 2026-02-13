@@ -3,6 +3,8 @@
 ## Objective
 Build a transparent, risk-controlled, continuously improving Polymarket trading system that maximizes repeatable long-run profit using only currently available data feeds (Polymarket + Coinbase + internal logs/telemetry).
 
+For the detailed, actionable task list, see: `docs/PROFIT_SYSTEM_BACKLOG.md`.
+
 ## Constraints
 - No real order posting unless system is in `LIVE` and explicitly confirmed.
 - Use currently integrated data sources only.

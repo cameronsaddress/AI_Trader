@@ -2,6 +2,8 @@
 
 Last updated: 2026-02-12
 
+Detailed backlog: `docs/PROFIT_SYSTEM_BACKLOG.md`
+
 ## Overall Progress
 - Phase 1 (Standard techniques): ~78% complete
 - Phase 2 (ML + safe deployment): ~41% complete
