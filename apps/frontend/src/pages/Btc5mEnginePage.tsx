@@ -62,10 +62,47 @@ const DEFAULT_SIM_BANKROLL = 1000;
 const SERIES_MAX_POINTS = 720;
 const ORDER_FEED_ROWS = 24;
 const POSITIONS_ROWS = 64;
+const FLOW_COLS = 108;
+// Match the reference "cross-exchange signal flow" rail: rows are CEX venues.
+// Some venues may not be wired yet; we still render the row for pixel parity.
+const FLOW_ROWS: Array<{ id: string; label: string; key: string }> = [
+  { id: 'BIN', label: 'BIN', key: 'binance' },
+  { id: 'CB', label: 'CB', key: 'coinbase' },
+  { id: 'OKX', label: 'OKX', key: 'okx' },
+  { id: 'BYB', label: 'BYB', key: 'bybit' },
+  { id: 'KRK', label: 'KRK', key: 'kraken' },
+  { id: 'BFX', label: 'BFX', key: 'bitfinex' },
+  // Optional rows shown in the reference aesthetic.
+  { id: 'GATE', label: 'GATE', key: 'gate' },
+  { id: 'MEXC', label: 'MEXC', key: 'mexc' },
+  { id: 'KUCN', label: 'KUCN', key: 'kucoin' },
+  { id: 'HTX', label: 'HTX', key: 'htx' },
+  { id: 'BSTP', label: 'BSTP', key: 'bitstamp' },
+  { id: 'GEM', label: 'GEM', key: 'gemini' },
+];
+
+function computeMedian(values: number[]): number | null {
+  const clean = values.filter((v) => Number.isFinite(v));
+  if (clean.length === 0) return null;
+  const sorted = [...clean].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[mid] as number;
+  const a = sorted[mid - 1] as number;
+  const b = sorted[mid] as number;
+  return (a + b) / 2;
+}
 
 function parseNumber(value: unknown): number | null {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) return null;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
 }
 
 function parseText(value: unknown): string | null {
@@ -175,6 +212,28 @@ function computeSharpe(returns: number[]): number | null {
   return mean / stdev;
 }
 
+function computeCorrelation(xs: number[], ys: number[]): number | null {
+  const n = Math.min(xs.length, ys.length);
+  if (n < 10) return null;
+  const x = xs.slice(xs.length - n);
+  const y = ys.slice(ys.length - n);
+  const meanX = x.reduce((a, b) => a + b, 0) / n;
+  const meanY = y.reduce((a, b) => a + b, 0) / n;
+  let cov = 0;
+  let varX = 0;
+  let varY = 0;
+  for (let i = 0; i < n; i += 1) {
+    const dx = x[i] - meanX;
+    const dy = y[i] - meanY;
+    cov += dx * dy;
+    varX += dx * dx;
+    varY += dy * dy;
+  }
+  const denom = Math.sqrt(varX * varY);
+  if (denom <= 1e-12) return null;
+  return cov / denom;
+}
+
 function computeMaxDrawdown(values: number[]): number {
   let peak = -Infinity;
   let maxDd = 0;
@@ -184,6 +243,18 @@ function computeMaxDrawdown(values: number[]): number {
     if (dd > maxDd) maxDd = dd;
   }
   return maxDd;
+}
+
+function isProbablyUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function windowLabelForResolvedTs(tsMs: number): { start: number; end: number; label: string } {
+  const epoch = Math.floor(tsMs / 1000);
+  // Trades resolve at (or immediately after) the 5m boundary, so treat the boundary as window end.
+  const end = epoch - (epoch % 300);
+  const start = end - 300;
+  return { start, end, label: formatEtWindow(start, end) };
 }
 
 export const Btc5mEnginePage: React.FC = () => {
@@ -197,13 +268,19 @@ export const Btc5mEnginePage: React.FC = () => {
   const [latestScanPasses, setLatestScanPasses] = useState(false);
 
   const [spotSeries, setSpotSeries] = useState<Array<{ timestamp: number; value: number }>>([]);
-  const [equitySeries, setEquitySeries] = useState<Array<{ timestamp: number; value: number }>>([]);
-  const [edgeSeries, setEdgeSeries] = useState<Array<{ timestamp: number; value: number }>>([]);
+  const [impliedSeries, setImpliedSeries] = useState<Array<{ timestamp: number; value: number }>>([]);
 
   const [tradeBlotter, setTradeBlotter] = useState<Record<string, TradeRecord>>({});
 
+  const [flowColumns, setFlowColumns] = useState<number[][]>(
+    () => Array.from({ length: FLOW_COLS }, () => Array(FLOW_ROWS.length).fill(0)),
+  );
+  const flowMaxAbsRef = useRef<number[]>(Array(FLOW_ROWS.length).fill(1e-9));
+  const lastGoodSpotRef = useRef<number | null>(null);
+  const lastCexSnapshotRef = useRef<Record<string, number>>({});
+
   const lastSpotPush = useRef(0);
-  const lastEdgePush = useRef(0);
+  const lastImpliedPush = useRef(0);
 
   const nowMs = useNowMs(250);
   const nowSec = Math.floor(nowMs / 1000);
@@ -362,21 +439,67 @@ export const Btc5mEnginePage: React.FC = () => {
       const ts = typeof scan.timestamp === 'number' ? scan.timestamp : Date.now();
       setLatestScanPasses(Boolean(scan?.passes_threshold));
 
-      const spot = parseNumber(scan?.meta?.spot ?? scan?.prices?.[0]);
-      if (spot !== null && ts - lastSpotPush.current >= 800) {
-        lastSpotPush.current = ts;
-        setSpotSeries((prev) => [...prev, { timestamp: ts, value: spot }].slice(-SERIES_MAX_POINTS));
+      const meta = scan?.meta ?? {};
+      const rawCexPrices = meta?.cex_prices && typeof meta.cex_prices === 'object' && !Array.isArray(meta.cex_prices)
+        ? meta.cex_prices as Record<string, unknown>
+        : null;
+      const parsedCexPrices: Record<string, number> = {};
+      if (rawCexPrices) {
+        Object.entries(rawCexPrices).forEach(([k, v]) => {
+          const n = parseNumber(v);
+          if (n !== null && n > 1_000 && n < 500_000) {
+            parsedCexPrices[k] = n;
+          }
+        });
+      }
+      const cexMid = parseNumber(meta?.cex_mid) ?? computeMedian(Object.values(parsedCexPrices));
+
+      // Prefer cross-exchange median as the "aggregated" spot for UI charts.
+      const spot = cexMid ?? parseNumber(meta?.spot ?? scan?.prices?.[0]);
+      if (spot !== null) {
+        const withinBounds = spot > 1_000 && spot < 500_000;
+        const last = lastGoodSpotRef.current;
+        const saneJump = last === null ? true : Math.abs(spot - last) / Math.max(1e-9, last) < 0.08;
+        if (withinBounds && saneJump) {
+          lastGoodSpotRef.current = spot;
+          if (ts - lastSpotPush.current >= 800) {
+            lastSpotPush.current = ts;
+            setSpotSeries((prev) => [...prev, { timestamp: ts, value: spot }].slice(-SERIES_MAX_POINTS));
+          }
+        }
       }
 
-      const edge = parseNumber(scan?.meta?.best_net_expected_roi ?? scan?.score ?? scan?.gap);
-      if (edge !== null && ts - lastEdgePush.current >= 250) {
-        lastEdgePush.current = ts;
-        setEdgeSeries((prev) => [...prev, { timestamp: ts, value: edge }].slice(-SERIES_MAX_POINTS));
+      const implied = parseNumber(scan?.meta?.yes_ask);
+      if (implied !== null && ts - lastImpliedPush.current >= 800) {
+        lastImpliedPush.current = ts;
+        setImpliedSeries((prev) => [...prev, { timestamp: ts, value: implied }].slice(-SERIES_MAX_POINTS));
       }
 
       if (scan?.meta) {
-        setLatestScanMeta(scan.meta);
+        setLatestScanMeta({ ...scan.meta, cex_mid: cexMid, cex_prices: parsedCexPrices });
       }
+
+      // Stream the signal-flow matrix right-to-left by pushing one column per scan.
+      // Each row is the exchange premium (bps) vs the median spot.
+      const denom = cexMid !== null && cexMid > 0 ? cexMid : null;
+      const column = FLOW_ROWS.map((row) => {
+        const px = parsedCexPrices[row.key];
+        if (!denom || !px) return 0;
+        return ((px - denom) / denom) * 10_000;
+      });
+
+      flowMaxAbsRef.current = flowMaxAbsRef.current.map((prevMax, idx) => {
+        const decayed = Math.max(1e-9, prevMax * 0.992);
+        return Math.max(decayed, Math.abs(column[idx] ?? 0) || 0);
+      });
+
+      setFlowColumns((prevCols) => {
+        const next = prevCols.length >= FLOW_COLS ? prevCols.slice(1) : prevCols.slice();
+        next.push(column);
+        return next;
+      });
+
+      lastCexSnapshotRef.current = parsedCexPrices;
     };
 
     socket.on('trading_mode_update', handleTradingMode);
@@ -402,10 +525,7 @@ export const Btc5mEnginePage: React.FC = () => {
         const res = await fetch('/api/arb/stats');
         if (!res.ok) return;
         const json = await res.json();
-        const equity = parseNumber(json?.simulation_ledger?.equity) ?? parseNumber(json?.bankroll);
-        const ts = Date.now();
-        if (!active || equity === null) return;
-        setEquitySeries((prev) => [...prev, { timestamp: ts, value: equity }].slice(-SERIES_MAX_POINTS));
+        if (!active) return;
         const tradingMode = json?.trading_mode;
         if (tradingMode === 'PAPER' || tradingMode === 'LIVE') {
           setMode(tradingMode);
@@ -425,7 +545,60 @@ export const Btc5mEnginePage: React.FC = () => {
     };
   }, []);
 
-  const spot = parseNumber(latestScanMeta?.spot) ?? (spotSeries.length ? spotSeries[spotSeries.length - 1].value : null);
+  useEffect(() => {
+    let cancelled = false;
+    const loadTradeHistory = async () => {
+      try {
+        const res = await fetch(`/api/arb/strategy-trades?strategy=${encodeURIComponent(STRATEGY_ID)}&limit=600`);
+        if (!res.ok) return;
+        const payload = await res.json() as { trades?: any[] };
+        const rows = Array.isArray(payload?.trades) ? payload.trades : [];
+        if (cancelled || rows.length === 0) return;
+        setTradeBlotter((prev) => {
+          const next = { ...prev };
+          rows.forEach((row, idx) => {
+            const ts = parseNumber(row?.timestamp) ?? Date.now();
+            const pnl = parseNumber(row?.pnl);
+            const notional = parseNumber(row?.notional) ?? 0;
+            const executionId = parseText(row?.execution_id) || `hist-${ts}-${idx}`;
+            const resolvedWindow = windowLabelForResolvedTs(ts);
+            next[executionId] = {
+              execution_id: executionId,
+              direction: safeDirection(row?.side) ?? null,
+              window_label: resolvedWindow.label,
+              entry_ts: resolvedWindow.start * 1000,
+              entry_price: parseNumber(row?.entry_price),
+              notional,
+              exit_ts: ts,
+              pnl: pnl ?? null,
+              status: 'RESOLVED',
+            };
+          });
+          return next;
+        });
+      } catch {
+        // ignore
+      }
+    };
+
+    void loadTradeHistory();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const cexMid = parseNumber(latestScanMeta?.cex_mid);
+  const spot = cexMid ?? parseNumber(latestScanMeta?.spot) ?? (spotSeries.length ? spotSeries[spotSeries.length - 1].value : null);
+  const cexPrices = useMemo(() => {
+    const raw = latestScanMeta?.cex_prices;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {} as Record<string, number>;
+    const out: Record<string, number> = {};
+    Object.entries(raw as Record<string, unknown>).forEach(([k, v]) => {
+      const n = parseNumber(v);
+      if (n !== null) out[k] = n;
+    });
+    return out;
+  }, [latestScanMeta]);
   const fairYes = parseNumber(latestScanMeta?.fair_yes);
   const yesAsk = parseNumber(latestScanMeta?.yes_ask);
   const noAsk = parseNumber(latestScanMeta?.no_ask);
@@ -434,13 +607,26 @@ export const Btc5mEnginePage: React.FC = () => {
   const bestProb = parseNumber(latestScanMeta?.best_prob);
   const bestNetExpected = parseNumber(latestScanMeta?.best_net_expected_roi);
   const kelly = parseNumber(latestScanMeta?.kelly_fraction);
+  const sigma = parseNumber(latestScanMeta?.sigma_annualized);
+
+  const corr = useMemo(() => {
+    const n = Math.min(spotSeries.length, impliedSeries.length, 120);
+    if (n < 24) return null;
+    const spotVals = spotSeries.slice(-n).map((p) => p.value);
+    const impliedVals = impliedSeries.slice(-n).map((p) => p.value);
+    const spotRet: number[] = [];
+    const impliedChg: number[] = [];
+    for (let i = 1; i < n; i += 1) {
+      const s0 = spotVals[i - 1];
+      const s1 = spotVals[i];
+      if (!Number.isFinite(s0) || !Number.isFinite(s1) || s0 <= 0 || s1 <= 0) continue;
+      spotRet.push(Math.log(s1 / s0));
+      impliedChg.push(impliedVals[i] - impliedVals[i - 1]);
+    }
+    return computeCorrelation(spotRet, impliedChg);
+  }, [spotSeries, impliedSeries]);
 
   const strat = strategyMetrics[STRATEGY_ID] || {};
-  const cumulativePnl = parseNumber(strat.pnl)
-    ?? (() => {
-      const lastEquity = equitySeries.length ? equitySeries[equitySeries.length - 1].value : DEFAULT_SIM_BANKROLL;
-      return lastEquity - DEFAULT_SIM_BANKROLL;
-    })();
   const allTradesSorted = useMemo(
     () => Object.values(tradeBlotter).sort((a, b) => b.entry_ts - a.entry_ts),
     [tradeBlotter],
@@ -449,7 +635,12 @@ export const Btc5mEnginePage: React.FC = () => {
     () => allTradesSorted.filter((t) => t.status !== 'OPEN'),
     [allTradesSorted],
   );
-  const trades = strat.daily_trades ?? closedTrades.length;
+  const closedTradePnl = useMemo(
+    () => closedTrades.reduce((sum, t) => sum + (t.pnl ?? 0), 0),
+    [closedTrades],
+  );
+  const cumulativePnl = parseNumber(strat.pnl) ?? closedTradePnl;
+  const trades = closedTrades.length;
   const wins = closedTrades.filter((t) => (t.pnl ?? 0) > 0).length;
   const winRate = closedTrades.length > 0 ? wins / closedTrades.length : 0;
 
@@ -457,6 +648,21 @@ export const Btc5mEnginePage: React.FC = () => {
   const todayPnl = closedTrades
     .filter((t) => (t.exit_ts ?? 0) >= todayStartMs)
     .reduce((sum, t) => sum + (t.pnl ?? 0), 0);
+
+  const equitySeries = useMemo(() => {
+    const ordered = [...closedTrades]
+      .filter((t) => (t.exit_ts ?? 0) > 0)
+      .sort((a, b) => (a.exit_ts ?? 0) - (b.exit_ts ?? 0));
+    let equity = DEFAULT_SIM_BANKROLL;
+    const series = ordered.map((t) => {
+      equity += t.pnl ?? 0;
+      return { timestamp: t.exit_ts ?? t.entry_ts, value: equity };
+    });
+    if (series.length === 0) {
+      return [{ timestamp: Date.now(), value: DEFAULT_SIM_BANKROLL }];
+    }
+    return series.slice(-SERIES_MAX_POINTS);
+  }, [closedTrades]);
 
   const equityValues = equitySeries.map((p) => p.value);
   const maxDd = equityValues.length > 5 ? computeMaxDrawdown(equityValues) : 0;
@@ -488,9 +694,61 @@ export const Btc5mEnginePage: React.FC = () => {
   const orderFeed = allTradesSorted.slice(0, ORDER_FEED_ROWS);
   const positions = allTradesSorted.slice(0, POSITIONS_ROWS);
 
+  const layoutDebugEnabled = useMemo(() => {
+    try {
+      return new URLSearchParams(window.location.search).has('debug_layout');
+    } catch {
+      return false;
+    }
+  }, []);
+  const layoutRefs = {
+    outer: useRef<HTMLDivElement | null>(null),
+    left: useRef<HTMLDivElement | null>(null),
+    top: useRef<HTMLDivElement | null>(null),
+    bottom: useRef<HTMLDivElement | null>(null),
+    right: useRef<HTMLDivElement | null>(null),
+  };
+  const [layoutDebugInfo, setLayoutDebugInfo] = useState<Record<string, any> | null>(null);
+
+  useEffect(() => {
+    if (!layoutDebugEnabled) return;
+    console.log('[BTC5M] layout version=2026-02-13.1');
+    const sample = () => {
+      const rect = (el: HTMLElement | null) => {
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return {
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          top: Math.round(r.top),
+          left: Math.round(r.left),
+          scrollH: el.scrollHeight,
+          clientH: el.clientHeight,
+        };
+      };
+      setLayoutDebugInfo({
+        pathname: window.location.pathname,
+        search: window.location.search,
+        inner: { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio },
+        outer: rect(layoutRefs.outer.current),
+        left: rect(layoutRefs.left.current),
+        top: rect(layoutRefs.top.current),
+        bottom: rect(layoutRefs.bottom.current),
+        right: rect(layoutRefs.right.current),
+      });
+    };
+    sample();
+    const t = window.setInterval(sample, 750);
+    window.addEventListener('resize', sample);
+    return () => {
+      window.clearInterval(t);
+      window.removeEventListener('resize', sample);
+    };
+  }, [layoutDebugEnabled]);
+
   return (
     <ExecutionLayout>
-      <div className="h-screen w-screen flex flex-col">
+      <div className="h-full w-full flex flex-col" data-btc5m-layout="2026-02-13.1">
         <TopBar
           btcPrice={formatBtcPrice(spot)}
           pnl={cumulativePnl}
@@ -503,86 +761,125 @@ export const Btc5mEnginePage: React.FC = () => {
           onExit={() => navigate('/polymarket')}
         />
 
-        <div className="flex-1 min-h-0 p-3">
+        <div className="flex-1 min-h-0 min-w-0 p-3 flex">
+          {/* Hard-layout the reference UI: left column is split into (top grid) + (fixed bottom band),
+              right column is the positions rail spanning full height. */}
           <div
-            className="h-full w-full grid gap-px bg-white/10 p-px"
+            className="flex-1 min-h-0 min-w-0 grid gap-px bg-white/10 p-px"
+            ref={layoutRefs.outer}
             style={{
-              gridTemplateColumns: 'minmax(340px, 3.4fr) minmax(420px, 4fr) minmax(420px, 4fr) minmax(320px, 2.4fr)',
-              gridTemplateRows: 'minmax(0, 1fr) minmax(0, 1fr) 240px',
+              gridTemplateColumns: 'minmax(0, 11.4fr) minmax(320px, 2.4fr)',
+              gridTemplateRows: 'minmax(0, 1fr)',
             }}
           >
-            <PanelCell style={{ gridColumn: '1', gridRow: '1 / span 2' }}>
-              <CumulativePnlPanel
-                cumulativePnl={cumulativePnl}
-                todayPnl={todayPnl}
-                roiPct={roiPct}
-                series={equitySeries.map((p) => p.value - DEFAULT_SIM_BANKROLL)}
-              />
-            </PanelCell>
+            <div className="h-full min-h-0 min-w-0 flex flex-col gap-px bg-white/10" ref={layoutRefs.left}>
+              <div
+                className="flex-1 min-h-0 grid gap-px bg-white/10"
+                ref={layoutRefs.top}
+                style={{
+                  gridTemplateColumns: 'minmax(340px, 3.4fr) minmax(420px, 4fr) minmax(420px, 4fr)',
+                  gridTemplateRows: 'minmax(0, 1fr) minmax(0, 1fr)',
+                }}
+              >
+                <PanelCell style={{ gridColumn: '1', gridRow: '1 / span 2' }}>
+                  <CumulativePnlPanel
+                    cumulativePnl={cumulativePnl}
+                    todayPnl={todayPnl}
+                    roiPct={roiPct}
+                    series={equitySeries.map((p) => p.value - DEFAULT_SIM_BANKROLL)}
+                  />
+                </PanelCell>
 
-            <PanelCell style={{ gridColumn: '2', gridRow: '1' }}>
-              <BigLinePanel
-                title="BTC/USD - AGGREGATED"
-                headline={formatBtcPrice(spot)}
-                series={spotSeries.map((p) => p.value)}
-              />
-            </PanelCell>
+                <PanelCell style={{ gridColumn: '2', gridRow: '1' }}>
+                  <BigLinePanel
+                    title="BTC/USD - AGGREGATED"
+                    headline={formatBtcPrice(spot)}
+                    series={spotSeries.map((p) => p.value).filter((v) => v > 1_000 && v < 500_000)}
+                  />
+                </PanelCell>
 
-            <PanelCell style={{ gridColumn: '3', gridRow: '1' }}>
-              <BigLinePanel
-                title="EQUITY CURVE"
-                headline=""
-                series={equitySeries.map((p) => p.value)}
-              />
-            </PanelCell>
+                <PanelCell style={{ gridColumn: '3', gridRow: '1' }}>
+                  <BigLinePanel
+                    title="EQUITY CURVE"
+                    headline=""
+                    series={equitySeries.map((p) => p.value)}
+                  />
+                </PanelCell>
 
-            <PanelCell style={{ gridColumn: '2', gridRow: '2' }}>
-              <OrderFeedPanel
-                rows={orderFeed}
-                onTrace={(id) => void openTrace(id)}
-              />
-            </PanelCell>
+                <PanelCell style={{ gridColumn: '2', gridRow: '2' }}>
+                  <OrderFeedPanel
+                    rows={orderFeed}
+                    onTrace={(id) => {
+                      if (!isProbablyUuid(id)) return;
+                      void openTrace(id);
+                    }}
+                  />
+                </PanelCell>
 
-            <PanelCell style={{ gridColumn: '3', gridRow: '2' }}>
-              <SignalFlowPanel values={edgeSeries.map((p) => p.value)} />
-            </PanelCell>
+                <PanelCell style={{ gridColumn: '3', gridRow: '2' }}>
+                  <SignalFlowPanel columns={flowColumns} maxAbs={flowMaxAbsRef.current} />
+                </PanelCell>
+              </div>
 
-            <PanelCell style={{ gridColumn: '1', gridRow: '3' }}>
-              <StatsPanel
-                avgPerTrade={avgPerTrade}
-                sharpe={sharpe}
-                maxDrawdown={maxDd}
-                openNotional={openNotional}
-                kelly={kelly}
-                ddLimitPct={-5.0}
-              />
-            </PanelCell>
+              <div
+                className="h-[240px] grid gap-px bg-white/10"
+                id="btc5m-bottom-band"
+                ref={layoutRefs.bottom}
+                style={{
+                  gridTemplateColumns: 'minmax(340px, 3.4fr) minmax(420px, 4fr) minmax(420px, 4fr)',
+                }}
+              >
+                <PanelCell>
+                  <StatsPanel
+                    avgPerTrade={avgPerTrade}
+                    sharpe={sharpe}
+                    maxDrawdown={maxDd}
+                    openNotional={openNotional}
+                    kelly={kelly}
+                    ddLimitPct={-5.0}
+                  />
+                </PanelCell>
 
-            <PanelCell style={{ gridColumn: '2 / span 2', gridRow: '3' }}>
-              <ExecutionPipelinePanel
-                spot={spot}
-                yesAsk={yesAsk}
-                noAsk={noAsk}
-                fairYes={fairYes}
-                bestSide={bestSide}
-                bestPrice={bestPrice}
-                bestProb={bestProb}
-                bestNetExpected={bestNetExpected}
-                kelly={kelly}
-                execDecision={execDecision}
-                liveModeLabel={mode === 'PAPER' ? 'PAPER' : liveOrderPostingEnabled ? 'LIVE' : 'DRY-RUN'}
-                notionalHint={openNotional > 0 ? openNotional : lastNotional}
-              />
-            </PanelCell>
+                <PanelCell style={{ gridColumn: '2 / span 2' }}>
+                  <ExecutionPipelinePanel
+                    spot={spot}
+                    cexPrices={cexPrices}
+                    yesAsk={yesAsk}
+                    noAsk={noAsk}
+                    fairYes={fairYes}
+                    sigma={sigma}
+                    corr={corr}
+                    bestSide={bestSide}
+                    bestPrice={bestPrice}
+                    bestProb={bestProb}
+                    bestNetExpected={bestNetExpected}
+                    kelly={kelly}
+                    execDecision={execDecision}
+                    liveModeLabel={mode === 'PAPER' ? 'PAPER' : liveOrderPostingEnabled ? 'LIVE' : 'DRY-RUN'}
+                    notionalHint={openNotional > 0 ? openNotional : lastNotional}
+                  />
+                </PanelCell>
+              </div>
+            </div>
 
-            <PanelCell style={{ gridColumn: '4', gridRow: '1 / span 3' }}>
+            <PanelCell>
               <PositionsPanel
                 rows={positions}
-                onTrace={(id) => void openTrace(id)}
+                onTrace={(id) => {
+                  if (!isProbablyUuid(id)) return;
+                  void openTrace(id);
+                }}
               />
             </PanelCell>
           </div>
         </div>
+
+        {layoutDebugEnabled && layoutDebugInfo && (
+          <div className="fixed bottom-3 left-3 z-[200] bg-black/80 border border-white/20 backdrop-blur-sm px-3 py-2 text-[10px] font-mono text-gray-100 max-w-[520px]">
+            <div className="text-gray-400 uppercase tracking-widest">layout debug</div>
+            <pre className="mt-1 whitespace-pre-wrap">{JSON.stringify(layoutDebugInfo, null, 2)}</pre>
+          </div>
+        )}
 
         {traceExecutionId && (
           <div className="fixed inset-0 z-[120] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
@@ -681,12 +978,12 @@ function TopBar(props: {
 function PanelCell({ children, style }: { children: React.ReactNode; style?: React.CSSProperties }) {
   return (
     <section
-      className="bg-[#070707] relative overflow-hidden"
+      className="bg-[#070707] relative overflow-hidden min-h-0 min-w-0"
       style={style}
     >
       <div className="absolute inset-0 pointer-events-none bg-[linear-gradient(180deg,rgba(255,255,255,0.04),transparent_45%)]" />
       <div className="absolute inset-0 pointer-events-none shadow-[inset_0_0_0_1px_rgba(255,255,255,0.02)]" />
-      <div className="relative z-10 h-full">
+      <div className="relative z-10 h-full min-h-0">
         {children}
       </div>
     </section>
@@ -713,7 +1010,7 @@ function CumulativePnlPanel(props: {
   const roiClass = props.roiPct >= 0 ? 'text-gray-400' : 'text-gray-400';
 
   return (
-    <div className="h-full relative">
+    <div className="h-full min-h-0 relative">
       <div className="absolute inset-0">
         <GlowLineChart series={props.series} stroke="rgba(255,255,255,0.92)" />
       </div>
@@ -733,7 +1030,7 @@ function CumulativePnlPanel(props: {
 
 function BigLinePanel(props: { title: string; headline: string; series: number[] }) {
   return (
-    <div className="h-full relative">
+    <div className="h-full min-h-0 relative">
       <div className="absolute inset-0">
         <GlowLineChart series={props.series} stroke="rgba(255,255,255,0.85)" />
       </div>
@@ -751,17 +1048,16 @@ function BigLinePanel(props: { title: string; headline: string; series: number[]
 
 function OrderFeedPanel(props: { rows: TradeRecord[]; onTrace: (id: string) => void }) {
   return (
-    <div className="h-full flex flex-col">
+    <div className="h-full min-h-0 flex flex-col">
       <div className="px-5 pt-4">
         <PanelTitle>ORDER FEED</PanelTitle>
       </div>
-      <div className="px-5 pt-3 text-[10px] font-mono uppercase tracking-widest text-gray-600 grid grid-cols-[84px_120px_80px_84px_110px_1fr] gap-3 border-b border-white/10 pb-2">
+      <div className="px-5 pt-3 text-[10px] font-mono uppercase tracking-widest text-gray-600 grid grid-cols-[84px_140px_70px_84px_110px] gap-3 border-b border-white/10 pb-2">
         <div>TIME</div>
         <div>MARKET</div>
         <div>SIDE</div>
         <div>ENTRY</div>
         <div>SIZE</div>
-        <div>STATUS</div>
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto px-5 py-3">
         {props.rows.length === 0 && (
@@ -769,14 +1065,9 @@ function OrderFeedPanel(props: { rows: TradeRecord[]; onTrace: (id: string) => v
         )}
         <div className="space-y-2">
           {props.rows.map((row) => {
-            const pnl = row.pnl;
-            const pnlText = pnl === null ? '--' : formatUsdSigned0Spaces(pnl);
-            const pnlClass = pnl === null ? 'text-gray-600' : pnl >= 0 ? 'text-emerald-300' : 'text-rose-300';
             const sideLabel = row.direction || '--';
             const sideClass = sideLabel === 'UP' ? 'text-emerald-300' : sideLabel === 'DOWN' ? 'text-rose-300' : 'text-gray-400';
             const barClass = sideLabel === 'UP' ? 'bg-emerald-400' : sideLabel === 'DOWN' ? 'bg-rose-400' : 'bg-white/15';
-            const status = row.status === 'STOPPED' ? 'stopped ×' : row.status === 'OPEN' ? 'open' : 'resolved ✓';
-            const statusClass = row.status === 'STOPPED' ? 'text-rose-300' : row.status === 'OPEN' ? 'text-gray-400' : 'text-gray-400';
 
             const windowShort = row.window_label.replace(' ET', '');
 
@@ -788,19 +1079,13 @@ function OrderFeedPanel(props: { rows: TradeRecord[]; onTrace: (id: string) => v
                 className="w-full text-left group"
                 title={`Open trace ${row.execution_id}`}
               >
-                <div className="grid grid-cols-[2px_84px_120px_80px_84px_110px_1fr] gap-3 items-center">
+                <div className="grid grid-cols-[2px_84px_140px_70px_84px_110px] gap-3 items-center">
                   <div className={`h-10 ${barClass}`} />
                   <div className="font-mono text-[11px] text-gray-500">{formatTime24h(row.entry_ts)}</div>
                   <div className="font-mono text-[11px] text-gray-300">{windowShort}</div>
                   <div className={`font-mono text-[11px] font-semibold ${sideClass}`}>{sideLabel}</div>
                   <div className="font-mono text-[11px] text-gray-200">{formatCents0(row.entry_price)}</div>
                   <div className="font-mono text-[11px] text-gray-200">{formatUsd0Spaces(row.notional)}</div>
-                  <div className={`font-mono text-[11px] ${statusClass} flex items-center justify-between gap-3`}>
-                    <span className="truncate">{status}</span>
-                    <span className={pnlClass}>
-                      {pnlText}
-                    </span>
-                  </div>
                 </div>
               </button>
             );
@@ -811,14 +1096,14 @@ function OrderFeedPanel(props: { rows: TradeRecord[]; onTrace: (id: string) => v
   );
 }
 
-function SignalFlowPanel(props: { values: number[] }) {
+function SignalFlowPanel(props: { columns: number[][]; maxAbs: number[] }) {
   return (
-    <div className="h-full flex flex-col">
+    <div className="h-full min-h-0 flex flex-col">
       <div className="px-5 pt-4">
         <PanelTitle>CROSS-EXCHANGE SIGNAL FLOW</PanelTitle>
       </div>
       <div className="flex-1 min-h-0 p-5">
-        <SignalFlowMatrix values={props.values} />
+        <SignalFlowMatrix columns={props.columns} maxAbs={props.maxAbs} />
       </div>
     </div>
   );
@@ -834,37 +1119,49 @@ function StatsPanel(props: {
 }) {
   return (
     <div className="h-full p-5">
-      <div className="grid grid-cols-2 gap-x-8 gap-y-6">
-        <MiniStat
-          label="AVG / TRADE"
-          value={formatUsd2SignedNoPlus(props.avgPerTrade)}
-          valueClass={props.avgPerTrade >= 0 ? 'text-emerald-300' : 'text-rose-300'}
-        />
-        <MiniStat
-          label="SHARPE"
-          value={props.sharpe === null ? '--' : props.sharpe.toFixed(2)}
-          valueClass="text-gray-100"
-        />
-        <MiniStat
-          label="MAX DD"
-          value={props.maxDrawdown > 0 ? formatUsd0Commas(-props.maxDrawdown) : '$0'}
-          valueClass={props.maxDrawdown > 0 ? 'text-rose-300' : 'text-gray-200'}
-        />
-        <MiniStat
-          label="OPEN POS"
-          value={formatUsd0Spaces(props.openNotional)}
-          valueClass={props.openNotional > 0 ? 'text-amber-300' : 'text-gray-200'}
-        />
-        <MiniStat
-          label="KELLY F*"
-          value={props.kelly === null ? '--' : `${(Math.max(0, Math.min(1, props.kelly)) * 100).toFixed(2)}%`}
-          valueClass="text-gray-100"
-        />
-        <MiniStat
-          label="DD LIMIT"
-          value={`${props.ddLimitPct.toFixed(1)}%`}
-          valueClass="text-rose-300"
-        />
+      <div className="grid grid-cols-2 grid-rows-3 gap-px bg-white/10 h-full">
+        <div className="bg-black/40 px-5 py-4">
+          <MiniStat
+            label="AVG / TRADE"
+            value={formatUsd2SignedNoPlus(props.avgPerTrade)}
+            valueClass={props.avgPerTrade >= 0 ? 'text-emerald-300' : 'text-rose-300'}
+          />
+        </div>
+        <div className="bg-black/40 px-5 py-4">
+          <MiniStat
+            label="SHARPE"
+            value={props.sharpe === null ? '--' : props.sharpe.toFixed(2)}
+            valueClass="text-gray-100"
+          />
+        </div>
+        <div className="bg-black/40 px-5 py-4">
+          <MiniStat
+            label="MAX DD"
+            value={props.maxDrawdown > 0 ? formatUsd0Commas(-props.maxDrawdown) : '$0'}
+            valueClass={props.maxDrawdown > 0 ? 'text-rose-300' : 'text-gray-200'}
+          />
+        </div>
+        <div className="bg-black/40 px-5 py-4">
+          <MiniStat
+            label="OPEN POS"
+            value={formatUsd0Spaces(props.openNotional)}
+            valueClass={props.openNotional > 0 ? 'text-amber-300' : 'text-gray-200'}
+          />
+        </div>
+        <div className="bg-black/40 px-5 py-4">
+          <MiniStat
+            label="KELLY F*"
+            value={props.kelly === null ? '--' : `${(Math.max(0, Math.min(1, props.kelly)) * 100).toFixed(2)}%`}
+            valueClass="text-gray-100"
+          />
+        </div>
+        <div className="bg-black/40 px-5 py-4">
+          <MiniStat
+            label="DD LIMIT"
+            value={`${props.ddLimitPct.toFixed(1)}%`}
+            valueClass="text-rose-300"
+          />
+        </div>
       </div>
     </div>
   );
@@ -879,11 +1176,24 @@ function MiniStat(props: { label: string; value: string; valueClass: string }) {
   );
 }
 
+function usePipelineSweep(stepCount: number, stepMs: number): { activeIndex: number; warmIndex: number; warmProgress: number } {
+  const now = useNowMs(50);
+  const cycleMs = Math.max(1, stepCount * stepMs);
+  const t = ((now % cycleMs) + cycleMs) % cycleMs;
+  const activeIndex = Math.floor(t / stepMs) % stepCount;
+  const warmIndex = (activeIndex + 1) % stepCount;
+  const warmProgress = Math.min(1, Math.max(0, (t % stepMs) / stepMs));
+  return { activeIndex, warmIndex, warmProgress };
+}
+
 function ExecutionPipelinePanel(props: {
   spot: number | null;
+  cexPrices: Record<string, number>;
   yesAsk: number | null;
   noAsk: number | null;
   fairYes: number | null;
+  sigma: number | null;
+  corr: number | null;
   bestSide: 'UP' | 'DOWN' | null;
   bestPrice: number | null;
   bestProb: number | null;
@@ -895,12 +1205,15 @@ function ExecutionPipelinePanel(props: {
 }) {
   const impliedYes = props.yesAsk;
   const cexProb = props.fairYes;
-  const edge = impliedYes !== null && cexProb !== null ? (cexProb - impliedYes) : null;
-  const edgeBps = edge !== null ? edge * 10_000 : null;
-  const netBps = props.bestNetExpected !== null ? props.bestNetExpected * 10_000 : null;
+  const edgePct = impliedYes !== null && cexProb !== null ? (cexProb - impliedYes) * 100 : null;
   const evUsd = props.bestNetExpected !== null && Number.isFinite(props.notionalHint) && props.notionalHint > 0
     ? props.notionalHint * props.bestNetExpected
     : null;
+  const sweep = usePipelineSweep(5, 200);
+  const px = (key: string): string => {
+    const value = props.cexPrices?.[key];
+    return typeof value === 'number' && Number.isFinite(value) ? formatUsd0Spaces(value) : '--';
+  };
 
   return (
     <div className="h-full flex flex-col">
@@ -908,40 +1221,49 @@ function ExecutionPipelinePanel(props: {
         <PanelTitle>EXECUTION PIPELINE</PanelTitle>
       </div>
       <div className="flex-1 min-h-0 p-5">
-        <div className="grid grid-cols-5 gap-px bg-white/10 h-full">
-          <PipeCard title="01" subtitle="CEX FEEDS">
-            <PipeRow k="coinbase" v={props.spot === null ? '--' : formatUsd0Spaces(props.spot)} />
-            <PipeRow k="binance" v="--" />
-            <PipeRow k="okx" v="--" />
-            <PipeRow k="bybit" v="--" />
-            <PipeRow k="kraken" v="--" />
-            <PipeRow k="bitfinex" v="--" />
+        <div className="grid gap-px bg-white/10 h-full grid-cols-[minmax(0,1fr)_18px_minmax(0,1fr)_18px_minmax(0,1fr)_18px_minmax(0,1fr)_18px_minmax(0,1fr)]">
+          <PipeCard idx={0} sweep={sweep} title="01" subtitle="CEX FEEDS">
+            <PipeRow k="binance" v={px('binance')} />
+            <PipeRow k="coinbase" v={px('coinbase')} kClass="text-gray-200" vClass="text-gray-100" />
+            <PipeRow k="okx" v={px('okx')} />
+            <PipeRow k="bybit" v={px('bybit')} />
+            <PipeRow k="kraken" v={px('kraken')} />
+            <PipeRow k="bitfinex" v={px('bitfinex')} />
           </PipeCard>
-          <PipeCard title="02" subtitle="PM ODDS">
+          <PipeArrow />
+          <PipeCard idx={1} sweep={sweep} title="02" subtitle="PM ODDS">
             <PipeRow k="UP" v={props.yesAsk === null ? '--' : formatCents0(props.yesAsk)} vClass="text-emerald-300" />
             <PipeRow k="DN" v={props.noAsk === null ? '--' : formatCents0(props.noAsk)} vClass="text-rose-300" />
             <PipeRow k="implied" v={impliedYes === null ? '--' : `${(Math.max(0, Math.min(1, impliedYes)) * 100).toFixed(1)}%`} />
+            <div className="mt-3 text-[11px] font-mono text-gray-500">
+              vol <span className="text-gray-400">--</span>
+            </div>
           </PipeCard>
-          <PipeCard title="03" subtitle="EDGE">
+          <PipeArrow />
+          <PipeCard idx={2} sweep={sweep} title="03" subtitle="EDGE">
             <PipeRow k="cex" v={cexProb === null ? '--' : `${(Math.max(0, Math.min(1, cexProb)) * 100).toFixed(1)}%`} />
             <PipeRow k="pm" v={impliedYes === null ? '--' : `${(Math.max(0, Math.min(1, impliedYes)) * 100).toFixed(1)}%`} />
             <PipeRow
               k="edge"
-              v={edgeBps === null ? '--' : `${edgeBps >= 0 ? '+' : ''}${edgeBps.toFixed(1)}bps`}
-              vClass={edgeBps !== null && edgeBps >= 0 ? 'text-emerald-300' : 'text-rose-300'}
+              v={edgePct === null ? '--' : `${edgePct >= 0 ? '+' : ''}${edgePct.toFixed(1)}%`}
+              vClass={edgePct !== null && edgePct >= 0 ? 'text-emerald-300' : 'text-rose-300'}
             />
-            <PipeRow
-              k="net"
-              v={netBps === null ? '--' : `${netBps >= 0 ? '+' : ''}${netBps.toFixed(1)}bps`}
-              vClass={netBps !== null && netBps >= 0 ? 'text-emerald-300' : 'text-rose-300'}
-            />
+            <div className="mt-3 text-[11px] font-mono text-gray-500">
+              σ <span className="text-gray-200">{props.sigma === null ? '--' : props.sigma.toFixed(1)}</span>
+            </div>
           </PipeCard>
-          <PipeCard title="04" subtitle="KELLY">
+          <PipeArrow />
+          <PipeCard idx={3} sweep={sweep} title="04" subtitle="KELLY">
             <PipeRow k="f*" v={props.kelly === null ? '--' : `${(Math.max(0, Math.min(1, props.kelly)) * 100).toFixed(2)}%`} />
-            <PipeRow k="p" v={props.bestProb === null ? '--' : `${(Math.max(0, Math.min(1, props.bestProb)) * 100).toFixed(1)}%`} />
-            <PipeRow k="entry" v={props.bestPrice === null ? '--' : formatCents0(props.bestPrice)} />
+            <PipeRow k="½k" v={props.kelly === null ? '--' : `${(Math.max(0, Math.min(1, props.kelly / 2)) * 100).toFixed(2)}%`} />
+            <PipeRow k="corr" v={props.corr === null ? '--' : props.corr.toFixed(2)} />
+            <div className="mt-3 text-[11px] font-mono">
+              <span className="text-gray-500">$ </span>
+              <span className="text-gray-200">{props.notionalHint > 0 ? formatIntSpaces(props.notionalHint) : '--'}</span>
+            </div>
           </PipeCard>
-          <PipeCard title="05" subtitle="EXEC">
+          <PipeArrow />
+          <PipeCard idx={4} sweep={sweep} title="05" subtitle="EXEC">
             <PipeRow k="dir" v={props.bestSide || '--'} vClass={props.bestSide === 'UP' ? 'text-emerald-300' : props.bestSide === 'DOWN' ? 'text-rose-300' : 'text-gray-200'} />
             <PipeRow k="@" v={props.bestPrice === null ? '--' : formatCents0(props.bestPrice)} />
             <div className="mt-3 text-[11px] font-mono">
@@ -957,9 +1279,38 @@ function ExecutionPipelinePanel(props: {
   );
 }
 
-function PipeCard(props: { title: string; subtitle: string; children: React.ReactNode }) {
+function PipeArrow() {
   return (
-    <div className="bg-[#070707] p-4 flex flex-col justify-between">
+    <div className="bg-[#070707] flex items-center justify-center text-gray-600 font-mono text-[14px] select-none">
+      →
+    </div>
+  );
+}
+
+function PipeCard(props: {
+  idx: number;
+  sweep: { activeIndex: number; warmIndex: number; warmProgress: number };
+  title: string;
+  subtitle: string;
+  children: React.ReactNode;
+}) {
+  const isActive = props.idx === props.sweep.activeIndex;
+  const isWarm = props.idx === props.sweep.warmIndex;
+  const warmOpacity = isWarm ? 0.18 + props.sweep.warmProgress * 0.62 : 0;
+  const topLineOpacity = isActive ? 0.92 : warmOpacity;
+  return (
+    <div className={`bg-[#070707] p-4 flex flex-col justify-between relative ${isActive ? 'bg-white/[0.03]' : isWarm ? 'bg-white/[0.015]' : ''}`}>
+      <div
+        className="absolute left-0 right-0 top-0 h-[2px]"
+        style={{
+          background: `rgba(255,255,255,${topLineOpacity.toFixed(3)})`,
+          boxShadow: isActive
+            ? '0 0 10px rgba(255,255,255,0.22)'
+            : isWarm
+              ? '0 0 8px rgba(255,255,255,0.12)'
+              : 'none',
+        }}
+      />
       <div>
         <div className="flex items-center gap-3 font-mono text-[10px] uppercase tracking-widest text-gray-600">
           <span className="text-gray-500">{props.title}</span>
@@ -973,10 +1324,10 @@ function PipeCard(props: { title: string; subtitle: string; children: React.Reac
   );
 }
 
-function PipeRow(props: { k: string; v: string; vClass?: string }) {
+function PipeRow(props: { k: string; v: string; kClass?: string; vClass?: string }) {
   return (
     <div className="flex items-center justify-between gap-3 font-mono text-[12px]">
-      <span className="text-gray-500">{props.k}</span>
+      <span className={props.kClass || 'text-gray-500'}>{props.k}</span>
       <span className={props.vClass || 'text-gray-200'}>{props.v}</span>
     </div>
   );
@@ -984,7 +1335,7 @@ function PipeRow(props: { k: string; v: string; vClass?: string }) {
 
 function PositionsPanel(props: { rows: TradeRecord[]; onTrace: (id: string) => void }) {
   return (
-    <div className="h-full flex flex-col">
+    <div className="h-full min-h-0 flex flex-col">
       <div className="px-5 pt-4 pb-3 border-b border-white/10">
         <PanelTitle>POSITIONS</PanelTitle>
       </div>
@@ -997,10 +1348,24 @@ function PositionsPanel(props: { rows: TradeRecord[]; onTrace: (id: string) => v
             const pnl = row.pnl;
             const pnlText = pnl === null ? '--' : formatUsdSigned0Spaces(pnl);
             const pnlClass = pnl === null ? 'text-gray-600' : pnl >= 0 ? 'text-emerald-300' : 'text-rose-300';
-            const edgeBar = pnl === null ? 'bg-white/15' : pnl >= 0 ? 'bg-emerald-400' : 'bg-rose-400';
+            const edgeBar = row.direction === 'UP' ? 'bg-emerald-400' : row.direction === 'DOWN' ? 'bg-rose-400' : 'bg-white/15';
             const sideClass = row.direction === 'UP' ? 'text-emerald-300' : row.direction === 'DOWN' ? 'text-rose-300' : 'text-gray-400';
             const arrow = row.direction === 'UP' ? '▲' : row.direction === 'DOWN' ? '▼' : '•';
             const status = row.status === 'STOPPED' ? 'stopped ×' : row.status === 'OPEN' ? 'open' : 'resolved ✓';
+            const progress = (() => {
+              const entry = row.entry_ts || 0;
+              const end = row.exit_ts ?? Date.now();
+              const denom = 300_000;
+              if (entry <= 0) return 1;
+              return Math.max(0.05, Math.min(1, (end - entry) / denom));
+            })();
+            const progressClass = row.status === 'STOPPED'
+              ? 'bg-rose-400'
+              : pnl === null
+                ? 'bg-white/15'
+                : pnl >= 0
+                  ? 'bg-emerald-400'
+                  : 'bg-rose-400';
 
             return (
               <button
@@ -1031,6 +1396,9 @@ function PositionsPanel(props: { rows: TradeRecord[]; onTrace: (id: string) => v
                     <div className="mt-2 font-mono text-[11px] text-gray-400">
                       {status}
                     </div>
+                    <div className="mt-3 h-[2px] w-full bg-white/10 overflow-hidden">
+                      <div className={`h-full ${progressClass}`} style={{ width: `${(progress * 100).toFixed(1)}%` }} />
+                    </div>
                   </div>
                 </div>
               </button>
@@ -1052,14 +1420,23 @@ function GlowLineChart(props: { series: number[]; stroke: string }) {
   const height = 420;
   const padX = 14;
   const padY = 14;
-  const min = Math.min(...points);
-  const max = Math.max(...points);
+  // Winsorize against single bad ticks so charts don't explode vertically.
+  const sorted = [...points].sort((a, b) => a - b);
+  const lowIdx = Math.floor(sorted.length * 0.02);
+  const highIdx = Math.max(lowIdx + 1, Math.ceil(sorted.length * 0.98) - 1);
+  let min = sorted[Math.max(0, Math.min(sorted.length - 1, lowIdx))] as number;
+  let max = sorted[Math.max(0, Math.min(sorted.length - 1, highIdx))] as number;
+  if (!Number.isFinite(min) || !Number.isFinite(max) || Math.abs(max - min) < 1e-9) {
+    min = Math.min(...points);
+    max = Math.max(...points);
+  }
   const spread = Math.max(1e-9, max - min);
 
   const poly = points
     .map((v, i) => {
+      const clamped = Math.min(max, Math.max(min, v));
       const x = padX + (i / (points.length - 1)) * (width - padX * 2);
-      const y = height - padY - ((v - min) / spread) * (height - padY * 2);
+      const y = height - padY - ((clamped - min) / spread) * (height - padY * 2);
       return `${x.toFixed(2)},${y.toFixed(2)}`;
     })
     .join(' ');
@@ -1105,37 +1482,51 @@ function GlowLineChart(props: { series: number[]; stroke: string }) {
   );
 }
 
-function SignalFlowMatrix(props: { values: number[] }) {
-  const cols = 64;
-  const rows = 18;
-  const needed = cols * rows;
-  const slice = props.values.slice(-needed);
-  const padded = slice.length < needed
-    ? new Array(needed - slice.length).fill(0).concat(slice)
-    : slice;
-
-  const maxAbs = Math.max(1e-9, ...padded.map((v) => Math.abs(v)));
+function SignalFlowMatrix(props: { columns: number[][]; maxAbs: number[] }) {
+  const cols = props.columns.length;
+  const rows = FLOW_ROWS.length;
+  const maxAbs = props.maxAbs.length === rows ? props.maxAbs : new Array(rows).fill(1);
 
   return (
-    <div
-      className="grid gap-[2px] h-full"
-      style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}
-    >
-      {padded.map((v, idx) => {
-        const intensity = Math.min(1, Math.abs(v) / maxAbs);
-        // grayscale with slightly higher brightness for positive edges
-        const base = 0.06;
-        const bright = base + intensity * 0.72;
-        const alpha = v >= 0 ? bright : bright * 0.42;
-        const bg = `rgba(255,255,255,${alpha.toFixed(3)})`;
-        return (
-          <div
-            key={idx}
-            className="rounded-[1px] border border-white/5"
-            style={{ background: bg }}
-          />
-        );
-      })}
+    <div className="h-full flex">
+      <div
+        className="w-12 pr-2 grid"
+        style={{ gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))` }}
+      >
+        {FLOW_ROWS.map((row) => (
+          <div key={row.id} className="text-[9px] font-mono uppercase tracking-widest text-gray-600 leading-none">
+            {row.label}
+          </div>
+        ))}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div
+          className="grid gap-px bg-white/10 p-px h-full"
+          style={{
+            gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
+            gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))`,
+          }}
+        >
+          {Array.from({ length: rows }).flatMap((_, rowIdx) => (
+            props.columns.map((col, colIdx) => {
+              const raw = Number(col?.[rowIdx] ?? 0);
+              const denom = Math.max(1e-9, Number(maxAbs[rowIdx] ?? 1e-9));
+              const intensity = Math.min(1, Math.abs(raw) / denom);
+              const base = 0.04;
+              const bright = base + intensity * 0.86;
+              const alpha = raw >= 0 ? bright : bright * 0.46;
+              const bg = `rgba(255,255,255,${alpha.toFixed(3)})`;
+              return (
+                <div
+                  key={`${rowIdx}-${colIdx}`}
+                  className="bg-[#070707]"
+                  style={{ background: bg }}
+                />
+              );
+            })
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

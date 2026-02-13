@@ -6,8 +6,14 @@ This document describes the BTC 5-minute window strategy and its UI page.
 - Strategy ID: `BTC_5M`
 - Heartbeat ID: `btc_5m`
 - UI page route: `/btc-5m-engine`
-- Data feeds (existing only):
-  - Coinbase Advanced Trade WS ticker (`BTC-USD`)
+- Data feeds (wired now):
+  - Coinbase Advanced Trade WS ticker (`BTC-USD`) (also used as the settlement reference in PAPER mode)
+  - Public CEX WS tickers for cross-exchange spot telemetry (no auth):
+    - Binance.US book ticker (`BTCUSDT`) (default in US; override via `BINANCE_WS_URL`)
+    - OKX tickers (`BTC-USDT`)
+    - Bybit tickers (`BTCUSDT`)
+    - Kraken ticker (`XBT/USD`)
+    - Bitfinex ticker (`tBTCUSD`)
   - Polymarket Gamma events lookup by slug
   - Polymarket CLOB market WS book updates for the window's YES/NO tokens
 
@@ -82,6 +88,6 @@ docker compose -f infrastructure/docker-compose.yml up -d arb-scanner-btc-5m
 ```
 
 ## Known Limitations (Current)
-- "Across exchanges" is not implemented because only Coinbase is currently wired as a CEX feed.
+- Cross-exchange prices are treated as "USD-ish" even when sourced from USDT venues (good for telemetry; tighten if used for settlement).
 - Entry/exit assumes taker fills at best ask/bid; no partial-fill modeling.
 - Probability model is simplified; it is a baseline intended to be tuned/validated with replay + walk-forward.

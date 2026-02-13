@@ -15,10 +15,13 @@ type StrategyTradeRecord = {
     net_return?: number;
     round_trip_cost_rate?: number;
     cost_drag_return?: number;
+    side?: string;
+    entry_price?: number;
 };
 
 type Row = Record<string, unknown>;
 
+const CSV_HEADER_V3 = 'timestamp,strategy,variant,pnl,notional,mode,reason,gross_return,net_return,round_trip_cost_rate,cost_drag_return,execution_id,side,entry_price\n';
 const CSV_HEADER_V2 = 'timestamp,strategy,variant,pnl,notional,mode,reason,gross_return,net_return,round_trip_cost_rate,cost_drag_return,execution_id\n';
 const CSV_HEADER_V1 = 'timestamp,strategy,variant,pnl,notional,mode,reason,gross_return,net_return,round_trip_cost_rate,cost_drag_return\n';
 const LEGACY_CSV_HEADER = 'timestamp,strategy,variant,pnl,notional,mode,reason';
@@ -42,6 +45,68 @@ function parseString(input: unknown): string | null {
 function csvEscape(value: string): string {
     const escaped = value.replace(/"/g, '""');
     return `"${escaped}"`;
+}
+
+function parseCsvLine(line: string): string[] {
+    const out: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i += 1) {
+        const ch = line[i] as string;
+        if (ch === '"') {
+            const next = line[i + 1];
+            if (inQuotes && next === '"') {
+                current += '"';
+                i += 1;
+                continue;
+            }
+            inQuotes = !inQuotes;
+            continue;
+        }
+        if (ch === ',' && !inQuotes) {
+            out.push(current);
+            current = '';
+            continue;
+        }
+        current += ch;
+    }
+    out.push(current);
+    return out;
+}
+
+async function migrateCsvToHeaderV3(filePath: string): Promise<void> {
+    const content = await fs.readFile(filePath, 'utf8');
+    const lines = content.split('\n');
+    const trimmedLines = lines.map((line) => line.trim()).filter((line) => line.length > 0);
+    if (trimmedLines.length === 0) {
+        await fs.writeFile(filePath, CSV_HEADER_V3, { encoding: 'utf8' });
+        return;
+    }
+
+    const headerLine = trimmedLines[0] as string;
+    const headerCols = parseCsvLine(headerLine).map((cell) => cell.trim().replace(/^"|"$/g, '').toLowerCase());
+    const hasSide = headerCols.includes('side');
+    const hasEntry = headerCols.includes('entry_price');
+    const hasExecution = headerCols.includes('execution_id');
+    const needs = !(hasSide && hasEntry && hasExecution);
+    if (!needs) {
+        return;
+    }
+
+    const targetCols = parseCsvLine(CSV_HEADER_V3.trim()).length;
+    const updated: string[] = [CSV_HEADER_V3.trim()];
+    for (let i = 1; i < trimmedLines.length; i += 1) {
+        const line = trimmedLines[i] as string;
+        const cells = parseCsvLine(line);
+        const missing = targetCols - cells.length;
+        if (missing > 0) {
+            updated.push(`${line}${','.repeat(missing)}`);
+        } else {
+            updated.push(line);
+        }
+    }
+
+    await fs.writeFile(filePath, `${updated.join('\n')}\n`, { encoding: 'utf8' });
 }
 
 function toRecord(payload: unknown): StrategyTradeRecord | null {
@@ -82,6 +147,13 @@ function toRecord(payload: unknown): StrategyTradeRecord | null {
     const costDragReturn = grossReturn !== undefined && netReturn !== undefined
         ? grossReturn - netReturn
         : roundTripCostRate;
+    const side = parseString(row.side)
+        || parseString(details?.side)
+        || parseString(details?.position_side)
+        || undefined;
+    const entryPrice = parseNumber(row.entry_price)
+        ?? parseNumber(details?.entry_price)
+        ?? undefined;
 
     return {
         timestamp: ts,
@@ -96,10 +168,12 @@ function toRecord(payload: unknown): StrategyTradeRecord | null {
         net_return: netReturn,
         round_trip_cost_rate: roundTripCostRate,
         cost_drag_return: costDragReturn,
+        side,
+        entry_price: entryPrice,
     };
 }
 
-function recordToCsv(record: StrategyTradeRecord, config: { extended: boolean; includeExecutionId: boolean }): string {
+function recordToCsv(record: StrategyTradeRecord, config: { extended: boolean; includeExecutionId: boolean; includeSide: boolean; includeEntryPrice: boolean }): string {
     const base = [
         String(Math.round(record.timestamp)),
         csvEscape(record.strategy),
@@ -122,6 +196,12 @@ function recordToCsv(record: StrategyTradeRecord, config: { extended: boolean; i
     ];
     if (config.includeExecutionId) {
         cells.push(csvEscape(record.execution_id || ''));
+    }
+    if (config.includeSide) {
+        cells.push(csvEscape(record.side || ''));
+    }
+    if (config.includeEntryPrice) {
+        cells.push(record.entry_price !== undefined ? record.entry_price.toFixed(8) : '');
     }
     return `${cells.join(',')}\n`;
 }
@@ -150,6 +230,8 @@ export class StrategyTradeRecorder {
     private writeQueue: Promise<void> = Promise.resolve();
     private extendedCsv = true;
     private includeExecutionId = true;
+    private includeSide = true;
+    private includeEntryPrice = true;
 
     constructor(filePath?: string) {
         this.filePath = resolveRecorderPath(filePath);
@@ -165,20 +247,27 @@ export class StrategyTradeRecorder {
 
         try {
             await fs.access(this.filePath);
+            await migrateCsvToHeaderV3(this.filePath);
             const content = await fs.readFile(this.filePath, 'utf8');
             const firstLine = content.split('\n', 1)[0]?.trim() || '';
             if (firstLine === LEGACY_CSV_HEADER) {
                 this.extendedCsv = false;
                 this.includeExecutionId = false;
+                this.includeSide = false;
+                this.includeEntryPrice = false;
             } else if (firstLine.length > 0) {
                 const columns = firstLine.split(',').map((col) => col.trim());
                 this.extendedCsv = columns.includes('gross_return') && columns.includes('cost_drag_return');
                 this.includeExecutionId = columns.includes('execution_id');
+                this.includeSide = columns.includes('side');
+                this.includeEntryPrice = columns.includes('entry_price');
             }
         } catch {
-            await fs.writeFile(this.filePath, CSV_HEADER_V2, { encoding: 'utf8' });
+            await fs.writeFile(this.filePath, CSV_HEADER_V3, { encoding: 'utf8' });
             this.extendedCsv = true;
             this.includeExecutionId = true;
+            this.includeSide = true;
+            this.includeEntryPrice = true;
         }
 
         this.initialized = true;
@@ -198,6 +287,8 @@ export class StrategyTradeRecorder {
             await fs.appendFile(this.filePath, recordToCsv(parsed, {
                 extended: this.extendedCsv,
                 includeExecutionId: this.includeExecutionId,
+                includeSide: this.includeSide,
+                includeEntryPrice: this.includeEntryPrice,
             }), { encoding: 'utf8' });
         }).catch((error) => {
             logger.error(`[StrategyTradeRecorder] failed to persist trade row: ${String(error)}`);
@@ -213,9 +304,11 @@ export class StrategyTradeRecorder {
             if (!this.initialized) {
                 await this.init();
             }
-            await fs.writeFile(this.filePath, CSV_HEADER_V2, { encoding: 'utf8' });
+            await fs.writeFile(this.filePath, CSV_HEADER_V3, { encoding: 'utf8' });
             this.extendedCsv = true;
             this.includeExecutionId = true;
+            this.includeSide = true;
+            this.includeEntryPrice = true;
         });
 
         this.writeQueue = task.catch((error) => {

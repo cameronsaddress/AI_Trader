@@ -5,7 +5,7 @@ use log::{error, info, warn};
 use redis::AsyncCommands;
 use serde_json::Value;
 use statrs::distribution::{ContinuousCDF, Normal};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
@@ -35,6 +35,12 @@ use crate::strategies::Strategy;
 
 const COINBASE_ADVANCED_WS_URL: &str = "wss://advanced-trade-ws.coinbase.com";
 const COINBASE_PRODUCT_ID: &str = "BTC-USD";
+// Binance global WS can return HTTP 451 from some regions; default to Binance.US for US-hosted systems.
+const BINANCE_US_BOOK_WS_URL: &str = "wss://stream.binance.us:9443/ws/btcusdt@bookTicker";
+const OKX_PUBLIC_WS_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
+const BYBIT_SPOT_WS_URL: &str = "wss://stream.bybit.com/v5/public/spot";
+const KRAKEN_PUBLIC_WS_URL: &str = "wss://ws.kraken.com";
+const BITFINEX_PUBLIC_WS_URL: &str = "wss://api-pub.bitfinex.com/ws/2";
 const WINDOW_SECONDS: i64 = 300;
 const SPOT_HISTORY_WINDOW_MS: i64 = 30 * 60 * 1000;
 const VOL_WINDOW_MS: i64 = 5 * 60 * 1000;
@@ -54,6 +60,30 @@ const DEFAULT_MAX_POSITION_FRACTION: f64 = 0.25;
 
 fn coinbase_ws_url() -> String {
     std::env::var("COINBASE_WS_URL").unwrap_or_else(|_| COINBASE_ADVANCED_WS_URL.to_string())
+}
+
+fn ws_url_from_env(var: &str, default: &str) -> String {
+    std::env::var(var).unwrap_or_else(|_| default.to_string())
+}
+
+fn binance_ws_url() -> String {
+    ws_url_from_env("BINANCE_WS_URL", BINANCE_US_BOOK_WS_URL)
+}
+
+fn okx_ws_url() -> String {
+    ws_url_from_env("OKX_WS_URL", OKX_PUBLIC_WS_URL)
+}
+
+fn bybit_ws_url() -> String {
+    ws_url_from_env("BYBIT_WS_URL", BYBIT_SPOT_WS_URL)
+}
+
+fn kraken_ws_url() -> String {
+    ws_url_from_env("KRAKEN_WS_URL", KRAKEN_PUBLIC_WS_URL)
+}
+
+fn bitfinex_ws_url() -> String {
+    ws_url_from_env("BITFINEX_WS_URL", BITFINEX_PUBLIC_WS_URL)
 }
 
 fn coinbase_ticker_subscriptions(ws_url: &str) -> Vec<Value> {
@@ -140,6 +170,402 @@ fn parse_coinbase_ticker_price(payload: &str) -> Option<f64> {
     }
 
     None
+}
+
+fn parse_binance_book_mid(payload: &str) -> Option<f64> {
+    let parsed = serde_json::from_str::<Value>(payload).ok()?;
+    let bid = parse_number(parsed.get("b"));
+    let ask = parse_number(parsed.get("a"));
+    match (bid, ask) {
+        (Some(b), Some(a)) if b > 0.0 && a > 0.0 => Some((a + b) / 2.0),
+        _ => None,
+    }
+}
+
+fn parse_okx_ticker_mid(payload: &str) -> Option<f64> {
+    let parsed = serde_json::from_str::<Value>(payload).ok()?;
+    if parsed.get("event").and_then(|v| v.as_str()).is_some() {
+        return None;
+    }
+    let arg = parsed.get("arg")?;
+    if arg.get("channel").and_then(|v| v.as_str()) != Some("tickers") {
+        return None;
+    }
+    // Prefer BTC-USDT (most liquid). Treat USDT as USD for UI/edge telemetry.
+    if arg.get("instId").and_then(|v| v.as_str()) != Some("BTC-USDT") {
+        return None;
+    }
+    let data = parsed.get("data")?.as_array()?;
+    let row = data.first()?;
+    let bid = parse_number(row.get("bidPx"));
+    let ask = parse_number(row.get("askPx"));
+    if let (Some(b), Some(a)) = (bid, ask) {
+        if b > 0.0 && a > 0.0 {
+            return Some((a + b) / 2.0);
+        }
+    }
+    parse_number(row.get("last"))
+}
+
+fn parse_bybit_ticker_mid(payload: &str) -> Option<f64> {
+    let parsed = serde_json::from_str::<Value>(payload).ok()?;
+    let topic = parsed.get("topic")?.as_str()?;
+    if topic != "tickers.BTCUSDT" {
+        return None;
+    }
+    let data = parsed.get("data")?;
+    let bid = parse_number(data.get("bid1Price"));
+    let ask = parse_number(data.get("ask1Price"));
+    if let (Some(b), Some(a)) = (bid, ask) {
+        if b > 0.0 && a > 0.0 {
+            return Some((a + b) / 2.0);
+        }
+    }
+    parse_number(data.get("lastPrice"))
+}
+
+fn parse_kraken_ticker_mid(payload: &str) -> Option<f64> {
+    let parsed = serde_json::from_str::<Value>(payload).ok()?;
+    if parsed.is_object() {
+        return None;
+    }
+    let arr = parsed.as_array()?;
+    if arr.len() < 4 {
+        return None;
+    }
+    if arr.get(2)?.as_str() != Some("ticker") {
+        return None;
+    }
+    let pair = arr.get(3)?.as_str().unwrap_or("");
+    if pair != "XBT/USD" && pair != "XBT/USDT" {
+        return None;
+    }
+    let data = arr.get(1)?;
+    let ask = data
+        .get("a")
+        .and_then(|v| v.as_array())
+        .and_then(|v| v.get(0))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok());
+    let bid = data
+        .get("b")
+        .and_then(|v| v.as_array())
+        .and_then(|v| v.get(0))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok());
+    match (bid, ask) {
+        (Some(b), Some(a)) if b > 0.0 && a > 0.0 => Some((a + b) / 2.0),
+        _ => None,
+    }
+}
+
+fn median_price(mut values: Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.retain(|v| v.is_finite() && *v > 0.0);
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values.get(mid).copied()
+    } else {
+        let a = values.get(mid.saturating_sub(1)).copied().unwrap_or(values[mid]);
+        let b = values.get(mid).copied().unwrap_or(a);
+        Some((a + b) / 2.0)
+    }
+}
+
+fn spawn_binance_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
+    let ws_url = binance_ws_url();
+    tokio::spawn(async move {
+        loop {
+            match connect_async(ws_url.as_str()).await {
+                Ok((mut ws_stream, _)) => {
+                    info!("Binance WS connected for BTC pricing via {}", ws_url);
+                    while let Some(msg) = ws_stream.next().await {
+                        match msg {
+                            Ok(Message::Text(text)) => {
+                                if let Some(price) = parse_binance_book_mid(&text) {
+                                    let now_ms = Utc::now().timestamp_millis();
+                                    let mut writer = prices.write().await;
+                                    writer.insert("binance", (price, now_ms));
+                                }
+                            }
+                            Ok(Message::Ping(payload)) => {
+                                let _ = ws_stream.send(Message::Pong(payload)).await;
+                            }
+                            Ok(Message::Close(_)) => break,
+                            Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => continue,
+                            Ok(_) => continue,
+                            Err(e) => {
+                                error!("Binance WS message error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => error!("Binance WS connection failed: {}", e),
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+fn spawn_okx_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
+    let ws_url = okx_ws_url();
+    tokio::spawn(async move {
+        let subscribe_msg = serde_json::json!({
+            "op": "subscribe",
+            "args": [{"channel": "tickers", "instId": "BTC-USDT"}]
+        })
+        .to_string();
+        loop {
+            match connect_async(ws_url.as_str()).await {
+                Ok((mut ws_stream, _)) => {
+                    info!("OKX WS connected for BTC pricing via {}", ws_url);
+                    if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.clone())).await {
+                        error!("OKX subscribe failed: {}", e);
+                    }
+                    while let Some(msg) = ws_stream.next().await {
+                        match msg {
+                            Ok(Message::Text(text)) => {
+                                let trimmed = text.trim();
+                                if trimmed == "ping" {
+                                    let _ = ws_stream.send(Message::Text("pong".to_string())).await;
+                                    continue;
+                                }
+                                if let Some(price) = parse_okx_ticker_mid(trimmed) {
+                                    let now_ms = Utc::now().timestamp_millis();
+                                    let mut writer = prices.write().await;
+                                    writer.insert("okx", (price, now_ms));
+                                }
+                            }
+                            Ok(Message::Ping(payload)) => {
+                                let _ = ws_stream.send(Message::Pong(payload)).await;
+                            }
+                            Ok(Message::Close(_)) => break,
+                            Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => continue,
+                            Ok(_) => continue,
+                            Err(e) => {
+                                error!("OKX WS message error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => error!("OKX WS connection failed: {}", e),
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+fn spawn_bybit_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
+    let ws_url = bybit_ws_url();
+    tokio::spawn(async move {
+        let subscribe_msg = serde_json::json!({
+            "op": "subscribe",
+            "args": ["tickers.BTCUSDT"]
+        })
+        .to_string();
+        loop {
+            match connect_async(ws_url.as_str()).await {
+                Ok((mut ws_stream, _)) => {
+                    info!("Bybit WS connected for BTC pricing via {}", ws_url);
+                    if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.clone())).await {
+                        error!("Bybit subscribe failed: {}", e);
+                    }
+                    while let Some(msg) = ws_stream.next().await {
+                        match msg {
+                            Ok(Message::Text(text)) => {
+                                let trimmed = text.trim();
+                                // Respond to bybit application-level pings if they occur.
+                                if trimmed.contains("\"op\":\"ping\"") {
+                                    let _ = ws_stream.send(Message::Text("{\"op\":\"pong\"}".to_string())).await;
+                                    continue;
+                                }
+                                if let Some(price) = parse_bybit_ticker_mid(trimmed) {
+                                    let now_ms = Utc::now().timestamp_millis();
+                                    let mut writer = prices.write().await;
+                                    writer.insert("bybit", (price, now_ms));
+                                }
+                            }
+                            Ok(Message::Ping(payload)) => {
+                                let _ = ws_stream.send(Message::Pong(payload)).await;
+                            }
+                            Ok(Message::Close(_)) => break,
+                            Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => continue,
+                            Ok(_) => continue,
+                            Err(e) => {
+                                error!("Bybit WS message error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => error!("Bybit WS connection failed: {}", e),
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+fn spawn_kraken_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
+    let ws_url = kraken_ws_url();
+    tokio::spawn(async move {
+        let subscribe_msg = serde_json::json!({
+            "event": "subscribe",
+            "pair": ["XBT/USD"],
+            "subscription": {"name": "ticker"}
+        })
+        .to_string();
+        loop {
+            match connect_async(ws_url.as_str()).await {
+                Ok((mut ws_stream, _)) => {
+                    info!("Kraken WS connected for BTC pricing via {}", ws_url);
+                    if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.clone())).await {
+                        error!("Kraken subscribe failed: {}", e);
+                    }
+                    while let Some(msg) = ws_stream.next().await {
+                        match msg {
+                            Ok(Message::Text(text)) => {
+                                let trimmed = text.trim();
+                                if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                                    if let Some(event) = v.get("event").and_then(|e| e.as_str()) {
+                                        if event == "ping" {
+                                            let reqid = v.get("reqid").and_then(|r| r.as_i64());
+                                            let pong = if let Some(id) = reqid {
+                                                serde_json::json!({"event":"pong","reqid": id}).to_string()
+                                            } else {
+                                                serde_json::json!({"event":"pong"}).to_string()
+                                            };
+                                            let _ = ws_stream.send(Message::Text(pong)).await;
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                if let Some(price) = parse_kraken_ticker_mid(trimmed) {
+                                    let now_ms = Utc::now().timestamp_millis();
+                                    let mut writer = prices.write().await;
+                                    writer.insert("kraken", (price, now_ms));
+                                }
+                            }
+                            Ok(Message::Ping(payload)) => {
+                                let _ = ws_stream.send(Message::Pong(payload)).await;
+                            }
+                            Ok(Message::Close(_)) => break,
+                            Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => continue,
+                            Ok(_) => continue,
+                            Err(e) => {
+                                error!("Kraken WS message error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => error!("Kraken WS connection failed: {}", e),
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+fn spawn_bitfinex_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
+    let ws_url = bitfinex_ws_url();
+    tokio::spawn(async move {
+        let subscribe_msg = serde_json::json!({
+            "event": "subscribe",
+            "channel": "ticker",
+            "symbol": "tBTCUSD"
+        })
+        .to_string();
+        loop {
+            match connect_async(ws_url.as_str()).await {
+                Ok((mut ws_stream, _)) => {
+                    info!("Bitfinex WS connected for BTC pricing via {}", ws_url);
+                    let mut chan_id: Option<i64> = None;
+                    if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.clone())).await {
+                        error!("Bitfinex subscribe failed: {}", e);
+                    }
+                    while let Some(msg) = ws_stream.next().await {
+                        match msg {
+                            Ok(Message::Text(text)) => {
+                                let trimmed = text.trim();
+                                let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+                                    continue;
+                                };
+
+                                if v.is_object() {
+                                    if let Some(event) = v.get("event").and_then(|e| e.as_str()) {
+                                        if event == "subscribed"
+                                            && v.get("channel").and_then(|c| c.as_str()) == Some("ticker")
+                                        {
+                                            chan_id = v.get("chanId").and_then(|c| c.as_i64());
+                                        } else if event == "ping" {
+                                            let cid = v.get("cid").and_then(|c| c.as_i64());
+                                            let pong = if let Some(cid) = cid {
+                                                serde_json::json!({"event":"pong","cid": cid}).to_string()
+                                            } else {
+                                                serde_json::json!({"event":"pong"}).to_string()
+                                            };
+                                            let _ = ws_stream.send(Message::Text(pong)).await;
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                let Some(arr) = v.as_array() else {
+                                    continue;
+                                };
+                                if arr.len() < 2 {
+                                    continue;
+                                }
+                                let Some(id) = arr.get(0).and_then(|c| c.as_i64()) else {
+                                    continue;
+                                };
+                                if chan_id.is_some() && chan_id != Some(id) {
+                                    continue;
+                                }
+                                if arr.get(1).and_then(|hb| hb.as_str()) == Some("hb") {
+                                    continue;
+                                }
+                                let Some(data) = arr.get(1).and_then(|d| d.as_array()) else {
+                                    continue;
+                                };
+                                let bid = data.get(0).and_then(|v| v.as_f64());
+                                let ask = data.get(2).and_then(|v| v.as_f64());
+                                let price = match (bid, ask) {
+                                    (Some(b), Some(a)) if b > 0.0 && a > 0.0 => Some((a + b) / 2.0),
+                                    _ => None,
+                                };
+                                if let Some(px) = price {
+                                    let now_ms = Utc::now().timestamp_millis();
+                                    let mut writer = prices.write().await;
+                                    writer.insert("bitfinex", (px, now_ms));
+                                }
+                            }
+                            Ok(Message::Ping(payload)) => {
+                                let _ = ws_stream.send(Message::Pong(payload)).await;
+                            }
+                            Ok(Message::Close(_)) => break,
+                            Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => continue,
+                            Ok(_) => continue,
+                            Err(e) => {
+                                error!("Bitfinex WS message error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => error!("Bitfinex WS connection failed: {}", e),
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+    });
 }
 
 fn parse_window_start_ts(slug: &str) -> Option<i64> {
@@ -362,9 +788,14 @@ impl Strategy for Btc5mLagStrategy {
         let variant = strategy_variant();
         let mut last_seen_reset_ts = 0_i64;
 
-        // Coinbase ticker feed
+        // Cross-exchange price feeds (Coinbase + public CEX tickers).
+        // Used for UI telemetry + "cross-exchange signal flow" and can be used to harden the spot signal.
+        let cex_prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>> = Arc::new(RwLock::new(HashMap::new()));
+
+        // Coinbase ticker feed (primary + also mirrored into cex_prices).
         let spot_writer = self.latest_spot_price.clone();
         let spot_history_writer = self.spot_history.clone();
+        let cex_coinbase_writer = cex_prices.clone();
         let coinbase_ws_url = coinbase_ws_url();
         let coinbase_subscriptions = coinbase_ticker_subscriptions(&coinbase_ws_url);
 
@@ -408,6 +839,10 @@ impl Strategy for Btc5mLagStrategy {
                                             *writer = (price, now_ms);
                                         }
                                         {
+                                            let mut writer = cex_coinbase_writer.write().await;
+                                            writer.insert("coinbase", (price, now_ms));
+                                        }
+                                        {
                                             let mut history = spot_history_writer.write().await;
                                             history.push_back((now_ms, price));
                                             while let Some((ts, _)) = history.front() {
@@ -438,6 +873,13 @@ impl Strategy for Btc5mLagStrategy {
                 sleep(Duration::from_secs(1)).await;
             }
         });
+
+        // Additional public CEX feeds (no auth).
+        spawn_binance_feed(cex_prices.clone());
+        spawn_okx_feed(cex_prices.clone());
+        spawn_bybit_feed(cex_prices.clone());
+        spawn_kraken_feed(cex_prices.clone());
+        spawn_bitfinex_feed(cex_prices.clone());
 
         let mut open_position: Option<Position> = None;
         let mut last_live_preview_ms = 0_i64;
@@ -740,6 +1182,21 @@ impl Strategy for Btc5mLagStrategy {
                             Side::Down => -1.0,
                         };
                         let scan_score = direction_sign * best_net_expected.abs();
+
+                        // Snapshot cross-exchange prices for UI telemetry and matrix rendering.
+                        let cex_snapshot = { cex_prices.read().await.clone() };
+                        let mut cex_values: Vec<f64> = Vec::new();
+                        let mut cex_prices_json = serde_json::Map::new();
+                        for (venue, (px, ts_ms)) in cex_snapshot.iter() {
+                            if *px > 0.0 {
+                                cex_prices_json.insert((*venue).to_string(), serde_json::json!(*px));
+                            }
+                            if now_ms - *ts_ms <= SPOT_STALE_MS && *px > 0.0 {
+                                cex_values.push(*px);
+                            }
+                        }
+                        let cex_mid = median_price(cex_values).unwrap_or(spot);
+
                         let scan_msg = build_scan_payload(
                             &target_market.market_id,
                             "BTC 5m Engine",
@@ -756,6 +1213,8 @@ impl Strategy for Btc5mLagStrategy {
                             now_ms,
                             serde_json::json!({
                                 "spot": spot,
+                                "cex_mid": cex_mid,
+                                "cex_prices": Value::Object(cex_prices_json),
                                 "window_start_spot": window_start_spot,
                                 "fair_yes": fair_yes,
                                 "fair_no": fair_no,

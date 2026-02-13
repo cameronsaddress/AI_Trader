@@ -5239,6 +5239,112 @@ app.get('/api/arb/validation-trades', async (_req, res) => {
     });
 });
 
+app.get('/api/arb/strategy-trades', async (req, res) => {
+    const strategy = typeof req.query.strategy === 'string' ? req.query.strategy.trim() : '';
+    const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : 200;
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(2000, Math.floor(rawLimit))) : 200;
+    if (!strategy) {
+        res.status(400).json({ error: 'Missing strategy query parameter' });
+        return;
+    }
+
+    const unquote = (value: string): string => {
+        const trimmed = value.trim();
+        if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+            return trimmed.slice(1, -1).replace(/""/g, '"');
+        }
+        return trimmed;
+    };
+
+    const parseCsvLine = (line: string): string[] => {
+        const out: string[] = [];
+        let current = '';
+        let inQuotes = false;
+        for (let i = 0; i < line.length; i += 1) {
+            const ch = line[i] as string;
+            if (ch === '"') {
+                const next = line[i + 1];
+                if (inQuotes && next === '"') {
+                    current += '"';
+                    i += 1;
+                    continue;
+                }
+                inQuotes = !inQuotes;
+                continue;
+            }
+            if (ch === ',' && !inQuotes) {
+                out.push(current);
+                current = '';
+                continue;
+            }
+            current += ch;
+        }
+        out.push(current);
+        return out;
+    };
+
+    try {
+        const filePath = strategyTradeRecorder.getPath();
+        const content = await fs.readFile(filePath, 'utf8').catch(() => '');
+        const lines = content.split('\n').map((line) => line.trim()).filter((line) => line.length > 0);
+        if (lines.length <= 1) {
+            res.json({ trades: [] });
+            return;
+        }
+
+        const header = parseCsvLine(lines[0]).map((cell) => unquote(cell).toLowerCase());
+        const idx = (name: string): number => header.indexOf(name.toLowerCase());
+
+        const timestampIdx = idx('timestamp');
+        const strategyIdx = idx('strategy');
+        const variantIdx = idx('variant');
+        const pnlIdx = idx('pnl');
+        const notionalIdx = idx('notional');
+        const modeIdx = idx('mode');
+        const reasonIdx = idx('reason');
+        const executionIdIdx = idx('execution_id');
+        const sideIdx = idx('side');
+        const entryPriceIdx = idx('entry_price');
+
+        const scanWindow = Math.max(limit * 25, 1500);
+        const start = Math.max(1, lines.length - scanWindow);
+        const slice = lines.slice(start);
+
+        const trades: any[] = [];
+        for (let j = slice.length - 1; j >= 0; j -= 1) {
+            const line = slice[j];
+            const cells = parseCsvLine(line);
+            const rowStrategy = strategyIdx >= 0 ? unquote(cells[strategyIdx] || '') : '';
+            if (rowStrategy !== strategy) {
+                continue;
+            }
+            const ts = timestampIdx >= 0 ? Number(unquote(cells[timestampIdx] || '')) : NaN;
+            const pnl = pnlIdx >= 0 ? Number(unquote(cells[pnlIdx] || '')) : NaN;
+            const notional = notionalIdx >= 0 ? Number(unquote(cells[notionalIdx] || '')) : NaN;
+            const trade = {
+                timestamp: Number.isFinite(ts) ? ts : Date.now(),
+                strategy: rowStrategy,
+                variant: variantIdx >= 0 ? unquote(cells[variantIdx] || '') : '',
+                pnl: Number.isFinite(pnl) ? pnl : null,
+                notional: Number.isFinite(notional) ? notional : null,
+                mode: modeIdx >= 0 ? unquote(cells[modeIdx] || '') : '',
+                reason: reasonIdx >= 0 ? unquote(cells[reasonIdx] || '') : '',
+                execution_id: executionIdIdx >= 0 ? (unquote(cells[executionIdIdx] || '') || null) : null,
+                side: sideIdx >= 0 ? (unquote(cells[sideIdx] || '') || null) : null,
+                entry_price: entryPriceIdx >= 0 ? (Number(unquote(cells[entryPriceIdx] || '')) || null) : null,
+            };
+            trades.push(trade);
+            if (trades.length >= limit) {
+                break;
+            }
+        }
+
+        res.json({ trades });
+    } catch (error) {
+        res.status(500).json({ error: `Failed to read strategy trades: ${String(error)}` });
+    }
+});
+
 app.post('/api/arb/validation-trades/reset', requireControlPlaneAuth, async (_req, res) => {
     await strategyTradeRecorder.reset();
     res.json({
