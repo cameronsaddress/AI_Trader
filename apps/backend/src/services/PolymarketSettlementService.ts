@@ -91,6 +91,9 @@ function asString(input: unknown): string | null {
 }
 
 function asNumber(input: unknown): number | null {
+    if (input === null || input === undefined || input === '') {
+        return null;
+    }
     const parsed = Number(input);
     return Number.isFinite(parsed) ? parsed : null;
 }
@@ -265,6 +268,12 @@ export class PolymarketSettlementService {
         } catch {
             logger.warn('[Settlement] failed to parse persisted state; starting with empty state');
         }
+    }
+
+    public async reset(): Promise<void> {
+        this.positions.clear();
+        this.lastRunAt = Date.now();
+        await this.persist();
     }
 
     public async registerAtomicExecution(result: PolymarketLiveExecutionResult): Promise<SettlementEvent[]> {

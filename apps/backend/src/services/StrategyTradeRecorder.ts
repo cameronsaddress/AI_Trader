@@ -10,11 +10,19 @@ type StrategyTradeRecord = {
     notional?: number;
     mode?: string;
     reason?: string;
+    gross_return?: number;
+    net_return?: number;
+    round_trip_cost_rate?: number;
+    cost_drag_return?: number;
 };
 
 type Row = Record<string, unknown>;
 
-const CSV_HEADER = 'timestamp,strategy,variant,pnl,notional,mode,reason\n';
+const CSV_HEADER = 'timestamp,strategy,variant,pnl,notional,mode,reason,gross_return,net_return,round_trip_cost_rate,cost_drag_return\n';
+const LEGACY_CSV_HEADER = 'timestamp,strategy,variant,pnl,notional,mode,reason';
+const DEFAULT_RELATIVE_PATH = path.join('logs', 'strategy_trades.csv');
+const APP_ROOT = path.resolve(__dirname, '..', '..');
+const LEGACY_PREFIX_RE = /^apps[\\/]+backend[\\/]+(.+)$/i;
 
 function parseNumber(input: unknown): number | null {
     const value = Number(input);
@@ -59,6 +67,14 @@ function toRecord(payload: unknown): StrategyTradeRecord | null {
         ?? undefined;
     const mode = parseString(row.mode) || undefined;
     const reason = parseString(row.reason) || parseString(details?.reason) || undefined;
+    const grossReturn = parseNumber(details?.gross_return) ?? undefined;
+    const netReturn = parseNumber(details?.net_return) ?? (
+        notional && notional > 0 ? pnl / notional : undefined
+    );
+    const roundTripCostRate = parseNumber(details?.round_trip_cost_rate) ?? undefined;
+    const costDragReturn = grossReturn !== undefined && netReturn !== undefined
+        ? grossReturn - netReturn
+        : roundTripCostRate;
 
     return {
         timestamp: ts,
@@ -68,11 +84,15 @@ function toRecord(payload: unknown): StrategyTradeRecord | null {
         notional,
         mode,
         reason,
+        gross_return: grossReturn,
+        net_return: netReturn,
+        round_trip_cost_rate: roundTripCostRate,
+        cost_drag_return: costDragReturn,
     };
 }
 
-function recordToCsv(record: StrategyTradeRecord): string {
-    const cells = [
+function recordToCsv(record: StrategyTradeRecord, extended: boolean): string {
+    const base = [
         String(Math.round(record.timestamp)),
         csvEscape(record.strategy),
         csvEscape(record.variant),
@@ -81,20 +101,46 @@ function recordToCsv(record: StrategyTradeRecord): string {
         csvEscape(record.mode || ''),
         csvEscape(record.reason || ''),
     ];
+    if (!extended) {
+        return `${base.join(',')}\n`;
+    }
+
+    const cells = [
+        ...base,
+        record.gross_return !== undefined ? record.gross_return.toFixed(8) : '',
+        record.net_return !== undefined ? record.net_return.toFixed(8) : '',
+        record.round_trip_cost_rate !== undefined ? record.round_trip_cost_rate.toFixed(8) : '',
+        record.cost_drag_return !== undefined ? record.cost_drag_return.toFixed(8) : '',
+    ];
     return `${cells.join(',')}\n`;
+}
+
+function normalizeConfiguredPath(input: string): string {
+    const trimmed = input.trim();
+    if (trimmed.length === 0) {
+        return DEFAULT_RELATIVE_PATH;
+    }
+
+    const legacy = LEGACY_PREFIX_RE.exec(trimmed);
+    return legacy?.[1] || trimmed;
+}
+
+function resolveRecorderPath(filePath?: string): string {
+    const configured = (filePath || process.env.STRATEGY_TRADE_LOG_PATH || '').trim();
+    if (configured.length > 0 && path.isAbsolute(configured)) {
+        return configured;
+    }
+    return path.resolve(APP_ROOT, normalizeConfiguredPath(configured));
 }
 
 export class StrategyTradeRecorder {
     private readonly filePath: string;
     private initialized = false;
     private writeQueue: Promise<void> = Promise.resolve();
+    private extendedCsv = true;
 
     constructor(filePath?: string) {
-        const configured = (filePath || process.env.STRATEGY_TRADE_LOG_PATH || '').trim();
-        const relativeDefault = path.join('logs', 'strategy_trades.csv');
-        this.filePath = path.isAbsolute(configured)
-            ? configured
-            : path.resolve(process.cwd(), configured || relativeDefault);
+        this.filePath = resolveRecorderPath(filePath);
     }
 
     public async init(): Promise<void> {
@@ -107,8 +153,16 @@ export class StrategyTradeRecorder {
 
         try {
             await fs.access(this.filePath);
+            const content = await fs.readFile(this.filePath, 'utf8');
+            const firstLine = content.split('\n', 1)[0]?.trim() || '';
+            if (firstLine === LEGACY_CSV_HEADER) {
+                this.extendedCsv = false;
+            } else if (firstLine.length > 0) {
+                this.extendedCsv = firstLine.includes('gross_return') && firstLine.includes('cost_drag_return');
+            }
         } catch {
             await fs.writeFile(this.filePath, CSV_HEADER, { encoding: 'utf8' });
+            this.extendedCsv = true;
         }
 
         this.initialized = true;
@@ -125,7 +179,7 @@ export class StrategyTradeRecorder {
             if (!this.initialized) {
                 await this.init();
             }
-            await fs.appendFile(this.filePath, recordToCsv(parsed), { encoding: 'utf8' });
+            await fs.appendFile(this.filePath, recordToCsv(parsed, this.extendedCsv), { encoding: 'utf8' });
         }).catch((error) => {
             logger.error(`[StrategyTradeRecorder] failed to persist trade row: ${String(error)}`);
         });
@@ -141,6 +195,7 @@ export class StrategyTradeRecorder {
                 await this.init();
             }
             await fs.writeFile(this.filePath, CSV_HEADER, { encoding: 'utf8' });
+            this.extendedCsv = true;
         });
 
         this.writeQueue = task.catch((error) => {

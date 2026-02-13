@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Dashboard } from './pages/Dashboard';
 import { PolymarketPage } from './pages/PolymarketPage';
+import { Btc5mEnginePage } from './pages/Btc5mEnginePage';
 import { SocketProvider } from './context/SocketContext';
 
 // Placeholders for now
@@ -15,6 +16,7 @@ function App() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/polymarket" element={<PolymarketPage />} />
+          <Route path="/btc-5m-engine" element={<Btc5mEnginePage />} />
           <Route path="/markets" element={<Placeholder title="Market Analysis" />} />
           <Route path="/intelligence" element={<Placeholder title="Swarm Intelligence" />} />
           <Route path="/strategies" element={<Placeholder title="Strategy Lab" />} />

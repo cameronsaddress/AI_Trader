@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
-use log::{error, info};
+use log::{error, info, warn};
 use redis::AsyncCommands;
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -14,15 +14,17 @@ use uuid::Uuid;
 
 use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
-    apply_sim_pnl,
     build_scan_payload,
-    compute_bet_size,
+    compute_strategy_bet_size,
     is_strategy_enabled,
     publish_heartbeat,
     read_risk_config,
-    read_sim_bankroll,
+    read_sim_available_cash,
     read_simulation_reset_ts,
     strategy_variant,
+    reserve_sim_notional_for_strategy,
+    release_sim_notional_for_strategy,
+    settle_sim_position_for_strategy,
     read_trading_mode,
     TradingMode,
 };
@@ -83,14 +85,27 @@ fn parse_number(value: Option<&Value>) -> Option<f64> {
     }
 }
 
-fn parse_coinbase_ticker_price(payload: &str) -> Option<f64> {
+fn parse_sequence(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_i64().and_then(|s| if s >= 0 { Some(s as u64) } else { None }))
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+    })
+}
+
+fn parse_coinbase_ticker_price(payload: &str) -> Option<(f64, Option<u64>)> {
     let parsed = serde_json::from_str::<Value>(payload).ok()?;
+    let root_sequence = parse_sequence(parsed.get("sequence_num"))
+        .or_else(|| parse_sequence(parsed.get("sequence")));
 
     // Legacy Coinbase Exchange feed shape.
     if parsed.get("type").and_then(|v| v.as_str()) == Some("ticker")
         && parsed.get("product_id").and_then(|v| v.as_str()) == Some(COINBASE_PRODUCT_ID)
     {
-        return parse_number(parsed.get("price"));
+        return parse_number(parsed.get("price")).map(|price| {
+            let seq = parse_sequence(parsed.get("sequence")).or(root_sequence);
+            (price, seq)
+        });
     }
 
     // Coinbase Advanced Trade shape.
@@ -109,18 +124,23 @@ fn parse_coinbase_ticker_price(payload: &str) -> Option<f64> {
             }
 
             if let Some(price) = parse_number(ticker.get("price")) {
-                return Some(price);
+                return Some((price, root_sequence));
             }
 
             let bid = parse_number(ticker.get("best_bid"));
             let ask = parse_number(ticker.get("best_ask"));
             if let (Some(best_bid), Some(best_ask)) = (bid, ask) {
-                return Some((best_bid + best_ask) / 2.0);
+                return Some(((best_bid + best_ask) / 2.0, root_sequence));
             }
         }
     }
 
     None
+}
+
+fn parse_coinbase_message_sequence(payload: &str) -> Option<u64> {
+    let parsed = serde_json::from_str::<Value>(payload).ok()?;
+    parse_sequence(parsed.get("sequence_num")).or_else(|| parse_sequence(parsed.get("sequence")))
 }
 
 fn rolling_std(values: &VecDeque<f64>) -> f64 {
@@ -196,6 +216,7 @@ impl Strategy for CexArbStrategy {
                 match connect_async(coinbase_ws_url.as_str()).await {
                     Ok((mut ws_stream, _)) => {
                         info!("Connected to Coinbase ticker feed: {}", coinbase_ws_url);
+                        let mut last_sequence: Option<u64> = None;
                         for sub_msg in &coinbase_subscriptions {
                             if let Err(e) = ws_stream.send(Message::Text(sub_msg.to_string())).await {
                                 error!("Coinbase subscribe failed: {}", e);
@@ -205,7 +226,25 @@ impl Strategy for CexArbStrategy {
                         while let Some(msg) = ws_stream.next().await {
                             match msg {
                                 Ok(Message::Text(text)) => {
-                                    if let Some(price) = parse_coinbase_ticker_price(&text) {
+                                    if let Some(seq) = parse_coinbase_message_sequence(&text) {
+                                        if let Some(prev) = last_sequence {
+                                            if seq <= prev {
+                                                continue;
+                                            }
+                                            let expected = prev.saturating_add(1);
+                                            if seq > expected {
+                                                warn!(
+                                                    "Coinbase ticker sequence gap detected (expected {}, got {}); reconnecting",
+                                                    expected,
+                                                    seq
+                                                );
+                                                break;
+                                            }
+                                        }
+                                        last_sequence = Some(seq);
+                                    }
+
+                                    if let Some((price, _sequence)) = parse_coinbase_ticker_price(&text) {
                                         let mut w = cb_writer.write().await;
                                         *w = (price, Utc::now().timestamp_millis());
                                     }
@@ -321,6 +360,17 @@ impl Strategy for CexArbStrategy {
                         let enabled = is_strategy_enabled(&mut conn, "CEX_SNIPER").await;
 
                         if !enabled {
+                            let released_notional = {
+                                let mut positions = positions_link.write().await;
+                                let release = positions.iter().map(|pos| pos.size).sum::<f64>();
+                                if release > 0.0 {
+                                    positions.clear();
+                                }
+                                release
+                            };
+                            if released_notional > 0.0 {
+                                let _ = release_sim_notional_for_strategy(&mut conn, "CEX_SNIPER", released_notional).await;
+                            }
                             publish_heartbeat(&mut conn, "cex_arb").await;
                             continue;
                         }
@@ -437,8 +487,15 @@ impl Strategy for CexArbStrategy {
                                 && now_ms - last_live_preview_ms >= LIVE_PREVIEW_COOLDOWN_MS
                             {
                                 let risk_cfg = read_risk_config(&mut conn).await;
-                                let bankroll = read_sim_bankroll(&mut conn).await;
-                                let preview_size = compute_bet_size(bankroll, &risk_cfg, 10.0, 0.20);
+                                let available_cash = read_sim_available_cash(&mut conn).await;
+                                let preview_size = compute_strategy_bet_size(
+                                    &mut conn,
+                                    "CEX_SNIPER",
+                                    available_cash,
+                                    &risk_cfg,
+                                    10.0,
+                                    0.20,
+                                ).await;
                                 if preview_size > 0.0 {
                                     let preview_price = if eligible_long { book.yes.best_ask } else { book.no.best_ask };
                                     if preview_price > 0.0 {
@@ -479,14 +536,18 @@ impl Strategy for CexArbStrategy {
                                     }
                                 }
                             }
-                            let cleared = {
+                            let (cleared, released_notional) = {
                                 let mut positions = positions_link.write().await;
                                 let count = positions.len();
+                                let release = positions.iter().map(|pos| pos.size).sum::<f64>();
                                 if count > 0 {
                                     positions.clear();
                                 }
-                                count
+                                (count, release)
                             };
+                            if released_notional > 0.0 {
+                                let _ = release_sim_notional_for_strategy(&mut conn, "CEX_SNIPER", released_notional).await;
+                            }
                             if cleared > 0 {
                                 info!("CEX Sniper: clearing {} paper position(s) in LIVE mode", cleared);
                             }
@@ -582,7 +643,7 @@ impl Strategy for CexArbStrategy {
 
                         for (pos, exit_price, gross_return, hold_ms, reason) in closed {
                             let pnl = realized_pnl(pos.size, gross_return, cost_model);
-                            let new_bankroll = apply_sim_pnl(&mut conn, pnl).await;
+                            let new_bankroll = settle_sim_position_for_strategy(&mut conn, "CEX_SNIPER", pos.size, pnl).await;
 
                             let pnl_msg = serde_json::json!({
                                 "strategy": "CEX_SNIPER",
@@ -612,9 +673,21 @@ impl Strategy for CexArbStrategy {
 
                         if let Some(mut pos) = new_entry {
                             let risk_cfg = read_risk_config(&mut conn).await;
-                            let bankroll = read_sim_bankroll(&mut conn).await;
-                            pos.size = compute_bet_size(bankroll, &risk_cfg, 10.0, 0.20);
+                            let available_cash = read_sim_available_cash(&mut conn).await;
+                            pos.size = compute_strategy_bet_size(
+                                &mut conn,
+                                "CEX_SNIPER",
+                                available_cash,
+                                &risk_cfg,
+                                10.0,
+                                0.20,
+                            ).await;
                             if pos.size <= 0.0 {
+                                publish_heartbeat(&mut conn, "cex_arb").await;
+                                continue;
+                            }
+
+                            if !reserve_sim_notional_for_strategy(&mut conn, "CEX_SNIPER", pos.size).await {
                                 publish_heartbeat(&mut conn, "cex_arb").await;
                                 continue;
                             }
@@ -624,6 +697,7 @@ impl Strategy for CexArbStrategy {
                                 if positions.len() < MAX_CONCURRENT_POSITIONS {
                                     positions.push(pos.clone());
                                 } else {
+                                    let _ = release_sim_notional_for_strategy(&mut conn, "CEX_SNIPER", pos.size).await;
                                     publish_heartbeat(&mut conn, "cex_arb").await;
                                     continue;
                                 }

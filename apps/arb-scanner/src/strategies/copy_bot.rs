@@ -10,15 +10,17 @@ use tokio::time::{sleep, Duration};
 
 use crate::engine::PolymarketClient;
 use crate::strategies::control::{
-    apply_sim_pnl,
     build_scan_payload,
-    compute_bet_size,
+    compute_strategy_bet_size,
     is_strategy_enabled,
     publish_heartbeat,
     read_risk_config,
-    read_sim_bankroll,
+    read_sim_available_cash,
     read_simulation_reset_ts,
     strategy_variant,
+    reserve_sim_notional_for_strategy,
+    release_sim_notional_for_strategy,
+    settle_sim_position_for_strategy,
     read_trading_mode,
     TradingMode,
 };
@@ -36,8 +38,12 @@ const ENTRY_BUY_RATIO_THRESHOLD: f64 = 0.65;
 const MAX_SINGLE_WALLET_SHARE: f64 = 0.55;
 const ENTRY_UPTICK_RATIO_THRESHOLD: f64 = 0.55;
 const MIN_PRICE_DRIFT_PCT: f64 = 0.01;
+const MIN_BUYER_ENTROPY: f64 = 0.45;
+const MIN_FLOW_ACCELERATION: f64 = 0.90;
+const MIN_CLUSTER_CONFIDENCE: f64 = 0.62;
 const TAKE_PROFIT_PCT: f64 = 0.12;
 const STOP_LOSS_PCT: f64 = -0.08;
+const MAX_HOLD_SECS: i64 = 120;
 const LIVE_PREVIEW_COOLDOWN_SECS: i64 = 20;
 
 #[derive(Debug, Clone)]
@@ -88,7 +94,8 @@ impl Strategy for SyndicateStrategy {
             }
         };
         let cost_model = SimCostModel::from_env();
-        let event_variant = strategy_variant();
+        let variant = strategy_variant();
+        let event_variant = variant.clone();
 
         let trade_window_writer = self.trade_window.clone();
         let positions_writer = self.open_positions.clone();
@@ -215,13 +222,13 @@ impl Strategy for SyndicateStrategy {
 
                             // Exit logic on incoming trade updates.
                             let trading_mode = read_trading_mode(&mut event_conn).await;
-                            let mut cleared_live = false;
+                            let mut cleared_live: Option<Position> = None;
                             let mut close_candidate: Option<(Position, f64, &'static str)> = None;
 
                             {
                                 let mut positions = positions_writer.write().await;
                                 if trading_mode == TradingMode::Live {
-                                    cleared_live = positions.remove(&token_id).is_some();
+                                    cleared_live = positions.remove(&token_id);
                                 } else if let Some(pos) = positions.get(&token_id).cloned() {
                                     if Utc::now().timestamp() - pos.timestamp >= MIN_HOLD_SECS {
                                         let pnl_pct = (price - pos.entry_price) / pos.entry_price;
@@ -235,7 +242,8 @@ impl Strategy for SyndicateStrategy {
                             }
 
                             if trading_mode == TradingMode::Live {
-                                if cleared_live {
+                                if let Some(pos) = cleared_live {
+                                    let _ = release_sim_notional_for_strategy(&mut event_conn, "SYNDICATE", pos.size).await;
                                     info!("Syndicate: clearing paper position for token {} in LIVE mode", token_id);
                                 }
                                 continue;
@@ -243,7 +251,7 @@ impl Strategy for SyndicateStrategy {
 
                             if let Some((pos, pnl_pct, reason)) = close_candidate {
                                 let realized = realized_pnl(pos.size, pnl_pct, event_cost_model);
-                                let new_bankroll = apply_sim_pnl(&mut event_conn, realized).await;
+                                let new_bankroll = settle_sim_position_for_strategy(&mut event_conn, "SYNDICATE", pos.size, realized).await;
 
                                 let pnl_msg = serde_json::json!({
                                     "strategy": "SYNDICATE",
@@ -281,16 +289,38 @@ impl Strategy for SyndicateStrategy {
             sleep(Duration::from_secs(5)).await;
 
             if !is_strategy_enabled(&mut conn, "SYNDICATE").await {
+                let released_notional = {
+                    let mut positions = self.open_positions.write().await;
+                    if positions.is_empty() {
+                        0.0
+                    } else {
+                        let release = positions.values().map(|pos| pos.size).sum::<f64>();
+                        positions.clear();
+                        release
+                    }
+                };
+                if released_notional > 0.0 {
+                    let _ = release_sim_notional_for_strategy(&mut conn, "SYNDICATE", released_notional).await;
+                }
                 publish_heartbeat(&mut conn, "copy_bot").await;
                 continue;
             }
 
             let trading_mode = read_trading_mode(&mut conn).await;
             if trading_mode == TradingMode::Live {
-                let mut positions = self.open_positions.write().await;
-                if !positions.is_empty() {
-                    info!("Syndicate: clearing {} paper position(s) in LIVE mode", positions.len());
-                    positions.clear();
+                let released_notional = {
+                    let mut positions = self.open_positions.write().await;
+                    if positions.is_empty() {
+                        0.0
+                    } else {
+                        info!("Syndicate: clearing {} paper position(s) in LIVE mode", positions.len());
+                        let release = positions.values().map(|pos| pos.size).sum::<f64>();
+                        positions.clear();
+                        release
+                    }
+                };
+                if released_notional > 0.0 {
+                    let _ = release_sim_notional_for_strategy(&mut conn, "SYNDICATE", released_notional).await;
                 }
             }
 
@@ -332,6 +362,90 @@ impl Strategy for SyndicateStrategy {
                     (ENTRY_VOLUME_THRESHOLD_USDC.max(median * 0.70)).min(100_000.0)
                 }
             };
+            let latest_price_by_token: HashMap<U256, f64> = window_snapshot
+                .iter()
+                .filter_map(|(token_id, trades)| {
+                    trades
+                        .iter()
+                        .rev()
+                        .find_map(|trade| if trade.price > 0.0 { Some((*token_id, trade.price)) } else { None })
+                })
+                .collect();
+
+            if trading_mode == TradingMode::Paper {
+                let mut time_exits: Vec<(U256, Position, f64)> = Vec::new();
+                {
+                    let mut positions = self.open_positions.write().await;
+                    let tokens: Vec<U256> = positions.keys().copied().collect();
+                    for token_id in tokens {
+                        let Some(pos) = positions.get(&token_id).cloned() else {
+                            continue;
+                        };
+                        if now - pos.timestamp < MAX_HOLD_SECS {
+                            continue;
+                        }
+                        let exit_price = latest_price_by_token
+                            .get(&token_id)
+                            .copied()
+                            .unwrap_or(pos.entry_price);
+                        positions.remove(&token_id);
+                        time_exits.push((token_id, pos, exit_price));
+                    }
+                }
+
+                for (token_id, pos, exit_price) in time_exits {
+                    let pnl_pct = if pos.entry_price > 0.0 {
+                        (exit_price - pos.entry_price) / pos.entry_price
+                    } else {
+                        0.0
+                    };
+                    let realized = realized_pnl(pos.size, pnl_pct, cost_model);
+                    let new_bankroll = settle_sim_position_for_strategy(&mut conn, "SYNDICATE", pos.size, realized).await;
+                    let ts_ms = Utc::now().timestamp_millis();
+                    let hold_secs = now.saturating_sub(pos.timestamp);
+                    let net_return = if pos.size > 0.0 { realized / pos.size } else { 0.0 };
+
+                    let pnl_msg = serde_json::json!({
+                        "strategy": "SYNDICATE",
+                        "variant": variant.as_str(),
+                        "pnl": realized,
+                        "notional": pos.size,
+                        "timestamp": ts_ms,
+                        "bankroll": new_bankroll,
+                        "mode": "PAPER",
+                        "details": {
+                            "action": "CLOSE_POSITION",
+                            "reason": "TIME_EXIT",
+                            "token_id": token_id.to_string(),
+                            "entry": pos.entry_price,
+                            "exit": exit_price,
+                            "hold_secs": hold_secs,
+                            "gross_return": pnl_pct,
+                            "net_return": net_return,
+                            "roi": format!("{:.2}%", net_return * 100.0),
+                            "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
+                        }
+                    });
+                    let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+
+                    let exec_msg = serde_json::json!({
+                        "market": "Syndicate",
+                        "side": "CLOSE",
+                        "price": exit_price,
+                        "size": pos.size,
+                        "timestamp": ts_ms,
+                        "mode": "PAPER",
+                        "details": {
+                            "reason": "TIME_EXIT",
+                            "token_id": token_id.to_string(),
+                            "hold_secs": hold_secs,
+                            "gross_return": pnl_pct,
+                            "net_return": net_return,
+                        }
+                    });
+                    let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                }
+            }
 
             for (token_id, trades) in window_snapshot.iter() {
                 if trades.len() < 3 {
@@ -342,10 +456,13 @@ impl Strategy for SyndicateStrategy {
                 let mut wallet_volume: HashMap<Address, f64> = HashMap::new();
                 let mut buy_volume_usdc = 0.0_f64;
                 let mut sell_volume_usdc = 0.0_f64;
+                let mut first_half_buy_volume = 0.0_f64;
+                let mut second_half_buy_volume = 0.0_f64;
                 let mut upticks: usize = 0;
                 let mut comparisons: usize = 0;
                 let mut first_price = 0.0_f64;
                 let mut last_price = 0.0_f64;
+                let split_index = trades.len() / 2;
 
                 for (idx, t) in trades.iter().enumerate() {
                     let buyer = if t.side == 0 { t.maker } else { t.taker };
@@ -354,6 +471,11 @@ impl Strategy for SyndicateStrategy {
 
                     if t.side == 0 {
                         buy_volume_usdc += t.amount_usdc;
+                        if idx < split_index {
+                            first_half_buy_volume += t.amount_usdc;
+                        } else {
+                            second_half_buy_volume += t.amount_usdc;
+                        }
                     } else {
                         sell_volume_usdc += t.amount_usdc;
                     }
@@ -398,12 +520,56 @@ impl Strategy for SyndicateStrategy {
                     1.0
                 };
 
+                let wallet_entropy = if buy_volume_usdc > 0.0 && unique_wallets > 1 {
+                    wallet_volume.values().fold(0.0_f64, |acc, volume| {
+                        let p = (*volume / buy_volume_usdc).clamp(1e-9, 1.0);
+                        acc - (p * p.ln())
+                    })
+                } else {
+                    0.0
+                };
+                let max_entropy = (unique_wallets as f64).ln().max(1e-9);
+                let buyer_entropy = if unique_wallets > 1 {
+                    (wallet_entropy / max_entropy).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+
+                let flow_acceleration = if first_half_buy_volume > 0.0 {
+                    second_half_buy_volume / first_half_buy_volume
+                } else if second_half_buy_volume > 0.0 {
+                    2.0
+                } else {
+                    0.0
+                };
+
+                let pressure_component = ((buy_ratio - ENTRY_BUY_RATIO_THRESHOLD) / (1.0 - ENTRY_BUY_RATIO_THRESHOLD))
+                    .clamp(0.0, 1.0);
+                let uptick_component = ((uptick_ratio - ENTRY_UPTICK_RATIO_THRESHOLD) / (1.0 - ENTRY_UPTICK_RATIO_THRESHOLD))
+                    .clamp(0.0, 1.0);
+                let drift_component = (price_drift / (MIN_PRICE_DRIFT_PCT * 3.0)).clamp(0.0, 1.0);
+                let entropy_component = (buyer_entropy / MIN_BUYER_ENTROPY).clamp(0.0, 1.0);
+                let flow_component = (flow_acceleration / MIN_FLOW_ACCELERATION).clamp(0.0, 1.0);
+                let concentration_component = ((MAX_SINGLE_WALLET_SHARE - max_wallet_share) / MAX_SINGLE_WALLET_SHARE)
+                    .clamp(0.0, 1.0);
+                let cluster_confidence = (
+                    (0.25 * pressure_component)
+                    + (0.20 * uptick_component)
+                    + (0.15 * drift_component)
+                    + (0.15 * entropy_component)
+                    + (0.15 * flow_component)
+                    + (0.10 * concentration_component)
+                ).clamp(0.0, 1.0);
+
                 if unique_wallets < ENTRY_WALLETS_THRESHOLD
                     || total_vol < adaptive_volume_threshold
                     || buy_ratio < ENTRY_BUY_RATIO_THRESHOLD
                     || uptick_ratio < ENTRY_UPTICK_RATIO_THRESHOLD
                     || price_drift < MIN_PRICE_DRIFT_PCT
                     || max_wallet_share > MAX_SINGLE_WALLET_SHARE
+                    || buyer_entropy < MIN_BUYER_ENTROPY
+                    || flow_acceleration < MIN_FLOW_ACCELERATION
+                    || cluster_confidence < MIN_CLUSTER_CONFIDENCE
                 {
                     continue;
                 }
@@ -444,26 +610,30 @@ impl Strategy for SyndicateStrategy {
                 recent_buys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let avg_price: f64 = recent_buys.iter().sum::<f64>() / recent_buys.len() as f64;
 
-                let bankroll = read_sim_bankroll(&mut conn).await;
+                let available_cash = read_sim_available_cash(&mut conn).await;
                 let risk_cfg = read_risk_config(&mut conn).await;
-                let bet_size = compute_bet_size(bankroll, &risk_cfg, 10.0, 0.20);
-                if bet_size <= 0.0 {
+                let base_bet_size = compute_strategy_bet_size(
+                    &mut conn,
+                    "SYNDICATE",
+                    available_cash,
+                    &risk_cfg,
+                    10.0,
+                    0.20,
+                ).await;
+                let confidence_size_scalar = (0.70 + cluster_confidence).clamp(0.70, 1.50);
+                let bet_size = (base_bet_size * confidence_size_scalar).min(available_cash * 0.20);
+                if bet_size < 10.0 {
                     continue;
                 }
 
-                {
-                    let mut last_entry_ts = self.last_entry_ts.write().await;
-                    last_entry_ts.insert(*token_id, now);
-                }
-
                 let ts_ms = Utc::now().timestamp_millis();
-                let scan_score = buy_ratio - 0.5;
-                let scan_threshold = ENTRY_BUY_RATIO_THRESHOLD - 0.5;
+                let scan_score = cluster_confidence;
+                let scan_threshold = MIN_CLUSTER_CONFIDENCE;
                 let scan_msg = build_scan_payload(
                     &token_id.to_string(),
                     "SYNDICATE-ALERT",
                     "SYNDICATE",
-                    "BUY_PRESSURE",
+                    "CLUSTER_CONFIDENCE",
                     "RATIO",
                     [total_vol, unique_wallets as f64],
                     avg_price,
@@ -472,7 +642,8 @@ impl Strategy for SyndicateStrategy {
                     scan_threshold,
                     true,
                     format!(
-                        "Cluster passed filters: buyers={} (>= {}), volume=${:.2} (>= ${:.2}), buy_pressure={:.2}% (>= {:.2}%), uptick_ratio={:.2}% (>= {:.2}%), price_drift={:.2}% (>= {:.2}%), max_wallet_share={:.2}% (<= {:.2}%)",
+                        "Cluster confidence {:.2} passed: buyers={} (>= {}), volume=${:.2} (>= ${:.2}), buy_pressure={:.2}% (>= {:.2}%), uptick_ratio={:.2}% (>= {:.2}%), price_drift={:.2}% (>= {:.2}%), entropy={:.2} (>= {:.2}), accel={:.2}x (>= {:.2}x), max_wallet_share={:.2}% (<= {:.2}%)",
+                        cluster_confidence,
                         unique_wallets,
                         ENTRY_WALLETS_THRESHOLD,
                         total_vol,
@@ -483,6 +654,10 @@ impl Strategy for SyndicateStrategy {
                         ENTRY_UPTICK_RATIO_THRESHOLD * 100.0,
                         price_drift * 100.0,
                         MIN_PRICE_DRIFT_PCT * 100.0,
+                        buyer_entropy,
+                        MIN_BUYER_ENTROPY,
+                        flow_acceleration,
+                        MIN_FLOW_ACCELERATION,
                         max_wallet_share * 100.0,
                         MAX_SINGLE_WALLET_SHARE * 100.0
                     ),
@@ -494,6 +669,10 @@ impl Strategy for SyndicateStrategy {
                         "buy_pressure": buy_ratio,
                         "uptick_ratio": uptick_ratio,
                         "price_drift": price_drift,
+                        "buyer_entropy": buyer_entropy,
+                        "flow_acceleration": flow_acceleration,
+                        "cluster_confidence": cluster_confidence,
+                        "confidence_size_scalar": confidence_size_scalar,
                         "max_wallet_share": max_wallet_share,
                     }),
                 );
@@ -514,6 +693,9 @@ impl Strategy for SyndicateStrategy {
                             "buy_pressure": buy_ratio,
                             "uptick_ratio": uptick_ratio,
                             "price_drift": price_drift,
+                            "buyer_entropy": buyer_entropy,
+                            "flow_acceleration": flow_acceleration,
+                            "cluster_confidence": cluster_confidence,
                             "max_wallet_share": max_wallet_share,
                             "preflight": {
                                 "venue": "POLYMARKET",
@@ -531,16 +713,39 @@ impl Strategy for SyndicateStrategy {
                         }
                     });
                     let _: () = conn.publish("arbitrage:execution", preview_msg.to_string()).await.unwrap_or_default();
+                    {
+                        let mut last_entry_ts = self.last_entry_ts.write().await;
+                        last_entry_ts.insert(*token_id, now);
+                    }
+                    continue;
+                }
+
+                if !reserve_sim_notional_for_strategy(&mut conn, "SYNDICATE", bet_size).await {
+                    continue;
+                }
+
+                let inserted = {
+                    let mut positions = self.open_positions.write().await;
+                    if positions.contains_key(token_id) {
+                        false
+                    } else {
+                        positions.insert(*token_id, Position {
+                            entry_price: avg_price,
+                            size: bet_size,
+                            timestamp: now,
+                        });
+                        true
+                    }
+                };
+
+                if !inserted {
+                    let _ = release_sim_notional_for_strategy(&mut conn, "SYNDICATE", bet_size).await;
                     continue;
                 }
 
                 {
-                    let mut positions = self.open_positions.write().await;
-                    positions.insert(*token_id, Position {
-                        entry_price: avg_price,
-                        size: bet_size,
-                        timestamp: now,
-                    });
+                    let mut last_entry_ts = self.last_entry_ts.write().await;
+                    last_entry_ts.insert(*token_id, now);
                 }
 
                 let exec_msg = serde_json::json!({
@@ -557,6 +762,9 @@ impl Strategy for SyndicateStrategy {
                         "buy_pressure": buy_ratio,
                         "uptick_ratio": uptick_ratio,
                         "price_drift": price_drift,
+                        "buyer_entropy": buyer_entropy,
+                        "flow_acceleration": flow_acceleration,
+                        "cluster_confidence": cluster_confidence,
                         "max_wallet_share": max_wallet_share,
                     }
                 });

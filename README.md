@@ -194,6 +194,7 @@ Supports 6+ models via OpenRouter, Anthropic, Google, and OpenAI. Features adapt
 - **Simulation Ledger:** Full paper-trading engine with realistic slippage (1-3 bps).
 - **Backtester:** Walk-forward framework for strategy validation.
 - **Research Validator:** `scripts/strategy_validation.py` computes walk-forward OOS metrics, CSCV/PBO, and deflated Sharpe diagnostics before live promotion.
+- **Paper/Live Checklist:** `scripts/run_live_paper_checklist.sh` runs a control-plane validation pass for mode toggle safety, intelligence blocks, atomic settlement simulation, and syndicate timed exits.
 
 ### 7. Rust HFT Engine (`arb-scanner`)
 **Location:** `apps/arb-scanner/`
@@ -212,6 +213,9 @@ Supports 6+ models via OpenRouter, Anthropic, Google, and OpenAI. Features adapt
 | **Copy Bot** | "The Syndicate" | Decodes Polygon calldata to mimic profitable wallet clusters. | ✅ Active |
 | **CEX Arb** | "The Bridge" | Spatial arbitrage between Coinbase (Spot) and Polymarket (Outcome). | ✅ Active |
 | **Market Neutral** | "The Hedge" | Directional fair-value pricing for 15m up/down contracts with parity/spread/cooldown/risk-budget filters. | ✅ Active |
+| **Graph Arb** | "The Constraint Graph" | Scans active binary universe for no-arbitrage graph violations and allocates to best net edge. | ✅ Active |
+| **Convergence Carry** | "The Mean Reverter" | Trades cross-outcome parity dislocations into convergence with bounded hold and risk exits. | ✅ Active |
+| **Maker MM** | "The Quoter" | Captures spread where maker expectancy survives adverse-selection and fee model constraints. | ✅ Active |
 
 **Execution Safety Note:** Rust scanner processes signals/paper logic; Polymarket live posting, intelligence gating, and settlement tracking/redeem flow are centralized in backend SDK controls.
 
@@ -252,6 +256,8 @@ docker exec -e STRATEGY_TYPE=OBI_SCALPER -w /usr/src/app infrastructure-arb-scan
 | `GET` | `/api/arb/intelligence` | Latest per-strategy scan intelligence + live gate settings |
 | `GET` | `/api/arb/settlements` | Atomic settlement tracker snapshot (positions + redeem state) |
 | `POST` | `/api/arb/settlements/process` | Force a settlement/redeem processing cycle (control-plane auth) |
+| `POST` | `/api/arb/settlements/reset` | Clear tracked settlement positions (control-plane auth) |
+| `POST` | `/api/arb/settlements/simulate-atomic` | Register synthetic atomic pair for PAPER validation (control-plane auth) |
 | `GET` | `/api/arb/validation-trades` | Validation dataset path + row count |
 | `POST` | `/api/arb/validation-trades/reset` | Truncate validation dataset (control-plane auth) |
 

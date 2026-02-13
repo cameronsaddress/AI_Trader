@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{Timelike, Utc};
 use futures::{SinkExt, StreamExt};
-use log::{error, info};
+use log::{error, info, warn};
 use redis::AsyncCommands;
 use serde_json::Value;
 use statrs::distribution::{ContinuousCDF, Normal};
@@ -14,15 +14,17 @@ use url::Url;
 
 use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
-    apply_sim_pnl,
     build_scan_payload,
-    compute_bet_size,
+    compute_strategy_bet_size,
     is_strategy_enabled,
     publish_heartbeat,
     read_risk_config,
-    read_sim_bankroll,
+    read_sim_available_cash,
     read_simulation_reset_ts,
     strategy_variant,
+    reserve_sim_notional_for_strategy,
+    release_sim_notional_for_strategy,
+    settle_sim_position_for_strategy,
     read_trading_mode,
     TradingMode,
 };
@@ -38,22 +40,82 @@ const VOL_WINDOW_MS: i64 = 5 * 60 * 1000;
 const VOL_MIN_SAMPLES: usize = 8;
 const SPOT_STALE_MS: i64 = 2_500;
 const BOOK_STALE_MS: i64 = 1_500;
-const ENTRY_EDGE_THRESHOLD: f64 = 0.04;
-const EXIT_EDGE_THRESHOLD: f64 = 0.01;
-const MAX_ENTRY_EDGE_THRESHOLD: f64 = 0.10;
-const TAKE_PROFIT_PCT: f64 = 0.08;
-const STOP_LOSS_PCT: f64 = -0.05;
+const DEFAULT_ENTRY_EDGE_THRESHOLD: f64 = 0.04;
+const DEFAULT_EXIT_EDGE_THRESHOLD: f64 = 0.01;
+const DEFAULT_MAX_ENTRY_EDGE_THRESHOLD: f64 = 0.10;
+const DEFAULT_TAKE_PROFIT_PCT: f64 = 0.08;
+const DEFAULT_STOP_LOSS_PCT: f64 = -0.05;
 const ENTRY_EXPIRY_CUTOFF_SECS: i64 = 45;
-const MAX_ENTRY_SPREAD: f64 = 0.08;
+const DEFAULT_MAX_ENTRY_SPREAD: f64 = 0.08;
 const LIVE_PREVIEW_COOLDOWN_MS: i64 = 2_000;
 const MIN_ENTRY_PRICE: f64 = 0.08;
 const MAX_ENTRY_PRICE: f64 = 0.92;
 const MAX_PARITY_DEVIATION: f64 = 0.02;
-const MIN_EDGE_TO_SPREAD_RATIO: f64 = 1.25;
+const DEFAULT_MIN_EDGE_TO_SPREAD_RATIO: f64 = 1.25;
 const ENTRY_COOLDOWN_MS: i64 = 8_000;
 const MIN_HOLD_MS: i64 = 1_500;
-const MAX_TRADES_PER_WINDOW: usize = 3;
-const MAX_CONSECUTIVE_LOSSES: u32 = 3;
+const DEFAULT_MAX_TRADES_PER_WINDOW: usize = 3;
+const DEFAULT_MAX_CONSECUTIVE_LOSSES: u32 = 3;
+const DEFAULT_MAX_POSITION_FRACTION: f64 = 0.20;
+
+#[derive(Debug, Clone, Copy)]
+struct StrategyParams {
+    entry_edge_threshold: f64,
+    max_entry_edge_threshold: f64,
+    exit_edge_threshold: f64,
+    take_profit_pct: f64,
+    stop_loss_pct: f64,
+    max_entry_spread: f64,
+    min_edge_to_spread_ratio: f64,
+    max_trades_per_window: usize,
+    max_consecutive_losses: u32,
+    max_position_fraction: f64,
+}
+
+impl StrategyParams {
+    fn for_asset(asset: &str) -> Self {
+        match asset {
+            // BTC gets tighter downside and lower concentration to improve long-run risk-adjusted return.
+            "BTC" => Self {
+                entry_edge_threshold: 0.045,
+                max_entry_edge_threshold: 0.095,
+                exit_edge_threshold: 0.012,
+                take_profit_pct: 0.065,
+                stop_loss_pct: -0.035,
+                max_entry_spread: 0.07,
+                min_edge_to_spread_ratio: 1.40,
+                max_trades_per_window: 2,
+                max_consecutive_losses: 2,
+                max_position_fraction: 0.16,
+            },
+            // SOL showed negative expectancy overnight; keep sizing and turnover conservative.
+            "SOL" => Self {
+                entry_edge_threshold: 0.055,
+                max_entry_edge_threshold: 0.10,
+                exit_edge_threshold: 0.012,
+                take_profit_pct: 0.070,
+                stop_loss_pct: -0.030,
+                max_entry_spread: 0.06,
+                min_edge_to_spread_ratio: 1.60,
+                max_trades_per_window: 1,
+                max_consecutive_losses: 1,
+                max_position_fraction: 0.10,
+            },
+            _ => Self {
+                entry_edge_threshold: DEFAULT_ENTRY_EDGE_THRESHOLD,
+                max_entry_edge_threshold: DEFAULT_MAX_ENTRY_EDGE_THRESHOLD,
+                exit_edge_threshold: DEFAULT_EXIT_EDGE_THRESHOLD,
+                take_profit_pct: DEFAULT_TAKE_PROFIT_PCT,
+                stop_loss_pct: DEFAULT_STOP_LOSS_PCT,
+                max_entry_spread: DEFAULT_MAX_ENTRY_SPREAD,
+                min_edge_to_spread_ratio: DEFAULT_MIN_EDGE_TO_SPREAD_RATIO,
+                max_trades_per_window: DEFAULT_MAX_TRADES_PER_WINDOW,
+                max_consecutive_losses: DEFAULT_MAX_CONSECUTIVE_LOSSES,
+                max_position_fraction: DEFAULT_MAX_POSITION_FRACTION,
+            },
+        }
+    }
+}
 
 fn coinbase_ws_url() -> String {
     std::env::var("COINBASE_WS_URL").unwrap_or_else(|_| COINBASE_ADVANCED_WS_URL.to_string())
@@ -92,14 +154,27 @@ fn parse_number(value: Option<&Value>) -> Option<f64> {
     }
 }
 
-fn parse_coinbase_ticker_price(payload: &str, product_id: &str) -> Option<f64> {
+fn parse_sequence(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_i64().and_then(|s| if s >= 0 { Some(s as u64) } else { None }))
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+    })
+}
+
+fn parse_coinbase_ticker_price(payload: &str, product_id: &str) -> Option<(f64, Option<u64>)> {
     let parsed = serde_json::from_str::<Value>(payload).ok()?;
+    let root_sequence = parse_sequence(parsed.get("sequence_num"))
+        .or_else(|| parse_sequence(parsed.get("sequence")));
 
     // Legacy Coinbase Exchange feed shape.
     if parsed.get("type").and_then(|v| v.as_str()) == Some("ticker")
         && parsed.get("product_id").and_then(|v| v.as_str()) == Some(product_id)
     {
-        return parse_number(parsed.get("price"));
+        return parse_number(parsed.get("price")).map(|price| {
+            let seq = parse_sequence(parsed.get("sequence")).or(root_sequence);
+            (price, seq)
+        });
     }
 
     // Coinbase Advanced Trade shape.
@@ -118,18 +193,23 @@ fn parse_coinbase_ticker_price(payload: &str, product_id: &str) -> Option<f64> {
             }
 
             if let Some(price) = parse_number(ticker.get("price")) {
-                return Some(price);
+                return Some((price, root_sequence));
             }
 
             let bid = parse_number(ticker.get("best_bid"));
             let ask = parse_number(ticker.get("best_ask"));
             if let (Some(best_bid), Some(best_ask)) = (bid, ask) {
-                return Some((best_bid + best_ask) / 2.0);
+                return Some(((best_bid + best_ask) / 2.0, root_sequence));
             }
         }
     }
 
     None
+}
+
+fn parse_coinbase_message_sequence(payload: &str) -> Option<u64> {
+    let parsed = serde_json::from_str::<Value>(payload).ok()?;
+    parse_sequence(parsed.get("sequence_num")).or_else(|| parse_sequence(parsed.get("sequence")))
 }
 
 #[derive(Debug, Clone)]
@@ -290,6 +370,7 @@ impl Strategy for MarketNeutralStrategy {
         };
         let cost_model = SimCostModel::from_env();
         let variant = strategy_variant();
+        let params = StrategyParams::for_asset(&self.asset);
         let mut last_seen_reset_ts = 0_i64;
 
         let spot_writer = self.latest_spot_price.clone();
@@ -307,6 +388,7 @@ impl Strategy for MarketNeutralStrategy {
                             asset_pair,
                             coinbase_ws_url
                         );
+                        let mut last_sequence: Option<u64> = None;
                         for subscribe_msg in &coinbase_subscriptions {
                             if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.to_string())).await {
                                 error!("Coinbase subscribe failed: {}", e);
@@ -316,7 +398,26 @@ impl Strategy for MarketNeutralStrategy {
                         while let Some(msg) = ws_stream.next().await {
                             match msg {
                                 Ok(Message::Text(text)) => {
-                                    if let Some(price) = parse_coinbase_ticker_price(&text, &asset_pair) {
+                                    if let Some(seq) = parse_coinbase_message_sequence(&text) {
+                                        if let Some(prev) = last_sequence {
+                                            if seq <= prev {
+                                                continue;
+                                            }
+                                            let expected = prev.saturating_add(1);
+                                            if seq > expected {
+                                                warn!(
+                                                    "Coinbase ticker sequence gap detected for {} (expected {}, got {}); reconnecting",
+                                                    asset_pair,
+                                                    expected,
+                                                    seq
+                                                );
+                                                break;
+                                            }
+                                        }
+                                        last_sequence = Some(seq);
+                                    }
+
+                                    if let Some((price, _sequence)) = parse_coinbase_ticker_price(&text, &asset_pair) {
                                         let mut w = spot_writer.write().await;
                                         *w = (price, Utc::now().timestamp_millis());
                                         let now_ms = Utc::now().timestamp_millis();
@@ -438,6 +539,13 @@ impl Strategy for MarketNeutralStrategy {
                         let heartbeat_id = self.heartbeat_id();
 
                         if !is_strategy_enabled(&mut conn, &strategy_id).await {
+                            let released_notional = {
+                                let mut pos_lock = self.open_position.write().await;
+                                pos_lock.take().map(|pos| pos.size).unwrap_or(0.0)
+                            };
+                            if released_notional > 0.0 {
+                                let _ = release_sim_notional_for_strategy(&mut conn, &strategy_id, released_notional).await;
+                            }
                             publish_heartbeat(&mut conn, &heartbeat_id).await;
                             continue;
                         }
@@ -480,9 +588,9 @@ impl Strategy for MarketNeutralStrategy {
                         let yes_no_mid_sum = book.yes.mid() + book.no.mid();
                         let yes_spread = (book.yes.best_ask - book.yes.best_bid).max(0.0);
                         let edge = fair_yes - book.yes.best_ask;
-                        let adaptive_entry_edge = (ENTRY_EDGE_THRESHOLD
+                        let adaptive_entry_edge = (params.entry_edge_threshold
                             + ((sigma - ASSUMED_VOLATILITY).max(0.0) * 0.02))
-                            .clamp(ENTRY_EDGE_THRESHOLD, MAX_ENTRY_EDGE_THRESHOLD);
+                            .clamp(params.entry_edge_threshold, params.max_entry_edge_threshold);
                         let required_edge = adaptive_entry_edge + cost_model.round_trip_cost_rate();
                         let parity_deviation = (yes_no_mid_sum - 1.0).abs();
                         let edge_to_spread_ratio = if yes_spread > 0.0 {
@@ -492,10 +600,10 @@ impl Strategy for MarketNeutralStrategy {
                         };
                         let price_ok = book.yes.best_ask >= MIN_ENTRY_PRICE && book.yes.best_ask <= MAX_ENTRY_PRICE;
                         let parity_ok = parity_deviation <= MAX_PARITY_DEVIATION;
-                        let spread_ok = yes_spread <= MAX_ENTRY_SPREAD;
-                        let spread_efficiency_ok = yes_spread <= 0.0 || edge_to_spread_ratio >= MIN_EDGE_TO_SPREAD_RATIO;
-                        let risk_budget_ok = trades_this_window < MAX_TRADES_PER_WINDOW
-                            && consecutive_losses < MAX_CONSECUTIVE_LOSSES;
+                        let spread_ok = yes_spread <= params.max_entry_spread;
+                        let spread_efficiency_ok = yes_spread <= 0.0 || edge_to_spread_ratio >= params.min_edge_to_spread_ratio;
+                        let risk_budget_ok = trades_this_window < params.max_trades_per_window
+                            && consecutive_losses < params.max_consecutive_losses;
                         let structural_filters_ok = price_ok && parity_ok && spread_ok && spread_efficiency_ok && risk_budget_ok;
                         let passes_threshold = edge >= required_edge && structural_filters_ok;
                         let reason = if edge < required_edge {
@@ -522,13 +630,13 @@ impl Strategy for MarketNeutralStrategy {
                             format!(
                                 "YES spread {:.2}c exceeds max {:.2}c",
                                 yes_spread * 100.0,
-                                MAX_ENTRY_SPREAD * 100.0
+                                params.max_entry_spread * 100.0
                             )
                         } else if !spread_efficiency_ok {
                             format!(
                                 "Edge/spread ratio {:.2} below required {:.2}",
                                 edge_to_spread_ratio,
-                                MIN_EDGE_TO_SPREAD_RATIO
+                                params.min_edge_to_spread_ratio
                             )
                         } else if !risk_budget_ok {
                             format!(
@@ -585,14 +693,21 @@ impl Strategy for MarketNeutralStrategy {
                         if trading_mode == TradingMode::Live {
                             if passes_threshold
                                 && book.yes.best_ask > 0.0
-                                && yes_spread <= MAX_ENTRY_SPREAD
+                                && yes_spread <= params.max_entry_spread
                                 && remaining_seconds > ENTRY_EXPIRY_CUTOFF_SECS
                                 && now_ms - last_entry_ms >= ENTRY_COOLDOWN_MS
                                 && now_ms - last_live_preview_ms >= LIVE_PREVIEW_COOLDOWN_MS
                             {
-                                let bankroll = read_sim_bankroll(&mut conn).await;
+                                let available_cash = read_sim_available_cash(&mut conn).await;
                                 let risk_cfg = read_risk_config(&mut conn).await;
-                                let size = compute_bet_size(bankroll, &risk_cfg, 10.0, 0.20);
+                                let size = compute_strategy_bet_size(
+                                    &mut conn,
+                                    &strategy_id,
+                                    available_cash,
+                                    &risk_cfg,
+                                    10.0,
+                                    params.max_position_fraction,
+                                ).await;
                                 if size > 0.0 {
                                     let preview_msg = serde_json::json!({
                                         "market": format!("Long {}", self.asset),
@@ -632,15 +747,12 @@ impl Strategy for MarketNeutralStrategy {
                                     last_live_preview_ms = now_ms;
                                 }
                             }
-                            let had_position = {
+                            let released_notional = {
                                 let mut pos_lock = self.open_position.write().await;
-                                let existed = pos_lock.is_some();
-                                if existed {
-                                    *pos_lock = None;
-                                }
-                                existed
+                                pos_lock.take().map(|pos| pos.size).unwrap_or(0.0)
                             };
-                            if had_position {
+                            if released_notional > 0.0 {
+                                let _ = release_sim_notional_for_strategy(&mut conn, &strategy_id, released_notional).await;
                                 info!("{} strategy: clearing paper position in LIVE mode", strategy_id);
                             }
                             publish_heartbeat(&mut conn, &heartbeat_id).await;
@@ -672,11 +784,11 @@ impl Strategy for MarketNeutralStrategy {
                                     let mark_return = (mark_price - pos.entry_price) / pos.entry_price;
                                     let executable_return = (executable_exit_price - pos.entry_price) / pos.entry_price;
                                     let hold_ms = now_ms - pos.timestamp_ms;
-                                    let close_reason = if mark_return >= TAKE_PROFIT_PCT {
+                                    let close_reason = if mark_return >= params.take_profit_pct {
                                         Some("TAKE_PROFIT")
-                                    } else if hold_ms >= MIN_HOLD_MS && executable_return <= STOP_LOSS_PCT {
+                                    } else if hold_ms >= MIN_HOLD_MS && executable_return <= params.stop_loss_pct {
                                         Some("STOP_LOSS")
-                                    } else if hold_ms >= MIN_HOLD_MS && edge < EXIT_EDGE_THRESHOLD {
+                                    } else if hold_ms >= MIN_HOLD_MS && edge < params.exit_edge_threshold {
                                         Some("EDGE_DECAY")
                                     } else if remaining_seconds <= 30 {
                                         Some("EXPIRY_EXIT")
@@ -702,7 +814,7 @@ impl Strategy for MarketNeutralStrategy {
 
                         if let Some((pos, exit_price, mark_return, executable_return, hold_ms, reason)) = close_event {
                             let pnl = realized_pnl(pos.size, executable_return, cost_model);
-                            let new_bankroll = apply_sim_pnl(&mut conn, pnl).await;
+                            let new_bankroll = settle_sim_position_for_strategy(&mut conn, &strategy_id, pos.size, pnl).await;
                             if pnl < 0.0 {
                                 consecutive_losses = consecutive_losses.saturating_add(1);
                             } else {
@@ -737,10 +849,22 @@ impl Strategy for MarketNeutralStrategy {
                         }
 
                         if let Some(entry_price) = entry_signal_price {
-                            let bankroll = read_sim_bankroll(&mut conn).await;
+                            let available_cash = read_sim_available_cash(&mut conn).await;
                             let risk_cfg = read_risk_config(&mut conn).await;
-                            let size = compute_bet_size(bankroll, &risk_cfg, 10.0, 0.20);
+                            let size = compute_strategy_bet_size(
+                                &mut conn,
+                                &strategy_id,
+                                available_cash,
+                                &risk_cfg,
+                                10.0,
+                                params.max_position_fraction,
+                            ).await;
                             if size <= 0.0 {
+                                publish_heartbeat(&mut conn, &heartbeat_id).await;
+                                continue;
+                            }
+
+                            if !reserve_sim_notional_for_strategy(&mut conn, &strategy_id, size).await {
                                 publish_heartbeat(&mut conn, &heartbeat_id).await;
                                 continue;
                             }
@@ -780,6 +904,8 @@ impl Strategy for MarketNeutralStrategy {
                                     }
                                 });
                                 let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                            } else {
+                                let _ = release_sim_notional_for_strategy(&mut conn, &strategy_id, size).await;
                             }
                         }
 

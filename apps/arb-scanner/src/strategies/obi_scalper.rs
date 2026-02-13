@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
-use log::{error, info};
+use log::{error, info, warn};
 use redis::AsyncCommands;
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
@@ -13,15 +13,17 @@ use url::Url;
 
 use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
-    apply_sim_pnl,
     build_scan_payload,
-    compute_bet_size,
+    compute_strategy_bet_size,
     is_strategy_enabled,
     publish_heartbeat,
     read_risk_config,
-    read_sim_bankroll,
+    read_sim_available_cash,
     read_simulation_reset_ts,
     strategy_variant,
+    reserve_sim_notional_for_strategy,
+    release_sim_notional_for_strategy,
+    settle_sim_position_for_strategy,
     read_trading_mode,
     TradingMode,
 };
@@ -33,6 +35,10 @@ const COINBASE_ADVANCED_WS_URL: &str = "wss://advanced-trade-ws.coinbase.com";
 const OBI_SIGNAL_THRESHOLD: f64 = 0.45;
 const OBI_STD_MULTIPLIER: f64 = 2.0;
 const OBI_MAX_THRESHOLD: f64 = 0.80;
+const OBI_ENTRY_BUFFER: f64 = 0.08;
+const OBI_TREND_WINDOW: usize = 8;
+const MIN_OBI_TREND_DELTA: f64 = 0.015;
+const MIN_OBI_PASS_STREAK: u32 = 3;
 const SIGNAL_COOLDOWN_MS: i64 = 10_000;
 const OBI_DEPTH_LEVELS: usize = 15;
 const BOOK_STALE_MS: i64 = 1_500;
@@ -41,6 +47,10 @@ const TAKE_PROFIT_PCT: f64 = 0.03;
 const STOP_LOSS_PCT: f64 = -0.02;
 const COINBASE_PRODUCT_ID: &str = "BTC-USD";
 const MAX_ENTRY_SPREAD_BPS: f64 = 5.0;
+const MIN_ENTRY_PRICE: f64 = 0.15;
+const MAX_ENTRY_PRICE: f64 = 0.85;
+const MAX_ABS_SETTLEMENT_RETURN: f64 = 0.20;
+const MAX_POSITION_FRACTION: f64 = 0.05;
 const ENTRY_EXPIRY_CUTOFF_MS: i64 = 30_000;
 
 fn coinbase_ws_url() -> String {
@@ -78,6 +88,14 @@ fn parse_number(value: Option<&Value>) -> Option<f64> {
             .or_else(|| v.as_f64()),
         None => None,
     }
+}
+
+fn parse_sequence(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_i64().and_then(|s| if s >= 0 { Some(s as u64) } else { None }))
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -186,10 +204,29 @@ fn rolling_std(values: &std::collections::VecDeque<f64>) -> f64 {
     var.max(0.0).sqrt()
 }
 
-fn apply_coinbase_book_message(book: &mut LocalOrderBook, payload: &str) -> bool {
+fn apply_coinbase_book_message(
+    book: &mut LocalOrderBook,
+    payload: &str,
+    last_sequence: &mut Option<u64>,
+) -> Result<bool, (u64, u64)> {
     let Ok(val) = serde_json::from_str::<Value>(payload) else {
-        return false;
+        return Ok(false);
     };
+    let sequence = parse_sequence(val.get("sequence_num"))
+        .or_else(|| parse_sequence(val.get("sequence")));
+
+    if let Some(seq) = sequence {
+        if let Some(prev) = *last_sequence {
+            if seq <= prev {
+                return Ok(false);
+            }
+            let expected = prev.saturating_add(1);
+            if seq > expected {
+                return Err((expected, seq));
+            }
+        }
+        *last_sequence = Some(seq);
+    }
 
     // Legacy Coinbase Exchange level2 feed.
     if val.get("product_id").and_then(|v| v.as_str()) == Some(COINBASE_PRODUCT_ID) {
@@ -213,7 +250,7 @@ fn apply_coinbase_book_message(book: &mut LocalOrderBook, payload: &str) -> bool
                     }
                 }
             }
-            return true;
+            return Ok(true);
         }
 
         if msg_type == "l2update" {
@@ -228,17 +265,17 @@ fn apply_coinbase_book_message(book: &mut LocalOrderBook, payload: &str) -> bool
                     }
                 }
             }
-            return true;
+            return Ok(true);
         }
     }
 
     // Coinbase Advanced Trade level2 feed.
     if val.get("channel").and_then(|v| v.as_str()) != Some("l2_data") {
-        return false;
+        return Ok(false);
     }
 
     let Some(events) = val.get("events").and_then(|v| v.as_array()) else {
-        return false;
+        return Ok(false);
     };
 
     let mut updated = false;
@@ -265,7 +302,7 @@ fn apply_coinbase_book_message(book: &mut LocalOrderBook, payload: &str) -> bool
         }
     }
 
-    updated
+    Ok(updated)
 }
 
 pub struct ObiScalperStrategy {
@@ -305,6 +342,7 @@ impl Strategy for ObiScalperStrategy {
                 match connect_async(coinbase_ws_url.as_str()).await {
                     Ok((mut ws, _)) => {
                         info!("OBI connected to Coinbase order book feed: {}", coinbase_ws_url);
+                        let mut last_sequence: Option<u64> = None;
                         for sub_msg in &coinbase_subscriptions {
                             if let Err(e) = ws.send(Message::Text(sub_msg.to_string())).await {
                                 error!("Coinbase level2 subscribe failed: {}", e);
@@ -315,7 +353,17 @@ impl Strategy for ObiScalperStrategy {
                             match msg {
                                 Ok(Message::Text(text)) => {
                                     let mut b = book_writer.write().await;
-                                    let _ = apply_coinbase_book_message(&mut b, &text);
+                                    match apply_coinbase_book_message(&mut b, &text, &mut last_sequence) {
+                                        Ok(_) => {}
+                                        Err((expected, got)) => {
+                                            warn!(
+                                                "OBI Coinbase sequence gap detected (expected {}, got {}); reconnecting local order book",
+                                                expected,
+                                                got
+                                            );
+                                            break;
+                                        }
+                                    }
                                 }
                                 Ok(Message::Ping(payload)) => {
                                     // Keep connection healthy when server sends pings.
@@ -342,6 +390,7 @@ impl Strategy for ObiScalperStrategy {
         let mut last_signal_ms = 0_i64;
         let mut obi_history: VecDeque<f64> = VecDeque::new();
         let mut open_position: Option<Position> = None;
+        let mut pass_streak = 0_u32;
         let mut last_seen_reset_ts = 0_i64;
 
         loop {
@@ -427,6 +476,10 @@ impl Strategy for ObiScalperStrategy {
                     }
                     _ = interval.tick() => {
                         if !is_strategy_enabled(&mut conn, "OBI_SCALPER").await {
+                            if let Some(pos) = open_position.take() {
+                                let _ = release_sim_notional_for_strategy(&mut conn, "OBI_SCALPER", pos.size).await;
+                            }
+                            pass_streak = 0;
                             publish_heartbeat(&mut conn, "obi_scalper").await;
                             continue;
                         }
@@ -449,11 +502,13 @@ impl Strategy for ObiScalperStrategy {
                         };
 
                         if now_ms - book_last_update_ms > BOOK_STALE_MS {
+                            pass_streak = 0;
                             publish_heartbeat(&mut conn, "obi_scalper").await;
                             continue;
                         }
 
                         let Some(mid_price) = mid else {
+                            pass_streak = 0;
                             publish_heartbeat(&mut conn, "obi_scalper").await;
                             continue;
                         };
@@ -468,6 +523,7 @@ impl Strategy for ObiScalperStrategy {
                             || !poly_book.yes.is_valid()
                             || !poly_book.no.is_valid()
                         {
+                            pass_streak = 0;
                             publish_heartbeat(&mut conn, "obi_scalper").await;
                             continue;
                         }
@@ -497,18 +553,53 @@ impl Strategy for ObiScalperStrategy {
                         }
                         let sigma = rolling_std(&obi_history);
                         let adaptive_threshold = (OBI_SIGNAL_THRESHOLD.max(sigma * OBI_STD_MULTIPLIER)).min(OBI_MAX_THRESHOLD);
-                        let passes_threshold = obi.abs() >= adaptive_threshold;
-                        let reason = if passes_threshold {
+                        let effective_threshold = (adaptive_threshold + OBI_ENTRY_BUFFER).min(0.95);
+                        let trend_delta = if obi_history.len() >= OBI_TREND_WINDOW {
+                            let start_idx = obi_history.len() - OBI_TREND_WINDOW;
+                            let mut window: Vec<f64> = obi_history.iter().skip(start_idx).copied().collect();
+                            if window.len() < OBI_TREND_WINDOW {
+                                0.0
+                            } else {
+                                let half = OBI_TREND_WINDOW / 2;
+                                let early_avg = window.drain(..half).sum::<f64>() / half as f64;
+                                let late_len = OBI_TREND_WINDOW - half;
+                                let late_avg = window.iter().sum::<f64>() / late_len as f64;
+                                late_avg - early_avg
+                            }
+                        } else {
+                            0.0
+                        };
+                        let trend_ok = if obi >= 0.0 {
+                            trend_delta >= MIN_OBI_TREND_DELTA
+                        } else {
+                            trend_delta <= -MIN_OBI_TREND_DELTA
+                        };
+                        let passes_threshold = obi.abs() >= effective_threshold && trend_ok;
+                        if passes_threshold {
+                            pass_streak = pass_streak.saturating_add(1);
+                        } else {
+                            pass_streak = 0;
+                        }
+                        let reason = if obi.abs() < effective_threshold {
                             format!(
-                                "|OBI| {:.3} exceeded adaptive threshold {:.3}",
+                                "|OBI| {:.3} below entry threshold {:.3}",
                                 obi.abs(),
-                                adaptive_threshold
+                                effective_threshold
+                            )
+                        } else if !trend_ok {
+                            format!(
+                                "OBI trend delta {:.3} failed directional filter {:.3}",
+                                trend_delta,
+                                MIN_OBI_TREND_DELTA
                             )
                         } else {
                             format!(
-                                "|OBI| {:.3} below adaptive threshold {:.3}",
+                                "|OBI| {:.3} exceeded entry threshold {:.3} with trend {:.3} (streak {}/{})",
                                 obi.abs(),
-                                adaptive_threshold
+                                effective_threshold,
+                                trend_delta,
+                                pass_streak,
+                                MIN_OBI_PASS_STREAK
                             )
                         };
 
@@ -522,13 +613,19 @@ impl Strategy for ObiScalperStrategy {
                             mid_price,
                             "TOP_OF_BOOK_MID",
                             obi,
-                            adaptive_threshold,
+                            effective_threshold,
                             passes_threshold,
                             reason,
                             now_ms,
                             serde_json::json!({
                                 "obi_sigma": sigma,
                                 "depth_levels": OBI_DEPTH_LEVELS,
+                                "adaptive_threshold": adaptive_threshold,
+                                "effective_threshold": effective_threshold,
+                                "trend_delta": trend_delta,
+                                "trend_ok": trend_ok,
+                                "pass_streak": pass_streak,
+                                "min_pass_streak": MIN_OBI_PASS_STREAK,
                                 "coinbase_spread_bps": spread_bps,
                                 "poly_yes_bid": yes_bid,
                                 "poly_yes_ask": yes_ask,
@@ -559,16 +656,23 @@ impl Strategy for ObiScalperStrategy {
 
                         if trading_mode == TradingMode::Live {
                             if passes_threshold
+                                && pass_streak >= MIN_OBI_PASS_STREAK
                                 && now_ms - last_signal_ms >= SIGNAL_COOLDOWN_MS
                                 && spread_bps <= MAX_ENTRY_SPREAD_BPS
                                 && poly_entry_spread_bps <= MAX_ENTRY_SPREAD_BPS
                                 && remaining_ms >= ENTRY_EXPIRY_CUTOFF_MS
-                                && entry_price > 0.0
-                                && entry_price < 1.0
+                                && (MIN_ENTRY_PRICE..=MAX_ENTRY_PRICE).contains(&entry_price)
                             {
-                                let bankroll = read_sim_bankroll(&mut conn).await;
+                                let available_cash = read_sim_available_cash(&mut conn).await;
                                 let risk_cfg = read_risk_config(&mut conn).await;
-                                let size = compute_bet_size(bankroll, &risk_cfg, 10.0, 0.10);
+                                let size = compute_strategy_bet_size(
+                                    &mut conn,
+                                    "OBI_SCALPER",
+                                    available_cash,
+                                    &risk_cfg,
+                                    10.0,
+                                    MAX_POSITION_FRACTION,
+                                ).await;
                                 if size > 0.0 {
                                     let dry_run_msg = serde_json::json!({
                                         "market": "OBI Scalper",
@@ -580,6 +684,7 @@ impl Strategy for ObiScalperStrategy {
                                         "details": {
                                             "obi": obi,
                                             "adaptive_threshold": adaptive_threshold,
+                                            "pass_streak": pass_streak,
                                             "coinbase_mid": mid_price,
                                             "token_side": token_side,
                                             "entry_price": entry_price,
@@ -604,8 +709,8 @@ impl Strategy for ObiScalperStrategy {
                                 }
                             }
 
-                            if open_position.is_some() {
-                                open_position = None;
+                            if let Some(pos) = open_position.take() {
+                                let _ = release_sim_notional_for_strategy(&mut conn, "OBI_SCALPER", pos.size).await;
                                 info!("OBI Scalper: clearing paper position in LIVE mode");
                             }
                             publish_heartbeat(&mut conn, "obi_scalper").await;
@@ -617,6 +722,7 @@ impl Strategy for ObiScalperStrategy {
                             last_seen_reset_ts = reset_ts;
                             open_position = None;
                             obi_history.clear();
+                            pass_streak = 0;
                             last_signal_ms = 0;
                             publish_heartbeat(&mut conn, "obi_scalper").await;
                             continue;
@@ -645,8 +751,12 @@ impl Strategy for ObiScalperStrategy {
                                 };
 
                                 if let Some(reason) = close_reason {
-                                    let pnl = realized_pnl(pos.size, gross_return, cost_model);
-                                    let new_bankroll = apply_sim_pnl(&mut conn, pnl).await;
+                                    let capped_gross_return = gross_return
+                                        .max(-MAX_ABS_SETTLEMENT_RETURN)
+                                        .min(MAX_ABS_SETTLEMENT_RETURN);
+                                    let return_capped = (capped_gross_return - gross_return).abs() > f64::EPSILON;
+                                    let pnl = realized_pnl(pos.size, capped_gross_return, cost_model);
+                                    let new_bankroll = settle_sim_position_for_strategy(&mut conn, "OBI_SCALPER", pos.size, pnl).await;
 
                                     let net_return = if pos.size > 0.0 { pnl / pos.size } else { 0.0 };
                                     let pnl_msg = serde_json::json!({
@@ -666,6 +776,9 @@ impl Strategy for ObiScalperStrategy {
                                             "exit_obi": obi,
                                             "hold_ms": hold_ms,
                                             "gross_return": gross_return,
+                                            "capped_gross_return": capped_gross_return,
+                                            "settlement_cap_abs_return": MAX_ABS_SETTLEMENT_RETURN,
+                                            "return_capped": return_capped,
                                             "net_return": net_return,
                                             "roi": format!("{:.2}%", net_return * 100.0),
                                             "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
@@ -683,6 +796,8 @@ impl Strategy for ObiScalperStrategy {
                                         "details": {
                                             "reason": reason,
                                             "gross_return": gross_return,
+                                            "capped_gross_return": capped_gross_return,
+                                            "return_capped": return_capped,
                                             "net_return": net_return,
                                         }
                                     });
@@ -694,18 +809,30 @@ impl Strategy for ObiScalperStrategy {
 
                         if open_position.is_none()
                             && passes_threshold
+                            && pass_streak >= MIN_OBI_PASS_STREAK
                             && now_ms - last_signal_ms >= SIGNAL_COOLDOWN_MS
                             && spread_bps <= MAX_ENTRY_SPREAD_BPS
                             && poly_entry_spread_bps <= MAX_ENTRY_SPREAD_BPS
                             && remaining_ms >= ENTRY_EXPIRY_CUTOFF_MS
-                            && entry_price > 0.0
-                            && entry_price < 1.0
+                            && (MIN_ENTRY_PRICE..=MAX_ENTRY_PRICE).contains(&entry_price)
                             && exit_mark > 0.0
                         {
-                            let bankroll = read_sim_bankroll(&mut conn).await;
+                            let available_cash = read_sim_available_cash(&mut conn).await;
                             let risk_cfg = read_risk_config(&mut conn).await;
-                            let size = compute_bet_size(bankroll, &risk_cfg, 10.0, 0.10);
+                            let size = compute_strategy_bet_size(
+                                &mut conn,
+                                "OBI_SCALPER",
+                                available_cash,
+                                &risk_cfg,
+                                10.0,
+                                MAX_POSITION_FRACTION,
+                            ).await;
                             if size <= 0.0 {
+                                publish_heartbeat(&mut conn, "obi_scalper").await;
+                                continue;
+                            }
+
+                            if !reserve_sim_notional_for_strategy(&mut conn, "OBI_SCALPER", size).await {
                                 publish_heartbeat(&mut conn, "obi_scalper").await;
                                 continue;
                             }
@@ -728,6 +855,7 @@ impl Strategy for ObiScalperStrategy {
                                 "details": {
                                     "obi": obi,
                                     "adaptive_threshold": adaptive_threshold,
+                                    "pass_streak": pass_streak,
                                     "token_side": token_side,
                                     "type": "ORDER_BOOK_IMBALANCE"
                                 }

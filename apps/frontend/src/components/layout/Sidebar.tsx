@@ -1,4 +1,4 @@
-import { Home, LineChart, Brain, Workflow, History, Settings, Zap } from 'lucide-react';
+import { Home, LineChart, Brain, Workflow, History, Settings, Zap, Timer } from 'lucide-react';
 import { clsx } from 'clsx';
 import { motion } from 'framer-motion';
 import { useLocation, useNavigate } from 'react-router-dom';
@@ -6,6 +6,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 const navItems = [
     { icon: Home, label: 'Overview', path: '/' },
     { icon: Zap, label: 'Polymarket', path: '/polymarket' },
+    { icon: Timer, label: 'BTC 5m Engine', path: '/btc-5m-engine' },
     { icon: LineChart, label: 'Markets', path: '/markets' },
     { icon: Brain, label: 'Intelligence', path: '/intelligence' },
     { icon: Workflow, label: 'Strategies', path: '/strategies' },

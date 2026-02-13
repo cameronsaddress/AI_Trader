@@ -109,6 +109,9 @@ function asString(input: unknown): string | null {
 }
 
 function asNumber(input: unknown): number | null {
+    if (input === null || input === undefined || input === '') {
+        return null;
+    }
     const parsed = Number(input);
     return Number.isFinite(parsed) ? parsed : null;
 }
@@ -665,10 +668,9 @@ export class PolymarketPreflightService {
             };
         }
 
-        const orderResults: LiveExecutionOrderResult[] = [];
-        for (const order of signedOrders) {
+        const orderResults = await Promise.all(signedOrders.map(async (order): Promise<LiveExecutionOrderResult> => {
             try {
-                const response = await this.client.postOrder(order.signedOrder as any, this.liveOrderType);
+                const response = await this.client!.postOrder(order.signedOrder as any, this.liveOrderType);
                 const orderId = asString(asRecord(response)?.orderID);
                 const status = asString(asRecord(response)?.status);
                 const txHashesRaw = asRecord(response)?.transactionsHashes;
@@ -677,7 +679,7 @@ export class PolymarketPreflightService {
                     : [];
                 const success = Boolean(asRecord(response)?.success) || Boolean(orderId);
 
-                orderResults.push({
+                return {
                     tokenId: order.tokenId,
                     conditionId: order.conditionId,
                     side: order.side,
@@ -691,10 +693,10 @@ export class PolymarketPreflightService {
                     status: status || undefined,
                     transactions: transactions.length > 0 ? transactions : undefined,
                     error: success ? undefined : asString(asRecord(response)?.errorMsg) || 'Order post failed',
-                });
+                };
             } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
-                orderResults.push({
+                return {
                     tokenId: order.tokenId,
                     conditionId: order.conditionId,
                     side: order.side,
@@ -705,9 +707,9 @@ export class PolymarketPreflightService {
                     size: order.size,
                     ok: false,
                     error: message,
-                });
+                };
             }
-        }
+        }));
 
         const posted = orderResults.filter((order) => order.ok).length;
         const failed = orderResults.length - posted;

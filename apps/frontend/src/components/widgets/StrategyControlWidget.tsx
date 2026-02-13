@@ -17,6 +17,15 @@ interface Strategy {
 
 const STRATEGIES: Strategy[] = [
     {
+        id: 'BTC_5M',
+        name: 'BTC 5m Engine',
+        description: 'High-frequency BTC 5-minute up/down engine. Compares Coinbase spot vs Polymarket odds and enters one directional position per window (UP or DOWN), holding to resolution.',
+        icon: <Zap size={18} />,
+        color: 'text-rose-300',
+        status: 'active',
+        stats: { pnl: '$0.00', daily_trades: 0 }
+    },
+    {
         id: 'BTC_15M',
         name: 'BTC Fair Value',
         description: 'Directional fair-value model for BTC 15-minute up/down contracts. This strategy can lose money and is not a guaranteed arbitrage.',
@@ -76,6 +85,33 @@ const STRATEGIES: Strategy[] = [
         description: 'Trades Coinbase microstructure momentum from level2 imbalance and short-lived order-flow pressure.',
         icon: <BarChart2 size={18} />,
         color: 'text-orange-400',
+        status: 'active',
+        stats: { pnl: '$0.00', daily_trades: 0 }
+    },
+    {
+        id: 'GRAPH_ARB',
+        name: 'Graph Constraint Arb',
+        description: 'Scans a multi-market universe for constraint-graph violations and allocates to the best net locked edge after modeled costs.',
+        icon: <Activity size={18} />,
+        color: 'text-teal-300',
+        status: 'active',
+        stats: { pnl: '$0.00', daily_trades: 0 }
+    },
+    {
+        id: 'CONVERGENCE_CARRY',
+        name: 'Convergence Carry',
+        description: 'Targets cross-outcome parity reversion in binary books near expiry with disciplined exits and bounded hold windows.',
+        icon: <BarChart2 size={18} />,
+        color: 'text-sky-300',
+        status: 'active',
+        stats: { pnl: '$0.00', daily_trades: 0 }
+    },
+    {
+        id: 'MAKER_MM',
+        name: 'Maker Micro-MM',
+        description: 'Captures spread where expected maker edge survives fee/rebate/adverse-selection model constraints.',
+        icon: <Activity size={18} />,
+        color: 'text-lime-300',
         status: 'active',
         stats: { pnl: '$0.00', daily_trades: 0 }
     }

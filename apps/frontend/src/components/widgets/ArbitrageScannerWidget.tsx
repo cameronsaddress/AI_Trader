@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSocket } from '../../context/SocketContext';
 
-type ScanKind = 'ATOMIC' | 'SNIPER' | 'SYNDICATE' | 'FAIR_VALUE' | 'OBI' | 'UNKNOWN';
+type ScanKind = 'ATOMIC' | 'SNIPER' | 'SYNDICATE' | 'FAIR_VALUE' | 'WINDOW' | 'OBI' | 'GRAPH' | 'CONVERGENCE' | 'MAKER' | 'UNKNOWN';
 
 type SignalPoint = {
     timestamp: number;
@@ -23,6 +23,7 @@ type ScanMessage = {
     passes_threshold?: boolean;
     reason?: string;
     metric_label?: string;
+    meta?: Record<string, unknown>;
 };
 
 type DisplayRow = {
@@ -45,6 +46,7 @@ type DisplayRow = {
 const ATOMIC_MIN_NET_EDGE = 0.0035;
 const SNIPER_ENTRY_THRESHOLD = 0.0008;
 const FV_ENTRY_EDGE = 0.04;
+const WINDOW_MIN_EXPECTED_NET_RETURN = 0.006;
 const OBI_SIGNAL_THRESHOLD = 0.45;
 const SYNDICATE_MIN_BUY_RATIO = 0.65;
 const SYNDICATE_MIN_WALLETS = 3;
@@ -55,11 +57,15 @@ const HISTORY_MAX_POINTS = 240;
 const MAX_ROWS = 8;
 const ROW_ORDER: Record<ScanKind, number> = {
     ATOMIC: 0,
-    SNIPER: 1,
-    SYNDICATE: 2,
-    FAIR_VALUE: 3,
-    OBI: 4,
-    UNKNOWN: 5,
+    GRAPH: 1,
+    CONVERGENCE: 2,
+    MAKER: 3,
+    SNIPER: 4,
+    SYNDICATE: 5,
+    FAIR_VALUE: 6,
+    WINDOW: 7,
+    OBI: 8,
+    UNKNOWN: 9,
 };
 
 function parseNumber(input: unknown): number {
@@ -93,6 +99,7 @@ function parseScanMessage(input: unknown): ScanMessage | null {
     const reason = typeof payload.reason === 'string' ? payload.reason : undefined;
     const metricLabel = typeof payload.metric_label === 'string' ? payload.metric_label : undefined;
     const passesThreshold = typeof payload.passes_threshold === 'boolean' ? payload.passes_threshold : undefined;
+    const meta = payload.meta && typeof payload.meta === 'object' ? (payload.meta as Record<string, unknown>) : undefined;
 
     return {
         market_id: marketId,
@@ -109,13 +116,18 @@ function parseScanMessage(input: unknown): ScanMessage | null {
         passes_threshold: passesThreshold,
         reason,
         metric_label: metricLabel,
+        meta,
     };
 }
 
 function classify(strategy: string | undefined, symbol: string): ScanKind {
+    if (strategy === 'GRAPH_ARB' || symbol.includes('GRAPH')) return 'GRAPH';
+    if (strategy === 'CONVERGENCE_CARRY' || symbol.includes('CONVERGENCE')) return 'CONVERGENCE';
+    if (strategy === 'MAKER_MM' || symbol.includes('MAKER')) return 'MAKER';
     if (strategy === 'ATOMIC_ARB' || symbol === 'ATOMIC-ARB') return 'ATOMIC';
     if (strategy === 'CEX_SNIPER' || symbol.includes('SNIPER') || symbol.includes('COINBASE')) return 'SNIPER';
     if (strategy === 'SYNDICATE' || symbol.includes('SYNDICATE')) return 'SYNDICATE';
+    if ((strategy && strategy.endsWith('_5M')) || symbol.includes('5m')) return 'WINDOW';
     if (strategy === 'OBI_SCALPER' || symbol.includes('OBI')) return 'OBI';
     if ((strategy && strategy.endsWith('_15M')) || symbol.endsWith(' FV')) return 'FAIR_VALUE';
     return 'UNKNOWN';
@@ -148,7 +160,11 @@ function defaultThreshold(kind: ScanKind): number {
     if (kind === 'ATOMIC') return ATOMIC_MIN_NET_EDGE;
     if (kind === 'SNIPER') return SNIPER_ENTRY_THRESHOLD;
     if (kind === 'FAIR_VALUE') return FV_ENTRY_EDGE;
+    if (kind === 'WINDOW') return WINDOW_MIN_EXPECTED_NET_RETURN;
     if (kind === 'OBI') return OBI_SIGNAL_THRESHOLD;
+    if (kind === 'GRAPH') return 0.0045;
+    if (kind === 'CONVERGENCE') return 0.02;
+    if (kind === 'MAKER') return 0.009;
     return 0;
 }
 
@@ -176,6 +192,33 @@ function buildRow(rowKey: string, scan: ScanMessage, history: SignalPoint[]): Di
         fallbackReason = actionable
             ? `Net edge cleared ${(threshold * 100).toFixed(2)}% threshold`
             : `Net edge below ${(threshold * 100).toFixed(2)}% threshold`;
+    } else if (kind === 'GRAPH') {
+        marketLabel = 'Graph Constraint Arb';
+        dataText = `Ask Sum ${scan.prices[0].toFixed(4)} | Gross ${formatSignedPercent(scan.prices[1])}`;
+        metricText = `Constraint ${scan.metric_label ? scan.metric_label : 'Edge'}`;
+        signalText = `Net Edge ${formatSignedPercent(score)}`;
+        actionable = score >= threshold;
+        fallbackReason = actionable
+            ? `Constraint edge cleared ${(threshold * 100).toFixed(2)}% threshold`
+            : `Constraint edge below ${(threshold * 100).toFixed(2)}% threshold`;
+    } else if (kind === 'CONVERGENCE') {
+        marketLabel = 'Convergence Carry';
+        dataText = `Entry ${formatCents(scan.prices[0])} | Spread ${formatCents(scan.prices[1])}`;
+        metricText = scan.metric_label ? scan.metric_label : 'Parity';
+        signalText = `Parity ${formatSignedCents(score)}`;
+        actionable = score >= threshold;
+        fallbackReason = actionable
+            ? `Parity edge cleared ${(threshold * 100).toFixed(2)}c threshold`
+            : `Parity edge below ${(threshold * 100).toFixed(2)}c threshold`;
+    } else if (kind === 'MAKER') {
+        marketLabel = 'Maker Micro-MM';
+        dataText = `Entry ${formatCents(scan.prices[0])} | Spread ${formatCents(scan.prices[1])}`;
+        metricText = scan.metric_label ? scan.metric_label : 'Maker Edge';
+        signalText = `Expectancy ${formatSignedPercent(score)}`;
+        actionable = score >= threshold;
+        fallbackReason = actionable
+            ? `Expected net edge cleared ${(threshold * 100).toFixed(2)}% threshold`
+            : `Expected net edge below ${(threshold * 100).toFixed(2)}% threshold`;
     } else if (kind === 'SNIPER') {
         marketLabel = 'CEX Latency Arb';
         dataText = `Coinbase ${formatMoneyCompact(scan.prices[0])} | Poly ${formatCents(scan.prices[1])}`;
@@ -207,6 +250,20 @@ function buildRow(rowKey: string, scan: ScanMessage, history: SignalPoint[]): Di
         fallbackReason = actionable
             ? `Fair-value edge cleared ${(threshold * 100).toFixed(2)}c threshold`
             : `Fair-value edge below ${(threshold * 100).toFixed(2)}c threshold`;
+    } else if (kind === 'WINDOW') {
+        const spot = scan.prices[0];
+        const ask = scan.prices[1];
+        const fairProb = Math.max(0, Math.min(1, scan.sum));
+        const direction = score >= 0 ? 'UP' : 'DOWN';
+        const expectedNetBps = Math.abs(score) * 10_000;
+        marketLabel = scan.symbol || 'Window Engine';
+        dataText = `Coinbase ${formatMoneyCompact(spot)} | Ask ${formatCents(ask)}`;
+        metricText = `Fair ${direction} ${(fairProb * 100).toFixed(2)}%`;
+        signalText = `EV +${expectedNetBps.toFixed(1)}bps`;
+        actionable = Math.abs(score) >= Math.abs(threshold);
+        fallbackReason = actionable
+            ? `Expected net return cleared ${(threshold * 10_000).toFixed(1)}bps threshold`
+            : `Expected net return below ${(threshold * 10_000).toFixed(1)}bps threshold`;
     } else if (kind === 'OBI') {
         marketLabel = 'OBI Scalper';
         dataText = `Bid ${formatMoneyCompact(scan.prices[0])} | Ask ${formatMoneyCompact(scan.prices[1])}`;
@@ -222,8 +279,10 @@ function buildRow(rowKey: string, scan: ScanMessage, history: SignalPoint[]): Di
 
     const reasonText = (scan.reason && scan.reason.trim().length > 0) ? scan.reason : fallbackReason;
     const actionableFromPayload = typeof scan.passes_threshold === 'boolean' ? scan.passes_threshold : actionable;
-    const thresholdText = kind === 'FAIR_VALUE'
+    const thresholdText = kind === 'FAIR_VALUE' || kind === 'CONVERGENCE'
         ? `Threshold ${(threshold * 100).toFixed(2)}c`
+        : kind === 'WINDOW'
+        ? `Threshold ${(threshold * 10_000).toFixed(1)}bps`
         : kind === 'OBI'
         ? `Threshold ${Math.abs(threshold).toFixed(3)}`
         : `Threshold ${(Math.abs(threshold) * 100).toFixed(2)}%`;
@@ -251,8 +310,12 @@ function signalClass(kind: ScanKind, value: number, actionable: boolean): string
         return 'text-gray-500';
     }
 
-    if (kind === 'FAIR_VALUE' || kind === 'ATOMIC' || kind === 'SYNDICATE' || kind === 'OBI') {
+    if (kind === 'FAIR_VALUE' || kind === 'ATOMIC' || kind === 'SYNDICATE' || kind === 'OBI' || kind === 'GRAPH' || kind === 'CONVERGENCE' || kind === 'MAKER') {
         return 'text-emerald-400';
+    }
+
+    if (kind === 'WINDOW') {
+        return value > 0 ? 'text-emerald-400' : 'text-rose-400';
     }
 
     if (kind === 'SNIPER') {
@@ -271,6 +334,9 @@ function rowKeyFor(scan: ScanMessage): string {
     const kind = classify(scan.strategy, scan.symbol);
     if (kind === 'OBI') return 'OBI_SCALPER';
     if (kind === 'ATOMIC') return 'ATOMIC_ARB';
+    if (kind === 'GRAPH') return 'GRAPH_ARB';
+    if (kind === 'CONVERGENCE') return 'CONVERGENCE_CARRY';
+    if (kind === 'MAKER') return 'MAKER_MM';
 
     return scan.symbol;
 }

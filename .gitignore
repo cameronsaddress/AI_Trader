@@ -1,0 +1,27 @@
+# Secrets
+.env
+*.env.local
+cdp_api_key.json
+*ECDSA*.json
+TRADEAI_ECDSA.json
+
+# Dependencies
+node_modules/
+apps/*/node_modules/
+packages/*/node_modules/
+
+# Build outputs
+apps/backend/dist/
+apps/frontend/dist/
+apps/arb-scanner/target/
+apps/*/tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# Runtime artifacts
+logs/
+apps/*/logs/
+reports/
+
+# OS/editor
+.DS_Store
+.vscode/

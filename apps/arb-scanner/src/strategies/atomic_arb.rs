@@ -9,15 +9,17 @@ use url::Url;
 
 use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
-    apply_sim_pnl,
     build_scan_payload,
-    compute_bet_size,
+    compute_strategy_bet_size,
     is_strategy_enabled,
     publish_heartbeat,
     read_risk_config,
-    read_sim_bankroll,
+    read_sim_available_cash,
     read_simulation_reset_ts,
     strategy_variant,
+    reserve_sim_notional_for_strategy,
+    release_sim_notional_for_strategy,
+    settle_sim_position_for_strategy,
     read_trading_mode,
     TradingMode,
 };
@@ -32,6 +34,14 @@ const BOOK_STALE_MS: i64 = 1_500;
 const ENTRY_EXPIRY_CUTOFF_SECS: i64 = 20;
 const MIN_LEG_PRICE: f64 = 0.01;
 const MAX_LEG_PRICE: f64 = 0.99;
+
+#[derive(Debug, Clone)]
+struct PendingPaperTrade {
+    entry_ts_ms: i64,
+    notional_usd: f64,
+    ask_sum: f64,
+    net_edge: f64,
+}
 
 pub struct AtomicArbStrategy {
     client: PolymarketClient,
@@ -125,6 +135,7 @@ impl Strategy for AtomicArbStrategy {
 
             let mut book = BinaryBook::default();
             let mut last_fire_ms = 0_i64;
+            let mut pending_settlements: Vec<PendingPaperTrade> = Vec::new();
 
             loop {
                 tokio::select! {
@@ -154,6 +165,14 @@ impl Strategy for AtomicArbStrategy {
                         let now_ms = Utc::now().timestamp_millis();
 
                         if !is_strategy_enabled(&mut conn, "ATOMIC_ARB").await {
+                            let release_notional = pending_settlements
+                                .iter()
+                                .map(|pending| pending.notional_usd)
+                                .sum::<f64>();
+                            if release_notional > 0.0 {
+                                pending_settlements.clear();
+                                let _ = release_sim_notional_for_strategy(&mut conn, "ATOMIC_ARB", release_notional).await;
+                            }
                             publish_heartbeat(&mut conn, "atomic_arb").await;
                             continue;
                         }
@@ -167,6 +186,7 @@ impl Strategy for AtomicArbStrategy {
                         if reset_ts > last_seen_reset_ts {
                             last_seen_reset_ts = reset_ts;
                             last_fire_ms = 0;
+                            pending_settlements.clear();
                         }
 
                         if book.yes.best_ask < MIN_LEG_PRICE
@@ -227,13 +247,34 @@ impl Strategy for AtomicArbStrategy {
                         let _: () = conn.publish("arbitrage:scan", scan_msg.to_string()).await.unwrap_or_default();
 
                         if read_trading_mode(&mut conn).await == TradingMode::Live {
+                            if !pending_settlements.is_empty() {
+                                let release_notional = pending_settlements
+                                    .iter()
+                                    .map(|pending| pending.notional_usd)
+                                    .sum::<f64>();
+                                info!(
+                                    "Atomic arb: clearing {} pending paper settlement(s) after LIVE mode switch",
+                                    pending_settlements.len()
+                                );
+                                pending_settlements.clear();
+                                if release_notional > 0.0 {
+                                    let _ = release_sim_notional_for_strategy(&mut conn, "ATOMIC_ARB", release_notional).await;
+                                }
+                            }
                             if passes_threshold
                                 && (now_ms - last_fire_ms) >= FIRE_COOLDOWN_MS
                                 && seconds_to_expiry > ENTRY_EXPIRY_CUTOFF_SECS
                             {
-                                let bankroll = read_sim_bankroll(&mut conn).await;
+                                let available_cash = read_sim_available_cash(&mut conn).await;
                                 let risk_cfg = read_risk_config(&mut conn).await;
-                                let investment_usd = compute_bet_size(bankroll, &risk_cfg, 10.0, 0.20);
+                                let investment_usd = compute_strategy_bet_size(
+                                    &mut conn,
+                                    "ATOMIC_ARB",
+                                    available_cash,
+                                    &risk_cfg,
+                                    10.0,
+                                    0.20,
+                                ).await;
                                 if investment_usd > 0.0 {
                                     let shares = investment_usd / ask_sum;
                                     let yes_notional = shares * book.yes.best_ask;
@@ -292,21 +333,39 @@ impl Strategy for AtomicArbStrategy {
                             && (now_ms - last_fire_ms) >= FIRE_COOLDOWN_MS
                             && seconds_to_expiry > ENTRY_EXPIRY_CUTOFF_SECS
                         {
-                            let bankroll = read_sim_bankroll(&mut conn).await;
+                            let available_cash = read_sim_available_cash(&mut conn).await;
                             let risk_cfg = read_risk_config(&mut conn).await;
-                            let investment_usd = compute_bet_size(bankroll, &risk_cfg, 10.0, 0.20);
+                            let investment_usd = compute_strategy_bet_size(
+                                &mut conn,
+                                "ATOMIC_ARB",
+                                available_cash,
+                                &risk_cfg,
+                                10.0,
+                                0.20,
+                            ).await;
                             if investment_usd <= 0.0 {
+                                publish_heartbeat(&mut conn, "atomic_arb").await;
+                                continue;
+                            }
+
+                            if !reserve_sim_notional_for_strategy(&mut conn, "ATOMIC_ARB", investment_usd).await {
                                 publish_heartbeat(&mut conn, "atomic_arb").await;
                                 continue;
                             }
 
                             let shares = investment_usd / ask_sum;
                             let expected_profit = investment_usd * net_edge;
-                            let new_bankroll = apply_sim_pnl(&mut conn, expected_profit).await;
+
+                            pending_settlements.push(PendingPaperTrade {
+                                entry_ts_ms: now_ms,
+                                notional_usd: investment_usd,
+                                ask_sum,
+                                net_edge,
+                            });
 
                             let exec_msg = serde_json::json!({
                                 "market": "Atomic Arb",
-                                "side": "ATOMIC_ARB",
+                                "side": "ENTRY",
                                 "price": ask_sum,
                                 "size": investment_usd,
                                 "timestamp": now_ms,
@@ -317,26 +376,11 @@ impl Strategy for AtomicArbStrategy {
                                     "shares": shares,
                                     "gross_edge": gross_edge,
                                     "net_edge": net_edge,
+                                    "expected_profit": expected_profit,
+                                    "settlement_status": "PENDING_EXPIRY",
                                 }
                             });
                             let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
-
-                            let pnl_msg = serde_json::json!({
-                                "strategy": "ATOMIC_ARB",
-                                "variant": variant.as_str(),
-                                "pnl": expected_profit,
-                                "notional": investment_usd,
-                                "timestamp": now_ms,
-                                "bankroll": new_bankroll,
-                                "mode": "PAPER",
-                                "details": {
-                                    "action": "ARB_WIN",
-                                    "sum": ask_sum,
-                                    "net_edge": net_edge,
-                                    "roi": format!("{:.2}%", net_edge * 100.0),
-                                }
-                            });
-                            let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
 
                             last_fire_ms = now_ms;
                         }
@@ -346,6 +390,54 @@ impl Strategy for AtomicArbStrategy {
                 }
 
                 if Utc::now().timestamp() > market_expiry {
+                    if !pending_settlements.is_empty() {
+                        let settle_ts_ms = Utc::now().timestamp_millis();
+                        let mut settled_count = 0_usize;
+                        for pending in pending_settlements.drain(..) {
+                            let settled_pnl = pending.notional_usd * pending.net_edge;
+                            let new_bankroll = settle_sim_position_for_strategy(&mut conn, "ATOMIC_ARB", pending.notional_usd, settled_pnl).await;
+                            settled_count = settled_count.saturating_add(1);
+
+                            let pnl_msg = serde_json::json!({
+                                "strategy": "ATOMIC_ARB",
+                                "variant": variant.as_str(),
+                                "pnl": settled_pnl,
+                                "notional": pending.notional_usd,
+                                "timestamp": settle_ts_ms,
+                                "bankroll": new_bankroll,
+                                "mode": "PAPER",
+                                "details": {
+                                    "action": "SETTLE_ATOMIC",
+                                    "sum": pending.ask_sum,
+                                    "net_edge": pending.net_edge,
+                                    "hold_ms": settle_ts_ms - pending.entry_ts_ms,
+                                    "roi": format!("{:.2}%", pending.net_edge * 100.0),
+                                }
+                            });
+                            let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+
+                            let settle_msg = serde_json::json!({
+                                "market": "Atomic Arb",
+                                "side": "SETTLEMENT",
+                                "price": pending.ask_sum,
+                                "size": pending.notional_usd,
+                                "timestamp": settle_ts_ms,
+                                "mode": "PAPER",
+                                "details": {
+                                    "pnl": settled_pnl,
+                                    "net_edge": pending.net_edge,
+                                    "hold_ms": settle_ts_ms - pending.entry_ts_ms,
+                                }
+                            });
+                            let _: () = conn.publish("arbitrage:execution", settle_msg.to_string()).await.unwrap_or_default();
+                        }
+
+                        info!(
+                            "Atomic arb settled {} pending paper position(s) for market {}",
+                            settled_count,
+                            target_market.slug
+                        );
+                    }
                     break;
                 }
             }

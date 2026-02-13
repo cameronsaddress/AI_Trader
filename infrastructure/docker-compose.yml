@@ -107,6 +107,27 @@ services:
       - /usr/src/app/target
     command: cargo run
 
+  arb-scanner-btc-5m:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=BTC_5M
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+    dns:
+      - 8.8.8.8
+    depends_on:
+      - redis
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - /usr/src/app/target
+    command: cargo run
+
   arb-scanner-eth:
     build:
       context: ../apps/arb-scanner
@@ -221,6 +242,69 @@ services:
       - REDIS_URL=redis://redis:6379
       - RUST_LOG=info
       - STRATEGY_TYPE=OBI_SCALPER
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+    dns:
+      - 8.8.8.8
+    depends_on:
+      - redis
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - /usr/src/app/target
+    command: cargo run
+
+  arb-scanner-graph:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=GRAPH_ARB
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+    dns:
+      - 8.8.8.8
+    depends_on:
+      - redis
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - /usr/src/app/target
+    command: cargo run
+
+  arb-scanner-convergence:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=CONVERGENCE_CARRY
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+    dns:
+      - 8.8.8.8
+    depends_on:
+      - redis
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - /usr/src/app/target
+    command: cargo run
+
+  arb-scanner-maker:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=MAKER_MM
       - STRATEGY_VARIANT=baseline
       - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
