@@ -454,7 +454,7 @@ pub async fn read_strategy_risk_multiplier(conn: &mut redis::aio::Connection, st
     let parsed = conn.get::<_, f64>(&key).await.ok();
     if let Some(value) = parsed {
         if value.is_finite() {
-            return value.clamp(0.0, 2.0);
+            return value.clamp(0.0, 3.0);
         }
     }
 

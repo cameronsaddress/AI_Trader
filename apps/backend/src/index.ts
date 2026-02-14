@@ -496,10 +496,10 @@ const SIM_GLOBAL_UTILIZATION_CAP_PCT = Math.min(
     Math.max(0.10, Number(process.env.SIM_GLOBAL_UTILIZATION_CAP_PCT || '0.90')),
 );
 const STRATEGY_RISK_MULTIPLIER_PREFIX = 'strategy:risk_multiplier:';
-const STRATEGY_WEIGHT_FLOOR = 0.0;
-const STRATEGY_WEIGHT_CAP = 1.65;
+const STRATEGY_WEIGHT_FLOOR = 0.25;
+const STRATEGY_WEIGHT_CAP = Math.min(3.0, Math.max(1.0, Number(process.env.STRATEGY_WEIGHT_CAP || '2.0')));
 const STRATEGY_ALLOCATOR_EPSILON = 1e-6;
-const STRATEGY_ALLOCATOR_MIN_SAMPLES = Math.max(4, Number(process.env.STRATEGY_ALLOCATOR_MIN_SAMPLES || '8'));
+const STRATEGY_ALLOCATOR_MIN_SAMPLES = Math.max(4, Number(process.env.STRATEGY_ALLOCATOR_MIN_SAMPLES || '30'));
 const STRATEGY_ALLOCATOR_TARGET_SHARPE = Number(process.env.STRATEGY_ALLOCATOR_TARGET_SHARPE || '0.55');
 const DEFAULT_DISABLED_STRATEGIES = new Set(
     (process.env.DEFAULT_DISABLED_STRATEGIES || 'SOL_15M,SYNDICATE')
@@ -4106,12 +4106,14 @@ function computeStrategyMultiplier(state: StrategyPerformance): number {
         return Math.min(1.20, Math.max(0.80, bootstrap));
     }
 
-    // Hard circuit breaker for persistent negative edge.
-    if (state.sample_count >= 8 && state.ema_return <= -0.02) {
-        return 0;
+    // Throttle (don't kill) strategies with persistent negative edge.
+    // Thresholds tuned for binary option returns (±100% per trade).
+    // EMA alpha=0.08 needs ~30 samples to converge, so require 30+ before judging.
+    if (state.sample_count >= 30 && state.ema_return <= -0.25) {
+        return STRATEGY_WEIGHT_FLOOR;
     }
-    if (state.sample_count >= 12 && winRate <= 0.35 && state.ema_return <= -0.012) {
-        return 0;
+    if (state.sample_count >= 40 && winRate <= 0.35 && state.ema_return <= -0.15) {
+        return STRATEGY_WEIGHT_FLOOR;
     }
 
     const raw = 1 + (qualityScore * confidence * 0.45) - downsidePenalty;
@@ -4147,7 +4149,7 @@ async function updateStrategyAllocator(strategyId: string, pnl: number, notional
         : Math.max(1, Math.abs(pnl));
     const realizedReturn = pnl / normalizedNotional;
 
-    const alpha = 0.08;
+    const alpha = Math.min(0.50, Math.max(0.01, Number(process.env.STRATEGY_ALLOCATOR_EMA_ALPHA || '0.05')));
     state.ema_return = state.sample_count === 0
         ? realizedReturn
         : ((1 - alpha) * state.ema_return) + (alpha * realizedReturn);

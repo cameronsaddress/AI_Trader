@@ -28,6 +28,8 @@ pub struct BinaryBook {
     pub yes: Quote,
     pub no: Quote,
     pub last_update_ms: i64,
+    pub yes_update_ms: i64,
+    pub no_update_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +51,9 @@ fn update_snapshot_quote(side: &str, levels: Option<&Vec<Value>>, quote: &mut Qu
     let mut parsed_prices: Vec<f64> = Vec::new();
     for level in levels {
         if let Some(price) = level.get("price").and_then(parse_f64) {
-            parsed_prices.push(price);
+            if price.is_finite() && price > 0.0 {
+                parsed_prices.push(price);
+            }
         }
     }
 
@@ -117,7 +121,7 @@ pub fn update_books_from_market_ws(
         Err(_) => return 0,
     };
 
-    let mut updated_markets: HashMap<String, bool> = HashMap::new();
+    let mut updated_markets: HashMap<String, (bool, bool)> = HashMap::new();
 
     if let Some(arr) = parsed.as_array() {
         for entry in arr {
@@ -150,7 +154,8 @@ pub fn update_books_from_market_ws(
                 snapshot_quote.best_bid,
                 snapshot_quote.best_ask,
             );
-            updated_markets.insert(binding.market_key.clone(), true);
+            let sides = updated_markets.entry(binding.market_key.clone()).or_insert((false, false));
+            if binding.is_yes { sides.0 = true; } else { sides.1 = true; }
         }
     } else if let Some(price_changes) = parsed.get("price_changes").and_then(|v| v.as_array()) {
         for change in price_changes {
@@ -168,7 +173,8 @@ pub fn update_books_from_market_ws(
                 .entry(binding.market_key.clone())
                 .or_insert_with(BinaryBook::default);
             update_quote_for_binding(book, binding, best_bid, best_ask);
-            updated_markets.insert(binding.market_key.clone(), true);
+            let sides = updated_markets.entry(binding.market_key.clone()).or_insert((false, false));
+            if binding.is_yes { sides.0 = true; } else { sides.1 = true; }
         }
     }
 
@@ -177,9 +183,11 @@ pub fn update_books_from_market_ws(
     }
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    for market_key in updated_markets.keys() {
+    for (market_key, (yes_upd, no_upd)) in updated_markets.iter() {
         if let Some(book) = books.get_mut(market_key) {
             book.last_update_ms = now_ms;
+            if *yes_upd { book.yes_update_ms = now_ms; }
+            if *no_upd { book.no_update_ms = now_ms; }
         }
     }
 
@@ -192,7 +200,8 @@ pub fn update_book_from_market_ws(payload: &str, yes_token: &str, no_token: &str
         Err(_) => return false,
     };
 
-    let mut updated = false;
+    let mut yes_updated = false;
+    let mut no_updated = false;
 
     if let Some(arr) = parsed.as_array() {
         for entry in arr {
@@ -218,7 +227,8 @@ pub fn update_book_from_market_ws(payload: &str, yes_token: &str, no_token: &str
                 snapshot_quote.best_ask,
             );
 
-            updated = true;
+            if token == yes_token { yes_updated = true; }
+            if token == no_token { no_updated = true; }
         }
     } else if let Some(price_changes) = parsed.get("price_changes").and_then(|v| v.as_array()) {
         for change in price_changes {
@@ -235,13 +245,17 @@ pub fn update_book_from_market_ws(payload: &str, yes_token: &str, no_token: &str
             let best_ask = change.get("best_ask").and_then(parse_f64).unwrap_or(0.0);
 
             update_quote_for_token(book, token, yes_token, no_token, best_bid, best_ask);
-            updated = true;
+            if token == yes_token { yes_updated = true; }
+            if token == no_token { no_updated = true; }
         }
     }
 
-    if updated {
-        book.last_update_ms = chrono::Utc::now().timestamp_millis();
+    if yes_updated || no_updated {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        book.last_update_ms = now_ms;
+        if yes_updated { book.yes_update_ms = now_ms; }
+        if no_updated { book.no_update_ms = now_ms; }
     }
 
-    updated
+    yes_updated || no_updated
 }

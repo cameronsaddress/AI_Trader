@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
+import { socketUrl as getSocketUrl } from '../lib/api';
 
 interface SocketContextType {
     socket: Socket | null;
@@ -50,7 +51,7 @@ export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     useEffect(() => {
         // Connect to same origin (Vite proxy forwards to backend in dev).
-        const socketUrl = window.location.origin;
+        const socketUrl = getSocketUrl();
 
         console.log('[Socket] Connecting to:', socketUrl);
 

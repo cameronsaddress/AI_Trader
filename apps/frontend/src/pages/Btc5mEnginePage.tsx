@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useSocket } from '../context/SocketContext';
 import { ExecutionLayout } from '../components/layout/ExecutionLayout';
+import { apiUrl } from '../lib/api';
 
 type TradingMode = 'PAPER' | 'LIVE';
 
@@ -63,8 +64,7 @@ const SERIES_MAX_POINTS = 720;
 const ORDER_FEED_ROWS = 24;
 const POSITIONS_ROWS = 64;
 const FLOW_COLS = 108;
-// Match the reference "cross-exchange signal flow" rail: rows are CEX venues.
-// Some venues may not be wired yet; we still render the row for pixel parity.
+// Cross-exchange signal flow rail: one row per wired CEX feed.
 const FLOW_ROWS: Array<{ id: string; label: string; key: string }> = [
   { id: 'BIN', label: 'BIN', key: 'binance' },
   { id: 'CB', label: 'CB', key: 'coinbase' },
@@ -72,13 +72,6 @@ const FLOW_ROWS: Array<{ id: string; label: string; key: string }> = [
   { id: 'BYB', label: 'BYB', key: 'bybit' },
   { id: 'KRK', label: 'KRK', key: 'kraken' },
   { id: 'BFX', label: 'BFX', key: 'bitfinex' },
-  // Optional rows shown in the reference aesthetic.
-  { id: 'GATE', label: 'GATE', key: 'gate' },
-  { id: 'MEXC', label: 'MEXC', key: 'mexc' },
-  { id: 'KUCN', label: 'KUCN', key: 'kucoin' },
-  { id: 'HTX', label: 'HTX', key: 'htx' },
-  { id: 'BSTP', label: 'BSTP', key: 'bitstamp' },
-  { id: 'GEM', label: 'GEM', key: 'gemini' },
 ];
 
 function computeMedian(values: number[]): number | null {
@@ -186,15 +179,15 @@ function windowLabelForTs(tsMs: number): { start: number; end: number; label: st
 }
 
 function etMidnightEpochMs(nowMs: number): number {
-  // Convert now into "ET clock time" using stringification/parsing trick.
-  // This avoids adding a heavy timezone library and is stable enough for UI telemetry.
-  const now = new Date(nowMs);
-  const utcNow = new Date(now.toLocaleString('en-US', { timeZone: 'UTC' }));
-  const etNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const offsetMs = utcNow.getTime() - etNow.getTime();
-  const etMidnight = new Date(etNow.getTime());
-  etMidnight.setHours(0, 0, 0, 0);
-  return etMidnight.getTime() + offsetMs;
+  // Get today's date in ET as an ISO "YYYY-MM-DD" string (en-CA locale).
+  const etDateStr = new Date(nowMs).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  // Build midnight UTC of that calendar date, then offset to ET.
+  const midnightUTC = new Date(etDateStr + 'T00:00:00Z').getTime();
+  // EST (UTC-5) → midnight ET = midnightUTC + 5h; EDT (UTC-4) → +4h.
+  // Check which offset lands on the correct ET date.
+  const est = midnightUTC + 5 * 3_600_000;
+  if (new Date(est).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) === etDateStr) return est;
+  return midnightUTC + 4 * 3_600_000;
 }
 
 function safeDirection(input: unknown): 'UP' | 'DOWN' | null {
@@ -294,6 +287,15 @@ export const Btc5mEnginePage: React.FC = () => {
   const [executionTraceError, setExecutionTraceError] = useState<string | null>(null);
   const [executionTraceLoading, setExecutionTraceLoading] = useState(false);
 
+  // Engine Tuning panel state
+  const [tuningOpen, setTuningOpen] = useState(false);
+  const [riskModel, setRiskModel] = useState<'FIXED' | 'PERCENT'>('PERCENT');
+  const [riskValue, setRiskValue] = useState(1.7);
+  const [strategyMultiplierInfo, setStrategyMultiplierInfo] = useState<{
+    multiplier: number; sample_count: number; ema_return: number;
+  } | null>(null);
+  const [strategyStatuses, setStrategyStatuses] = useState<Record<string, boolean>>({});
+
   const closeTrace = React.useCallback(() => {
     setTraceExecutionId(null);
     setExecutionTrace(null);
@@ -308,7 +310,7 @@ export const Btc5mEnginePage: React.FC = () => {
     setExecutionTraceError(null);
     setExecutionTraceLoading(true);
     try {
-      const response = await fetch(`/api/arb/execution-trace/${encodeURIComponent(executionId)}`);
+      const response = await fetch(apiUrl(`/api/arb/execution-trace/${encodeURIComponent(executionId)}`));
       if (!response.ok) {
         const payload = await response.json().catch(() => null) as { error?: string } | null;
         setExecutionTraceError(payload?.error || `Trace lookup failed (${response.status})`);
@@ -412,16 +414,25 @@ export const Btc5mEnginePage: React.FC = () => {
       const ts = parseNumber(parsed.timestamp) ?? Date.now();
       const pnl = parseNumber(parsed.pnl);
       const notional = parseNumber((parsed as any).notional) ?? parseNumber(parsed?.details?.notional) ?? null;
+      const direction = safeDirection((parsed as any).side)
+        ?? safeDirection(parsed?.details?.side)
+        ?? safeDirection(parsed?.details?.position_side)
+        ?? null;
+      const entryPrice = parseNumber(parsed?.details?.entry_price);
+      const windowStartTs = parseNumber(parsed?.details?.window_start_ts);
+      const holdMs = parseNumber(parsed?.details?.hold_ms);
 
       setTradeBlotter((prev) => {
         const existing = prev[executionId];
-        const fallbackLabel = existing?.window_label || windowLabelForTs(ts).label;
+        const fallbackLabel = existing?.window_label
+          || (windowStartTs !== null ? formatEtWindow(windowStartTs, windowStartTs + 300) : windowLabelForTs(ts).label);
+        const inferredEntryTs = holdMs !== null && holdMs > 0 ? ts - holdMs : null;
         const next: TradeRecord = {
           execution_id: executionId,
-          direction: existing?.direction ?? null,
+          direction: existing?.direction ?? direction,
           window_label: fallbackLabel,
-          entry_ts: existing?.entry_ts ?? ts,
-          entry_price: existing?.entry_price ?? null,
+          entry_ts: existing?.entry_ts ?? (inferredEntryTs !== null ? inferredEntryTs : ts),
+          entry_price: existing?.entry_price ?? entryPrice ?? null,
           notional: existing?.notional ?? (notional ?? 0),
           exit_ts: existing?.exit_ts ?? ts,
           pnl: pnl ?? existing?.pnl ?? null,
@@ -479,6 +490,41 @@ export const Btc5mEnginePage: React.FC = () => {
         setLatestScanMeta({ ...scan.meta, cex_mid: cexMid, cex_prices: parsedCexPrices });
       }
 
+      // Hydrate the currently open position from scanner telemetry, so a page refresh mid-window
+      // doesn't leave the POSITIONS rail empty until the next ENTRY/SETTLEMENT execution event.
+      const openPos = meta?.open_position;
+      if (openPos && typeof openPos === 'object' && !Array.isArray(openPos)) {
+        const execId = parseText((openPos as any).execution_id)
+          || parseText((openPos as any).executionId)
+          || parseText((openPos as any).id);
+        const dir = safeDirection((openPos as any).side);
+        const entryPrice = parseNumber((openPos as any).entry_price);
+        const notional = parseNumber((openPos as any).notional) ?? parseNumber((openPos as any).size) ?? 0;
+        const entryTs = parseNumber((openPos as any).entry_ts_ms) ?? ts;
+        const windowStartTs = parseNumber((openPos as any).window_start_ts);
+        const label = windowStartTs !== null ? formatEtWindow(windowStartTs, windowStartTs + 300) : windowLabelForTs(entryTs).label;
+        if (execId) {
+          setTradeBlotter((prev) => {
+            const existing = prev[execId];
+            if (existing?.status === 'RESOLVED') {
+              return prev;
+            }
+            const next: TradeRecord = {
+              execution_id: execId,
+              direction: existing?.direction ?? dir,
+              window_label: existing?.window_label ?? label,
+              entry_ts: existing?.entry_ts ?? entryTs,
+              entry_price: existing?.entry_price ?? entryPrice,
+              notional: existing?.notional ?? notional,
+              exit_ts: null,
+              pnl: existing?.pnl ?? null,
+              status: 'OPEN',
+            };
+            return { ...prev, [execId]: next };
+          });
+        }
+      }
+
       // Stream the signal-flow matrix right-to-left by pushing one column per scan.
       // Each row is the exchange premium (bps) vs the median spot.
       const denom = cexMid !== null && cexMid > 0 ? cexMid : null;
@@ -502,12 +548,45 @@ export const Btc5mEnginePage: React.FC = () => {
       lastCexSnapshotRef.current = parsedCexPrices;
     };
 
+    // Engine Tuning panel listeners
+    const handleRiskConfig = (cfg: { model?: string; value?: number }) => {
+      if (cfg?.model === 'FIXED' || cfg?.model === 'PERCENT') setRiskModel(cfg.model);
+      if (typeof cfg?.value === 'number') setRiskValue(cfg.value);
+    };
+    const handleMultiplierUpdate = (payload: { strategy?: string; multiplier?: number; sample_count?: number; ema_return?: number }) => {
+      if (payload?.strategy === STRATEGY_ID) {
+        setStrategyMultiplierInfo({
+          multiplier: payload.multiplier ?? 1,
+          sample_count: payload.sample_count ?? 0,
+          ema_return: payload.ema_return ?? 0,
+        });
+      }
+    };
+    const handleMultiplierSnapshot = (snapshot: Record<string, { multiplier?: number; sample_count?: number; ema_return?: number }>) => {
+      const entry = snapshot?.[STRATEGY_ID];
+      if (entry) {
+        setStrategyMultiplierInfo({
+          multiplier: entry.multiplier ?? 1,
+          sample_count: entry.sample_count ?? 0,
+          ema_return: entry.ema_return ?? 0,
+        });
+      }
+    };
+    const handleStrategyStatus = (statusMap: Record<string, boolean>) => {
+      setStrategyStatuses(statusMap);
+    };
+
     socket.on('trading_mode_update', handleTradingMode);
     socket.on('strategy_metrics_update', handleStrategyMetrics);
     socket.on('execution_log', handleExecutionLog);
     socket.on('strategy_pnl', handleStrategyPnl);
     socket.on('scanner_update', handleScannerUpdate);
+    socket.on('risk_config_update', handleRiskConfig);
+    socket.on('strategy_risk_multiplier_update', handleMultiplierUpdate);
+    socket.on('strategy_risk_multiplier_snapshot', handleMultiplierSnapshot);
+    socket.on('strategy_status_update', handleStrategyStatus);
     socket.emit('request_trading_mode');
+    socket.emit('request_risk_config');
 
     return () => {
       socket.off('trading_mode_update', handleTradingMode);
@@ -515,6 +594,10 @@ export const Btc5mEnginePage: React.FC = () => {
       socket.off('execution_log', handleExecutionLog);
       socket.off('strategy_pnl', handleStrategyPnl);
       socket.off('scanner_update', handleScannerUpdate);
+      socket.off('risk_config_update', handleRiskConfig);
+      socket.off('strategy_risk_multiplier_update', handleMultiplierUpdate);
+      socket.off('strategy_risk_multiplier_snapshot', handleMultiplierSnapshot);
+      socket.off('strategy_status_update', handleStrategyStatus);
     };
   }, [socket]);
 
@@ -522,7 +605,7 @@ export const Btc5mEnginePage: React.FC = () => {
     let active = true;
     const fetchStats = async () => {
       try {
-        const res = await fetch('/api/arb/stats');
+        const res = await fetch(apiUrl('/api/arb/stats'));
         if (!res.ok) return;
         const json = await res.json();
         if (!active) return;
@@ -549,7 +632,7 @@ export const Btc5mEnginePage: React.FC = () => {
     let cancelled = false;
     const loadTradeHistory = async () => {
       try {
-        const res = await fetch(`/api/arb/strategy-trades?strategy=${encodeURIComponent(STRATEGY_ID)}&limit=600`);
+        const res = await fetch(apiUrl(`/api/arb/strategy-trades?strategy=${encodeURIComponent(STRATEGY_ID)}&limit=600`));
         if (!res.ok) return;
         const payload = await res.json() as { trades?: any[] };
         const rows = Array.isArray(payload?.trades) ? payload.trades : [];
@@ -608,6 +691,7 @@ export const Btc5mEnginePage: React.FC = () => {
   const bestNetExpected = parseNumber(latestScanMeta?.best_net_expected_roi);
   const kelly = parseNumber(latestScanMeta?.kelly_fraction);
   const sigma = parseNumber(latestScanMeta?.sigma_annualized);
+  const ddLimitPct = parseNumber(latestScanMeta?.max_drawdown_pct) ?? -5.0;
 
   const corr = useMemo(() => {
     const n = Math.min(spotSeries.length, impliedSeries.length, 120);
@@ -761,6 +845,25 @@ export const Btc5mEnginePage: React.FC = () => {
           onExit={() => navigate('/polymarket')}
         />
 
+        <EngineTuningPanel
+          open={tuningOpen}
+          onToggle={() => setTuningOpen((v) => !v)}
+          riskModel={riskModel}
+          riskValue={riskValue}
+          onRiskChange={(model, value) => {
+            setRiskModel(model);
+            setRiskValue(value);
+            socket?.emit('update_risk_config', { model, value, timestamp: Date.now() });
+          }}
+          multiplier={strategyMultiplierInfo}
+          strategyStatuses={strategyStatuses}
+          onToggleStrategy={(id, active) => {
+            socket?.emit('toggle_strategy', { id, active, timestamp: Date.now() });
+          }}
+          perSideCostRate={latestScanMeta?.per_side_cost_rate != null ? Number(latestScanMeta.per_side_cost_rate) : null}
+          minExpectedNetReturn={latestScanMeta?.min_expected_net_return != null ? Number(latestScanMeta.min_expected_net_return) : null}
+        />
+
         <div className="flex-1 min-h-0 min-w-0 p-3 flex">
           {/* Hard-layout the reference UI: left column is split into (top grid) + (fixed bottom band),
               right column is the positions rail spanning full height. */}
@@ -836,7 +939,7 @@ export const Btc5mEnginePage: React.FC = () => {
                     maxDrawdown={maxDd}
                     openNotional={openNotional}
                     kelly={kelly}
-                    ddLimitPct={-5.0}
+                    ddLimitPct={ddLimitPct}
                   />
                 </PanelCell>
 
@@ -1004,8 +1107,8 @@ function CumulativePnlPanel(props: {
   roiPct: number;
   series: number[];
 }) {
-  const headline = `$${formatIntSpaces(Math.abs(props.cumulativePnl))}`;
-  const pnlClass = props.cumulativePnl >= 0 ? 'text-gray-100' : 'text-gray-100';
+  const headline = formatUsd0Spaces(props.cumulativePnl);
+  const pnlClass = 'text-gray-100';
   const todayClass = props.todayPnl >= 0 ? 'text-emerald-300' : 'text-rose-300';
   const roiClass = props.roiPct >= 0 ? 'text-gray-400' : 'text-gray-400';
 
@@ -1052,12 +1155,14 @@ function OrderFeedPanel(props: { rows: TradeRecord[]; onTrace: (id: string) => v
       <div className="px-5 pt-4">
         <PanelTitle>ORDER FEED</PanelTitle>
       </div>
-      <div className="px-5 pt-3 text-[10px] font-mono uppercase tracking-widest text-gray-600 grid grid-cols-[84px_140px_70px_84px_110px] gap-3 border-b border-white/10 pb-2">
+      <div className="px-5 pt-3 text-[10px] font-mono uppercase tracking-widest text-gray-600 grid grid-cols-[2px_84px_140px_70px_84px_110px_100px] gap-3 border-b border-white/10 pb-2">
+        <div />
         <div>TIME</div>
         <div>MARKET</div>
         <div>SIDE</div>
         <div>ENTRY</div>
         <div>SIZE</div>
+        <div>STATUS</div>
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto px-5 py-3">
         {props.rows.length === 0 && (
@@ -1068,6 +1173,11 @@ function OrderFeedPanel(props: { rows: TradeRecord[]; onTrace: (id: string) => v
             const sideLabel = row.direction || '--';
             const sideClass = sideLabel === 'UP' ? 'text-emerald-300' : sideLabel === 'DOWN' ? 'text-rose-300' : 'text-gray-400';
             const barClass = sideLabel === 'UP' ? 'bg-emerald-400' : sideLabel === 'DOWN' ? 'bg-rose-400' : 'bg-white/15';
+            const statusLabel = row.status === 'STOPPED'
+              ? 'stopped ×'
+              : row.status === 'OPEN'
+                ? 'open'
+                : 'resolved ✓';
 
             const windowShort = row.window_label.replace(' ET', '');
 
@@ -1079,13 +1189,14 @@ function OrderFeedPanel(props: { rows: TradeRecord[]; onTrace: (id: string) => v
                 className="w-full text-left group"
                 title={`Open trace ${row.execution_id}`}
               >
-                <div className="grid grid-cols-[2px_84px_140px_70px_84px_110px] gap-3 items-center">
+                <div className="grid grid-cols-[2px_84px_140px_70px_84px_110px_100px] gap-3 items-center">
                   <div className={`h-10 ${barClass}`} />
                   <div className="font-mono text-[11px] text-gray-500">{formatTime24h(row.entry_ts)}</div>
                   <div className="font-mono text-[11px] text-gray-300">{windowShort}</div>
                   <div className={`font-mono text-[11px] font-semibold ${sideClass}`}>{sideLabel}</div>
                   <div className="font-mono text-[11px] text-gray-200">{formatCents0(row.entry_price)}</div>
                   <div className="font-mono text-[11px] text-gray-200">{formatUsd0Spaces(row.notional)}</div>
+                  <div className="font-mono text-[11px] text-gray-500">{statusLabel}</div>
                 </div>
               </button>
             );
@@ -1105,6 +1216,142 @@ function SignalFlowPanel(props: { columns: number[][]; maxAbs: number[] }) {
       <div className="flex-1 min-h-0 p-5">
         <SignalFlowMatrix columns={props.columns} maxAbs={props.maxAbs} />
       </div>
+    </div>
+  );
+}
+
+/* ─── Engine Tuning Panel ─────────────────────────────────────────── */
+
+const TUNING_STRATEGIES = ['BTC_5M', 'BTC_15M', 'ETH_15M', 'SOL_15M'] as const;
+
+function EngineTuningPanel(props: {
+  open: boolean;
+  onToggle: () => void;
+  riskModel: 'FIXED' | 'PERCENT';
+  riskValue: number;
+  onRiskChange: (model: 'FIXED' | 'PERCENT', value: number) => void;
+  multiplier: { multiplier: number; sample_count: number; ema_return: number } | null;
+  strategyStatuses: Record<string, boolean>;
+  onToggleStrategy: (id: string, active: boolean) => void;
+  perSideCostRate: number | null;
+  minExpectedNetReturn: number | null;
+}) {
+  const costBps = props.perSideCostRate != null ? (props.perSideCostRate * 10_000).toFixed(1) : '--';
+  const edgeBps = props.minExpectedNetReturn != null ? (props.minExpectedNetReturn * 10_000).toFixed(0) : '--';
+  const mult = props.multiplier;
+
+  return (
+    <div className="mx-3 mt-1 border border-white/10 rounded-lg bg-black/40 backdrop-blur-sm overflow-hidden">
+      {/* Header — always visible */}
+      <button
+        type="button"
+        onClick={props.onToggle}
+        className="w-full flex items-center justify-between px-4 py-2 hover:bg-white/5 transition-colors"
+      >
+        <span className="text-[10px] font-mono uppercase tracking-[0.22em] text-gray-400">
+          Engine Tuning
+        </span>
+        <svg
+          className={`w-3 h-3 text-gray-500 transition-transform ${props.open ? 'rotate-180' : ''}`}
+          fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+        </svg>
+      </button>
+
+      {/* Collapsible body */}
+      {props.open && (
+        <div className="px-4 pb-3 grid grid-cols-5 gap-4 border-t border-white/5 pt-3">
+
+          {/* 1. Risk Model */}
+          <div>
+            <div className="text-[9px] font-mono uppercase tracking-widest text-gray-600 mb-2">Position Size</div>
+            <div className="flex bg-white/5 rounded p-0.5 mb-2">
+              <button
+                type="button"
+                onClick={() => props.onRiskChange('FIXED', 50)}
+                className={`flex-1 px-2 py-1 text-[10px] rounded font-bold transition-all ${props.riskModel === 'FIXED' ? 'bg-emerald-500 text-black' : 'text-gray-400 hover:text-white'}`}
+              >
+                FIXED ($)
+              </button>
+              <button
+                type="button"
+                onClick={() => props.onRiskChange('PERCENT', 1.0)}
+                className={`flex-1 px-2 py-1 text-[10px] rounded font-bold transition-all ${props.riskModel === 'PERCENT' ? 'bg-purple-500 text-white' : 'text-gray-400 hover:text-white'}`}
+              >
+                RISK (%)
+              </button>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                min={props.riskModel === 'FIXED' ? 10 : 0.5}
+                max={props.riskModel === 'FIXED' ? 500 : 10.0}
+                step={props.riskModel === 'FIXED' ? 10 : 0.5}
+                value={props.riskValue}
+                onChange={(e) => props.onRiskChange(props.riskModel, parseFloat(e.target.value))}
+                className={`flex-1 h-1 rounded-lg appearance-none cursor-pointer ${props.riskModel === 'FIXED' ? 'accent-emerald-500 bg-emerald-900/30' : 'accent-purple-500 bg-purple-900/30'}`}
+              />
+              <span className={`text-xs font-mono font-bold w-14 text-right ${props.riskModel === 'FIXED' ? 'text-emerald-400' : 'text-purple-400'}`}>
+                {props.riskModel === 'FIXED' ? `$${props.riskValue}` : `${props.riskValue.toFixed(1)}%`}
+              </span>
+            </div>
+          </div>
+
+          {/* 2. Multiplier */}
+          <div>
+            <div className="text-[9px] font-mono uppercase tracking-widest text-gray-600 mb-2">Risk Multiplier</div>
+            <div className="text-lg font-mono font-semibold text-amber-300">
+              {mult ? `${mult.multiplier.toFixed(3)}x` : '--'}
+            </div>
+            <div className="text-[10px] font-mono text-gray-500 mt-1">
+              {mult ? `${mult.sample_count} samples` : 'no data'}
+            </div>
+            <div className="text-[10px] font-mono text-gray-500">
+              EMA {mult ? `${(mult.ema_return * 100).toFixed(1)}%` : '--'}
+            </div>
+          </div>
+
+          {/* 3. Cost Model */}
+          <div>
+            <div className="text-[9px] font-mono uppercase tracking-widest text-gray-600 mb-2">Cost / Side</div>
+            <div className="text-lg font-mono font-semibold text-gray-100">{costBps} bps</div>
+            <div className="text-[10px] font-mono text-gray-600 mt-1">restart to change</div>
+          </div>
+
+          {/* 4. Edge Threshold */}
+          <div>
+            <div className="text-[9px] font-mono uppercase tracking-widest text-gray-600 mb-2">Min Edge</div>
+            <div className="text-lg font-mono font-semibold text-gray-100">{edgeBps} bps</div>
+            <div className="text-[10px] font-mono text-gray-600 mt-1">restart to change</div>
+          </div>
+
+          {/* 5. Strategy Toggles */}
+          <div>
+            <div className="text-[9px] font-mono uppercase tracking-widest text-gray-600 mb-2">Strategies</div>
+            <div className="space-y-1">
+              {TUNING_STRATEGIES.map((id) => {
+                const active = props.strategyStatuses[id] !== false;
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => props.onToggleStrategy(id, !active)}
+                    className={`w-full flex items-center gap-2 px-2 py-1 rounded text-[10px] font-mono font-bold transition-colors ${
+                      active
+                        ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20'
+                        : 'bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20'
+                    }`}
+                  >
+                    <div className={`w-1.5 h-1.5 rounded-full ${active ? 'bg-emerald-400' : 'bg-red-400'}`} />
+                    {id.replace('_', ' ')}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1236,7 +1483,7 @@ function ExecutionPipelinePanel(props: {
             <PipeRow k="DN" v={props.noAsk === null ? '--' : formatCents0(props.noAsk)} vClass="text-rose-300" />
             <PipeRow k="implied" v={impliedYes === null ? '--' : `${(Math.max(0, Math.min(1, impliedYes)) * 100).toFixed(1)}%`} />
             <div className="mt-3 text-[11px] font-mono text-gray-500">
-              vol <span className="text-gray-400">--</span>
+              vol <span className="text-gray-200">{props.sigma === null ? '--' : `${(props.sigma * 100).toFixed(0)}%`}</span>
             </div>
           </PipeCard>
           <PipeArrow />
@@ -1266,11 +1513,19 @@ function ExecutionPipelinePanel(props: {
           <PipeCard idx={4} sweep={sweep} title="05" subtitle="EXEC">
             <PipeRow k="dir" v={props.bestSide || '--'} vClass={props.bestSide === 'UP' ? 'text-emerald-300' : props.bestSide === 'DOWN' ? 'text-rose-300' : 'text-gray-200'} />
             <PipeRow k="@" v={props.bestPrice === null ? '--' : formatCents0(props.bestPrice)} />
-            <div className="mt-3 text-[11px] font-mono">
-              <span className="text-gray-500">EV </span>
-              <span className={evUsd !== null && evUsd >= 0 ? 'text-emerald-300' : 'text-rose-300'}>
-                {evUsd === null ? '--' : formatUsdSigned0Spaces(evUsd)}
-              </span>
+            <PipeRow
+              k="gate"
+              v={props.execDecision}
+              vClass={props.execDecision === 'PASS' ? 'text-emerald-300' : 'text-gray-500'}
+            />
+            <div className="mt-3 text-[11px] font-mono flex items-center justify-between gap-3">
+              <div>
+                <span className="text-gray-500">EV </span>
+                <span className={evUsd !== null && evUsd >= 0 ? 'text-emerald-300' : 'text-rose-300'}>
+                  {evUsd === null ? '--' : formatUsdSigned0Spaces(evUsd)}
+                </span>
+              </div>
+              <span className="text-gray-600">{props.liveModeLabel}</span>
             </div>
           </PipeCard>
         </div>
@@ -1296,19 +1551,17 @@ function PipeCard(props: {
 }) {
   const isActive = props.idx === props.sweep.activeIndex;
   const isWarm = props.idx === props.sweep.warmIndex;
-  const warmOpacity = isWarm ? 0.18 + props.sweep.warmProgress * 0.62 : 0;
+  const warmOpacity = isWarm ? props.sweep.warmProgress * 0.25 : 0;
   const topLineOpacity = isActive ? 0.92 : warmOpacity;
   return (
-    <div className={`bg-[#070707] p-4 flex flex-col justify-between relative ${isActive ? 'bg-white/[0.03]' : isWarm ? 'bg-white/[0.015]' : ''}`}>
+    <div className={`bg-[#070707] p-4 flex flex-col justify-between relative ${isActive ? 'bg-white/[0.03]' : ''}`}>
       <div
         className="absolute left-0 right-0 top-0 h-[2px]"
         style={{
           background: `rgba(255,255,255,${topLineOpacity.toFixed(3)})`,
           boxShadow: isActive
             ? '0 0 10px rgba(255,255,255,0.22)'
-            : isWarm
-              ? '0 0 8px rgba(255,255,255,0.12)'
-              : 'none',
+            : 'none',
         }}
       />
       <div>

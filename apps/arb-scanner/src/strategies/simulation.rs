@@ -12,7 +12,7 @@ impl Default for SimCostModel {
     fn default() -> Self {
         Self {
             fee_bps_per_side: 10.0,
-            slippage_bps_per_side: 15.0,
+            slippage_bps_per_side: 8.0,
             maker_rebate_bps_per_side: 1.5,
             maker_adverse_bps_per_side: 2.0,
         }

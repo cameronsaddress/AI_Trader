@@ -23,6 +23,9 @@ apps/*/logs/
 apps/**/logs/
 reports/
 
+# Local debug screenshots
+screenshot*.png
+
 # OS/editor
 .DS_Store
 .vscode/

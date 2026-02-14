@@ -3,6 +3,7 @@ use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use statrs::distribution::{ContinuousCDF, Normal};
 use std::collections::{HashMap, VecDeque};
@@ -49,14 +50,25 @@ const SPOT_STALE_MS: i64 = 2_500;
 const BOOK_STALE_MS: i64 = 1_500;
 const ENTRY_EXPIRY_CUTOFF_SECS: i64 = 12;
 const LIVE_PREVIEW_COOLDOWN_MS: i64 = 2_000;
+const SETTLEMENT_SPOT_TIMEOUT_MS: i64 = 12_000;
+
+const OPEN_POSITION_REDIS_PREFIX: &str = "strategy:open_position:";
+const OPEN_POSITION_TTL_SECS: i64 = 60 * 60; // 1h
+const WINDOW_START_SPOT_REDIS_PREFIX: &str = "btc_5m:window_start_spot:";
+const WINDOW_START_SPOT_TTL_SECS: i64 = 6 * 60 * 60; // 6h
+const WINDOW_START_SPOT_MAX_SKEW_MS: i64 = 5_000;
 
 // Avoid extreme prices that can explode ROI at settlement.
 const MIN_ENTRY_PRICE: f64 = 0.15;
 const MAX_ENTRY_PRICE: f64 = 0.85;
 const MAX_PARITY_DEVIATION: f64 = 0.02;
-const DEFAULT_MIN_EXPECTED_NET_RETURN: f64 = 0.006; // 60 bps expected net return
+const DEFAULT_MIN_EXPECTED_NET_RETURN: f64 = 0.004; // 40 bps expected net return
 const DEFAULT_MAX_ENTRY_SPREAD: f64 = 0.08; // 8c wide markets are ignored
-const DEFAULT_MAX_POSITION_FRACTION: f64 = 0.25;
+const DEFAULT_MAX_POSITION_FRACTION: f64 = 0.35;
+const DEFAULT_MAX_DRAWDOWN_PCT: f64 = -5.0;
+// Risk-free rate for Black-Scholes fair-value pricing.
+// Negligible over a 5-minute window but kept explicit for correctness.
+const RISK_FREE_RATE: f64 = 0.045;
 
 fn coinbase_ws_url() -> String {
     std::env::var("COINBASE_WS_URL").unwrap_or_else(|_| COINBASE_ADVANCED_WS_URL.to_string())
@@ -278,13 +290,157 @@ fn median_price(mut values: Vec<f64>) -> Option<f64> {
     }
 }
 
+fn open_position_redis_key(strategy_id: &str) -> String {
+    format!("{}{}", OPEN_POSITION_REDIS_PREFIX, strategy_id.trim().to_uppercase())
+}
+
+fn window_start_spot_redis_key(window_start_ts: i64) -> String {
+    format!("{}{}", WINDOW_START_SPOT_REDIS_PREFIX, window_start_ts)
+}
+
+fn side_label(side: Side) -> &'static str {
+    match side {
+        Side::Up => "UP",
+        Side::Down => "DOWN",
+    }
+}
+
+fn parse_side_label(label: &str) -> Option<Side> {
+    match label.trim().to_uppercase().as_str() {
+        "UP" => Some(Side::Up),
+        "DOWN" => Some(Side::Down),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedPosition {
+    execution_id: String,
+    side: String,
+    entry_price: f64,
+    notional_usd: f64,
+    entry_ts_ms: i64,
+    window_start_spot: f64,
+    window_start_ts: i64,
+    expiry_ts: i64,
+    token_id: String,
+    condition_id: String,
+    fair_yes: f64,
+    sigma: f64,
+    slug: String,
+}
+
+impl PersistedPosition {
+    fn from_position(pos: &Position) -> Self {
+        Self {
+            execution_id: pos.execution_id.clone(),
+            side: side_label(pos.side).to_string(),
+            entry_price: pos.entry_price,
+            notional_usd: pos.notional_usd,
+            entry_ts_ms: pos.entry_ts_ms,
+            window_start_spot: pos.window_start_spot,
+            window_start_ts: pos.window_start_ts,
+            expiry_ts: pos.expiry_ts,
+            token_id: pos.token_id.clone(),
+            condition_id: pos.condition_id.clone(),
+            fair_yes: pos.fair_yes,
+            sigma: pos.sigma,
+            slug: pos.slug.clone(),
+        }
+    }
+
+    fn into_position(self) -> Option<Position> {
+        let side = parse_side_label(&self.side)?;
+        if !self.entry_price.is_finite() || self.entry_price <= 0.0 || self.entry_price >= 1.0 {
+            return None;
+        }
+        if !self.notional_usd.is_finite() || self.notional_usd <= 0.0 {
+            return None;
+        }
+        Some(Position {
+            execution_id: self.execution_id,
+            side,
+            entry_price: self.entry_price,
+            notional_usd: self.notional_usd,
+            entry_ts_ms: self.entry_ts_ms,
+            window_start_spot: self.window_start_spot,
+            window_start_ts: self.window_start_ts,
+            expiry_ts: self.expiry_ts,
+            token_id: self.token_id,
+            condition_id: self.condition_id,
+            fair_yes: self.fair_yes,
+            sigma: self.sigma,
+            slug: self.slug,
+        })
+    }
+}
+
+async fn load_open_position(
+    conn: &mut redis::aio::Connection,
+    strategy_id: &str,
+) -> Option<Position> {
+    let key = open_position_redis_key(strategy_id);
+    let raw: Option<String> = conn.get(&key).await.unwrap_or(None);
+    let raw = raw?;
+    let parsed = serde_json::from_str::<PersistedPosition>(&raw).ok()?;
+    parsed.into_position()
+}
+
+async fn persist_open_position(
+    conn: &mut redis::aio::Connection,
+    strategy_id: &str,
+    pos: &Position,
+) {
+    let key = open_position_redis_key(strategy_id);
+    let payload = serde_json::to_string(&PersistedPosition::from_position(pos)).unwrap_or_default();
+    let _: () = conn.set(&key, payload).await.unwrap_or_default();
+    let _: () = conn.expire(&key, OPEN_POSITION_TTL_SECS).await.unwrap_or_default();
+}
+
+async fn clear_open_position(conn: &mut redis::aio::Connection, strategy_id: &str) {
+    let key = open_position_redis_key(strategy_id);
+    let _: () = conn.del(&key).await.unwrap_or_default();
+}
+
+async fn read_cached_window_start_spot(
+    conn: &mut redis::aio::Connection,
+    window_start_ts: i64,
+) -> Option<f64> {
+    let key = window_start_spot_redis_key(window_start_ts);
+    let raw: Option<f64> = conn.get(&key).await.unwrap_or(None);
+    raw.filter(|v| v.is_finite() && *v > 0.0)
+}
+
+async fn cache_window_start_spot(
+    conn: &mut redis::aio::Connection,
+    window_start_ts: i64,
+    spot: f64,
+) {
+    if !spot.is_finite() || spot <= 0.0 {
+        return;
+    }
+    let key = window_start_spot_redis_key(window_start_ts);
+    let ok: bool = conn.set_nx(&key, spot).await.unwrap_or(false);
+    if ok {
+        let _: () = conn.expire(&key, WINDOW_START_SPOT_TTL_SECS).await.unwrap_or_default();
+    }
+}
+
+/// Compute the next reconnect delay with exponential backoff (1s → 2s → 4s → ... → 30s cap).
+/// Resets to 1s on a successful connection that received at least one message.
+fn next_backoff_secs(current: u64) -> u64 {
+    (current * 2).min(30).max(1)
+}
+
 fn spawn_binance_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
     let ws_url = binance_ws_url();
     tokio::spawn(async move {
+        let mut backoff_secs = 1_u64;
         loop {
             match connect_async(ws_url.as_str()).await {
                 Ok((mut ws_stream, _)) => {
                     info!("Binance WS connected for BTC pricing via {}", ws_url);
+                    backoff_secs = 1;
                     while let Some(msg) = ws_stream.next().await {
                         match msg {
                             Ok(Message::Text(text)) => {
@@ -309,7 +465,8 @@ fn spawn_binance_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                 }
                 Err(e) => error!("Binance WS connection failed: {}", e),
             }
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = next_backoff_secs(backoff_secs);
         }
     });
 }
@@ -322,10 +479,12 @@ fn spawn_okx_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
             "args": [{"channel": "tickers", "instId": "BTC-USDT"}]
         })
         .to_string();
+        let mut backoff_secs = 1_u64;
         loop {
             match connect_async(ws_url.as_str()).await {
                 Ok((mut ws_stream, _)) => {
                     info!("OKX WS connected for BTC pricing via {}", ws_url);
+                    backoff_secs = 1;
                     if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.clone())).await {
                         error!("OKX subscribe failed: {}", e);
                     }
@@ -358,7 +517,8 @@ fn spawn_okx_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                 }
                 Err(e) => error!("OKX WS connection failed: {}", e),
             }
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = next_backoff_secs(backoff_secs);
         }
     });
 }
@@ -371,10 +531,12 @@ fn spawn_bybit_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
             "args": ["tickers.BTCUSDT"]
         })
         .to_string();
+        let mut backoff_secs = 1_u64;
         loop {
             match connect_async(ws_url.as_str()).await {
                 Ok((mut ws_stream, _)) => {
                     info!("Bybit WS connected for BTC pricing via {}", ws_url);
+                    backoff_secs = 1;
                     if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.clone())).await {
                         error!("Bybit subscribe failed: {}", e);
                     }
@@ -408,7 +570,8 @@ fn spawn_bybit_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                 }
                 Err(e) => error!("Bybit WS connection failed: {}", e),
             }
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = next_backoff_secs(backoff_secs);
         }
     });
 }
@@ -422,10 +585,12 @@ fn spawn_kraken_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
             "subscription": {"name": "ticker"}
         })
         .to_string();
+        let mut backoff_secs = 1_u64;
         loop {
             match connect_async(ws_url.as_str()).await {
                 Ok((mut ws_stream, _)) => {
                     info!("Kraken WS connected for BTC pricing via {}", ws_url);
+                    backoff_secs = 1;
                     if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.clone())).await {
                         error!("Kraken subscribe failed: {}", e);
                     }
@@ -469,7 +634,8 @@ fn spawn_kraken_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                 }
                 Err(e) => error!("Kraken WS connection failed: {}", e),
             }
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = next_backoff_secs(backoff_secs);
         }
     });
 }
@@ -483,10 +649,12 @@ fn spawn_bitfinex_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
             "symbol": "tBTCUSD"
         })
         .to_string();
+        let mut backoff_secs = 1_u64;
         loop {
             match connect_async(ws_url.as_str()).await {
                 Ok((mut ws_stream, _)) => {
                     info!("Bitfinex WS connected for BTC pricing via {}", ws_url);
+                    backoff_secs = 1;
                     let mut chan_id: Option<i64> = None;
                     if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.clone())).await {
                         error!("Bitfinex subscribe failed: {}", e);
@@ -563,7 +731,8 @@ fn spawn_bitfinex_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                 }
                 Err(e) => error!("Bitfinex WS connection failed: {}", e),
             }
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = next_backoff_secs(backoff_secs);
         }
     });
 }
@@ -572,24 +741,37 @@ fn parse_window_start_ts(slug: &str) -> Option<i64> {
     slug.split("-5m-").nth(1).and_then(|s| s.parse::<i64>().ok())
 }
 
-fn spot_at_window_start(history: &VecDeque<(i64, f64)>, window_start_ms: i64) -> Option<f64> {
+fn spot_near_window_start(
+    history: &VecDeque<(i64, f64)>,
+    window_start_ms: i64,
+    max_skew_ms: i64,
+) -> Option<(i64, f64)> {
     if history.is_empty() {
         return None;
     }
 
     // Prefer a reading at/before window start to avoid look-ahead bias.
-    if let Some((_, px)) = history
+    if let Some((ts, px)) = history
         .iter()
         .rev()
         .find(|(ts, px)| *ts <= window_start_ms && *px > 0.0)
     {
-        return Some(*px);
+        if window_start_ms - *ts <= max_skew_ms {
+            return Some((*ts, *px));
+        }
     }
 
+    // Accept the first tick *after* window start only if it's very close to the boundary.
     history
         .iter()
         .find(|(ts, px)| *ts >= window_start_ms && *px > 0.0)
-        .map(|(_, px)| *px)
+        .and_then(|(ts, px)| {
+            if *ts - window_start_ms <= max_skew_ms {
+                Some((*ts, *px))
+            } else {
+                None
+            }
+        })
 }
 
 fn estimate_annualized_vol(history: &VecDeque<(i64, f64)>) -> Option<f64> {
@@ -648,19 +830,21 @@ fn estimate_annualized_vol(history: &VecDeque<(i64, f64)>) -> Option<f64> {
 }
 
 fn calculate_fair_yes(spot: f64, strike: f64, time_to_expiry_years: f64, sigma: f64) -> f64 {
+    if !spot.is_finite() || !strike.is_finite() || spot <= 0.0 || strike <= 0.0 {
+        return 0.5;
+    }
     if time_to_expiry_years <= 0.0 {
         return if spot > strike { 1.0 } else { 0.0 };
     }
 
-    let r = 0.045;
     let denom = sigma * time_to_expiry_years.sqrt();
     if denom <= 0.0 {
         return 0.5;
     }
 
-    let d2 = ((spot / strike).ln() + (r - 0.5 * sigma.powi(2)) * time_to_expiry_years) / denom;
+    let d2 = ((spot / strike).ln() + (RISK_FREE_RATE - 0.5 * sigma.powi(2)) * time_to_expiry_years) / denom;
     match Normal::new(0.0, 1.0) {
-        Ok(normal) => (-r * time_to_expiry_years).exp() * normal.cdf(d2),
+        Ok(normal) => (-RISK_FREE_RATE * time_to_expiry_years).exp() * normal.cdf(d2),
         Err(_) => 0.5,
     }
 }
@@ -685,6 +869,7 @@ struct Position {
     condition_id: String,
     fair_yes: f64,
     sigma: f64,
+    slug: String,
 }
 
 fn expected_roi(prob: f64, price: f64) -> f64 {
@@ -702,6 +887,9 @@ fn kelly_fraction(prob: f64, price: f64) -> f64 {
 }
 
 fn resolve_position_return(side: Side, entry_price: f64, window_start_spot: f64, end_spot: f64) -> (bool, f64) {
+    if !entry_price.is_finite() || entry_price <= 0.0 || !end_spot.is_finite() || end_spot <= 0.0 {
+        return (false, -1.0);
+    }
     let up = end_spot > window_start_spot;
     let won = match side {
         Side::Up => up,
@@ -770,6 +958,14 @@ impl Btc5mLagStrategy {
             .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1.0)
             .unwrap_or(DEFAULT_MAX_POSITION_FRACTION)
     }
+
+    fn max_drawdown_pct() -> f64 {
+        std::env::var("BTC_5M_MAX_DRAWDOWN_PCT")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value <= 0.0 && *value >= -100.0)
+            .unwrap_or(DEFAULT_MAX_DRAWDOWN_PCT)
+    }
 }
 
 #[async_trait]
@@ -800,10 +996,12 @@ impl Strategy for Btc5mLagStrategy {
         let coinbase_subscriptions = coinbase_ticker_subscriptions(&coinbase_ws_url);
 
         tokio::spawn(async move {
+            let mut backoff_secs = 1_u64;
             loop {
                 match connect_async(coinbase_ws_url.as_str()).await {
                     Ok((mut ws_stream, _)) => {
                         info!("Coinbase WS connected for BTC pricing via {}", coinbase_ws_url);
+                        backoff_secs = 1;
                         let mut last_sequence: Option<u64> = None;
                         for subscribe_msg in &coinbase_subscriptions {
                             if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.to_string())).await {
@@ -870,7 +1068,8 @@ impl Strategy for Btc5mLagStrategy {
                     }
                     Err(e) => error!("Coinbase WS connection failed: {}", e),
                 }
-                sleep(Duration::from_secs(1)).await;
+                sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = next_backoff_secs(backoff_secs);
             }
         });
 
@@ -881,7 +1080,17 @@ impl Strategy for Btc5mLagStrategy {
         spawn_kraken_feed(cex_prices.clone());
         spawn_bitfinex_feed(cex_prices.clone());
 
-        let mut open_position: Option<Position> = None;
+        // Resume any open PAPER-mode position after restarts so reserved notional
+        // is released/settled and the UI can hydrate open positions correctly.
+        let mut open_position: Option<Position> = load_open_position(&mut conn, self.strategy_id()).await;
+        if let Some(pos) = open_position.as_ref() {
+            info!(
+                "BTC_5M restored open position {} (side={}, notional=${:.2})",
+                pos.execution_id,
+                side_label(pos.side),
+                pos.notional_usd
+            );
+        }
         let mut last_live_preview_ms = 0_i64;
 
         loop {
@@ -933,6 +1142,10 @@ impl Strategy for Btc5mLagStrategy {
 
             let mut interval = tokio::time::interval(Duration::from_millis(90));
             let mut book = BinaryBook::default();
+            // When resuming after a restart, spot feeds may take a moment to hydrate.
+            // If a position expires before we have a usable boundary price, wait briefly
+            // before force-settling to avoid leaving reserved notional stuck.
+            let mut settlement_wait_start_ms: Option<i64> = None;
 
             loop {
                 tokio::select! {
@@ -964,91 +1177,138 @@ impl Strategy for Btc5mLagStrategy {
                         let mode = read_trading_mode(&mut conn).await;
 
                         if now_ts >= expiry_ts {
-                            if let Some(pos) = open_position.take() {
-                                if mode == TradingMode::Live {
+                            if mode == TradingMode::Live {
+                                if let Some(pos) = open_position.take() {
                                     let _ = release_sim_notional_for_strategy(&mut conn, self.strategy_id(), pos.notional_usd).await;
-                                    publish_heartbeat(&mut conn, self.heartbeat_id()).await;
-                                    break;
                                 }
-
-                                let (spot, spot_ts_ms) = *self.latest_spot_price.read().await;
-                                let end_spot = if spot > 0.0 && now_ms - spot_ts_ms <= SPOT_STALE_MS {
-                                    spot
-                                } else {
-                                    // Fall back to the latest history point after expiry (best effort).
-                                    let history = self.spot_history.read().await;
-                                    history
-                                        .iter()
-                                        .rev()
-                                        .find(|(ts, px)| *ts >= pos.expiry_ts * 1000 && *px > 0.0)
-                                        .map(|(_, px)| *px)
-                                        .unwrap_or(spot)
-                                };
-
-                                if pos.window_start_spot > 0.0 && end_spot > 0.0 {
-                                    let (won, gross_return) = resolve_position_return(pos.side, pos.entry_price, pos.window_start_spot, end_spot);
-                                    let net_return = gross_return - cost_model.per_side_cost_rate();
-                                    let pnl = pos.notional_usd * net_return;
-                                    let new_bankroll = settle_sim_position_for_strategy(&mut conn, self.strategy_id(), pos.notional_usd, pnl).await;
-                                    let ts_ms = Utc::now().timestamp_millis();
-                                    let hold_ms = ts_ms - pos.entry_ts_ms;
-                                    let side_label = match pos.side { Side::Up => "UP", Side::Down => "DOWN" };
-                                    let execution_id = pos.execution_id.clone();
-
-                                    let pnl_msg = serde_json::json!({
-                                        "execution_id": execution_id.clone(),
-                                        "strategy": self.strategy_id(),
-                                        "variant": variant.as_str(),
-                                        "pnl": pnl,
-                                        "notional": pos.notional_usd,
-                                        "timestamp": ts_ms,
-                                        "bankroll": new_bankroll,
-                                        "mode": "PAPER",
-                                        "details": {
-                                            "action": "RESOLVE_WINDOW",
-                                            "side": side_label,
-                                            "won": won,
-                                            "entry_price": pos.entry_price,
-                                            "window_start_spot": pos.window_start_spot,
-                                            "end_spot": end_spot,
-                                            "window_start_ts": pos.window_start_ts,
-                                            "expiry_ts": pos.expiry_ts,
-                                            "fair_yes": pos.fair_yes,
-                                            "sigma_annualized": pos.sigma,
-                                            "hold_ms": hold_ms,
-                                            "gross_return": gross_return,
-                                            "net_return": net_return,
-                                            "roi": format!("{:.2}%", net_return * 100.0),
-                                            "per_side_cost_rate": cost_model.per_side_cost_rate(),
-                                            "token_id": pos.token_id,
-                                            "condition_id": pos.condition_id,
-                                            "slug": target_market.slug,
-                                        }
-                                    });
-                                    let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
-
-                                    let settle_msg = serde_json::json!({
-                                        "execution_id": execution_id,
-                                        "market": "BTC 5m Engine",
-                                        "side": if won { "WIN" } else { "LOSS" },
-                                        "price": pos.entry_price,
-                                        "size": pos.notional_usd,
-                                        "timestamp": ts_ms,
-                                        "mode": "PAPER",
-                                        "details": {
-                                            "strategy": self.strategy_id(),
-                                            "position_side": side_label,
-                                            "pnl": pnl,
-                                            "net_return": net_return,
-                                            "hold_ms": hold_ms,
-                                            "window_start_spot": pos.window_start_spot,
-                                            "end_spot": end_spot,
-                                            "slug": target_market.slug,
-                                        }
-                                    });
-                                    let _: () = conn.publish("arbitrage:execution", settle_msg.to_string()).await.unwrap_or_default();
-                                }
+                                clear_open_position(&mut conn, self.strategy_id()).await;
+                                publish_heartbeat(&mut conn, self.heartbeat_id()).await;
+                                break;
                             }
+
+                            let Some(pos) = open_position.as_ref() else {
+                                break;
+                            };
+
+                            if settlement_wait_start_ms.is_none() {
+                                settlement_wait_start_ms = Some(now_ms);
+                            }
+
+                            // Resolve against a price close to the 5m boundary to avoid drifting
+                            // the outcome if the strategy loop stalls.
+                            let expiry_ms = pos.expiry_ts * 1000;
+                            let (spot, spot_ts_ms) = *self.latest_spot_price.read().await;
+                            let history = self.spot_history.read().await;
+                            let boundary_spot = spot_near_window_start(&history, expiry_ms, WINDOW_START_SPOT_MAX_SKEW_MS)
+                                .map(|(_, px)| px);
+                            drop(history);
+
+                            let near_boundary = (now_ms - expiry_ms).abs() <= WINDOW_START_SPOT_MAX_SKEW_MS;
+                            let fresh_spot = spot > 0.0 && now_ms - spot_ts_ms <= SPOT_STALE_MS;
+                            let mut end_spot = boundary_spot
+                                .or_else(|| if near_boundary && fresh_spot { Some(spot) } else { None })
+                                .unwrap_or(0.0);
+
+                            if end_spot <= 0.0 {
+                                // Fall back to cross-exchange median (UI parity) if Coinbase is unavailable.
+                                let cex_snapshot = { cex_prices.read().await.clone() };
+                                let mut cex_values: Vec<f64> = Vec::new();
+                                for (_venue, (px, ts_ms)) in cex_snapshot.iter() {
+                                    if now_ms - *ts_ms <= SPOT_STALE_MS && *px > 0.0 {
+                                        cex_values.push(*px);
+                                    }
+                                }
+                                end_spot = median_price(cex_values).unwrap_or(0.0);
+                            }
+
+                            if end_spot <= 0.0 {
+                                let waited_ms = now_ms - settlement_wait_start_ms.unwrap_or(now_ms);
+                                if waited_ms < SETTLEMENT_SPOT_TIMEOUT_MS {
+                                    publish_heartbeat(&mut conn, self.heartbeat_id()).await;
+                                    continue;
+                                }
+                                warn!(
+                                    "BTC_5M settlement missing spot after {}ms; force-releasing reserved notional for {}",
+                                    waited_ms,
+                                    pos.execution_id
+                                );
+                                let _ = release_sim_notional_for_strategy(&mut conn, self.strategy_id(), pos.notional_usd).await;
+                                open_position = None;
+                                clear_open_position(&mut conn, self.strategy_id()).await;
+                                publish_heartbeat(&mut conn, self.heartbeat_id()).await;
+                                break;
+                            }
+
+                            // We have an end price, settle the position.
+                            let pos = match open_position.take() {
+                                Some(p) => p,
+                                None => break,
+                            };
+                            // Clear persisted position BEFORE settlement so a crash during
+                            // settle_sim_position cannot cause double-settlement on restart.
+                            clear_open_position(&mut conn, self.strategy_id()).await;
+
+                            let (won, gross_return) = resolve_position_return(pos.side, pos.entry_price, pos.window_start_spot, end_spot);
+                            let net_return = gross_return - cost_model.per_side_cost_rate();
+                            let pnl = pos.notional_usd * net_return;
+                            let new_bankroll = settle_sim_position_for_strategy(&mut conn, self.strategy_id(), pos.notional_usd, pnl).await;
+                            let ts_ms = Utc::now().timestamp_millis();
+                            let hold_ms = ts_ms - pos.entry_ts_ms;
+                            let side_label = match pos.side { Side::Up => "UP", Side::Down => "DOWN" };
+                            let execution_id = pos.execution_id.clone();
+
+                            let pnl_msg = serde_json::json!({
+                                "execution_id": execution_id.clone(),
+                                "strategy": self.strategy_id(),
+                                "variant": variant.as_str(),
+                                "pnl": pnl,
+                                "notional": pos.notional_usd,
+                                "timestamp": ts_ms,
+                                "bankroll": new_bankroll,
+                                "mode": "PAPER",
+                                "details": {
+                                    "action": "RESOLVE_WINDOW",
+                                    "side": side_label,
+                                    "won": won,
+                                    "entry_price": pos.entry_price,
+                                    "window_start_spot": pos.window_start_spot,
+                                    "end_spot": end_spot,
+                                    "window_start_ts": pos.window_start_ts,
+                                    "expiry_ts": pos.expiry_ts,
+                                    "fair_yes": pos.fair_yes,
+                                    "sigma_annualized": pos.sigma,
+                                    "hold_ms": hold_ms,
+                                    "gross_return": gross_return,
+                                    "net_return": net_return,
+                                    "roi": format!("{:.2}%", net_return * 100.0),
+                                    "per_side_cost_rate": cost_model.per_side_cost_rate(),
+                                    "token_id": pos.token_id,
+                                    "condition_id": pos.condition_id,
+                                    "slug": target_market.slug,
+                                }
+                            });
+                            let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+
+                            let settle_msg = serde_json::json!({
+                                "execution_id": execution_id,
+                                "market": "BTC 5m Engine",
+                                "side": if won { "WIN" } else { "LOSS" },
+                                "price": pos.entry_price,
+                                "size": pos.notional_usd,
+                                "timestamp": ts_ms,
+                                "mode": "PAPER",
+                                "details": {
+                                    "strategy": self.strategy_id(),
+                                    "position_side": side_label,
+                                    "pnl": pnl,
+                                    "net_return": net_return,
+                                    "hold_ms": hold_ms,
+                                    "window_start_spot": pos.window_start_spot,
+                                    "end_spot": end_spot,
+                                    "slug": target_market.slug,
+                                }
+                            });
+                            let _: () = conn.publish("arbitrage:execution", settle_msg.to_string()).await.unwrap_or_default();
                             break;
                         }
 
@@ -1056,11 +1316,15 @@ impl Strategy for Btc5mLagStrategy {
                             if let Some(pos) = open_position.take() {
                                 let _ = release_sim_notional_for_strategy(&mut conn, self.strategy_id(), pos.notional_usd).await;
                             }
+                            clear_open_position(&mut conn, self.strategy_id()).await;
                             publish_heartbeat(&mut conn, self.heartbeat_id()).await;
                             continue;
                         }
 
-                        if !book.yes.is_valid() || !book.no.is_valid() || now_ms - book.last_update_ms > BOOK_STALE_MS {
+                        if !book.yes.is_valid() || !book.no.is_valid()
+                            || now_ms - book.yes_update_ms > BOOK_STALE_MS
+                            || now_ms - book.no_update_ms > BOOK_STALE_MS
+                        {
                             publish_heartbeat(&mut conn, self.heartbeat_id()).await;
                             continue;
                         }
@@ -1070,6 +1334,7 @@ impl Strategy for Btc5mLagStrategy {
                             last_seen_reset_ts = reset_ts;
                             open_position = None;
                             last_live_preview_ms = 0;
+                            clear_open_position(&mut conn, self.strategy_id()).await;
                             publish_heartbeat(&mut conn, self.heartbeat_id()).await;
                             continue;
                         }
@@ -1080,6 +1345,20 @@ impl Strategy for Btc5mLagStrategy {
                             continue;
                         }
 
+                        // Use cross-exchange median for fair value — more robust than single-exchange.
+                        let cex_snapshot = { cex_prices.read().await.clone() };
+                        let mut cex_values: Vec<f64> = Vec::new();
+                        let mut cex_prices_json = serde_json::Map::new();
+                        for (venue, (px, ts_ms)) in cex_snapshot.iter() {
+                            if *px > 0.0 {
+                                cex_prices_json.insert((*venue).to_string(), serde_json::json!(*px));
+                            }
+                            if now_ms - *ts_ms <= SPOT_STALE_MS && *px > 0.0 {
+                                cex_values.push(*px);
+                            }
+                        }
+                        let cex_mid = median_price(cex_values).unwrap_or(spot);
+
                         let remaining_seconds = expiry_ts - now_ts;
                         if remaining_seconds <= ENTRY_EXPIRY_CUTOFF_SECS {
                             publish_heartbeat(&mut conn, self.heartbeat_id()).await;
@@ -1087,9 +1366,17 @@ impl Strategy for Btc5mLagStrategy {
                         }
 
                         let window_start_ms = window_start_ts * 1000;
-                        let window_start_spot = {
+                        let window_start_spot = if let Some(cached) = read_cached_window_start_spot(&mut conn, window_start_ts).await {
+                            cached
+                        } else {
                             let history = self.spot_history.read().await;
-                            spot_at_window_start(&history, window_start_ms).unwrap_or(spot)
+                            match spot_near_window_start(&history, window_start_ms, WINDOW_START_SPOT_MAX_SKEW_MS) {
+                                Some((_ts, px)) => {
+                                    cache_window_start_spot(&mut conn, window_start_ts, px).await;
+                                    px
+                                }
+                                None => 0.0,
+                            }
                         };
                         if window_start_spot <= 0.0 {
                             publish_heartbeat(&mut conn, self.heartbeat_id()).await;
@@ -1101,7 +1388,7 @@ impl Strategy for Btc5mLagStrategy {
                             let history = self.spot_history.read().await;
                             estimate_annualized_vol(&history).unwrap_or(0.65)
                         };
-                        let fair_yes = calculate_fair_yes(spot, window_start_spot, tte_years, sigma).clamp(0.0, 1.0);
+                        let fair_yes = calculate_fair_yes(cex_mid, window_start_spot, tte_years, sigma).clamp(0.0, 1.0);
                         let fair_no = (1.0 - fair_yes).clamp(0.0, 1.0);
 
                         let yes_mid = book.yes.mid();
@@ -1183,19 +1470,20 @@ impl Strategy for Btc5mLagStrategy {
                         };
                         let scan_score = direction_sign * best_net_expected.abs();
 
-                        // Snapshot cross-exchange prices for UI telemetry and matrix rendering.
-                        let cex_snapshot = { cex_prices.read().await.clone() };
-                        let mut cex_values: Vec<f64> = Vec::new();
-                        let mut cex_prices_json = serde_json::Map::new();
-                        for (venue, (px, ts_ms)) in cex_snapshot.iter() {
-                            if *px > 0.0 {
-                                cex_prices_json.insert((*venue).to_string(), serde_json::json!(*px));
-                            }
-                            if now_ms - *ts_ms <= SPOT_STALE_MS && *px > 0.0 {
-                                cex_values.push(*px);
-                            }
-                        }
-                        let cex_mid = median_price(cex_values).unwrap_or(spot);
+                        // Expose any open position in the scan telemetry so the UI can hydrate the POSITIONS rail
+                        // even if it missed the ENTRY execution log (e.g. page refresh mid-window).
+                        let open_position_meta = open_position.as_ref().map(|pos| {
+                            let side_label = match pos.side { Side::Up => "UP", Side::Down => "DOWN" };
+                            serde_json::json!({
+                                "execution_id": pos.execution_id,
+                                "side": side_label,
+                                "entry_price": pos.entry_price,
+                                "notional": pos.notional_usd,
+                                "entry_ts_ms": pos.entry_ts_ms,
+                                "window_start_ts": pos.window_start_ts,
+                                "expiry_ts": pos.expiry_ts,
+                            })
+                        });
 
                         let scan_msg = build_scan_payload(
                             &target_market.market_id,
@@ -1215,6 +1503,7 @@ impl Strategy for Btc5mLagStrategy {
                                 "spot": spot,
                                 "cex_mid": cex_mid,
                                 "cex_prices": Value::Object(cex_prices_json),
+                                "open_position": open_position_meta,
                                 "window_start_spot": window_start_spot,
                                 "fair_yes": fair_yes,
                                 "fair_no": fair_no,
@@ -1243,6 +1532,7 @@ impl Strategy for Btc5mLagStrategy {
                                 "slug": target_market.slug,
                                 "window_start_ts": window_start_ts,
                                 "expiry_ts": expiry_ts,
+                                "max_drawdown_pct": Self::max_drawdown_pct(),
                             }),
                         );
                         let _: () = conn.publish("arbitrage:scan", scan_msg.to_string()).await.unwrap_or_default();
@@ -1250,6 +1540,7 @@ impl Strategy for Btc5mLagStrategy {
                         if mode == TradingMode::Live {
                             if let Some(pos) = open_position.take() {
                                 let _ = release_sim_notional_for_strategy(&mut conn, self.strategy_id(), pos.notional_usd).await;
+                                clear_open_position(&mut conn, self.strategy_id()).await;
                             }
                             if passes_threshold && now_ms - last_live_preview_ms >= LIVE_PREVIEW_COOLDOWN_MS {
                                 let available_cash = read_sim_available_cash(&mut conn).await;
@@ -1322,7 +1613,7 @@ impl Strategy for Btc5mLagStrategy {
                             if size > 0.0 && reserve_sim_notional_for_strategy(&mut conn, self.strategy_id(), size).await {
                                 let side_label = match best_side { Side::Up => "UP", Side::Down => "DOWN" };
                                 let execution_id = Uuid::new_v4().to_string();
-                                open_position = Some(Position {
+                                let pos = Position {
                                     execution_id: execution_id.clone(),
                                     side: best_side,
                                     entry_price: best_price,
@@ -1335,7 +1626,10 @@ impl Strategy for Btc5mLagStrategy {
                                     condition_id: target_market.market_id.clone(),
                                     fair_yes,
                                     sigma,
-                                });
+                                    slug: target_market.slug.clone(),
+                                };
+                                persist_open_position(&mut conn, self.strategy_id(), &pos).await;
+                                open_position = Some(pos);
 
                                 let exec_msg = serde_json::json!({
                                     "execution_id": execution_id,
