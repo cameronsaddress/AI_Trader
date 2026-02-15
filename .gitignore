@@ -26,6 +26,11 @@ reports/
 # Local debug screenshots
 screenshot*.png
 
+# Claude
+.claude/
+CLAUDE.md
+.mcp.json
+
 # OS/editor
 .DS_Store
 .vscode/
