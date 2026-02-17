@@ -989,6 +989,19 @@ function asNumber(input: unknown): number | null {
     return Number.isFinite(parsed) ? parsed : null;
 }
 
+function normalizeTimestampMs(input: unknown): number {
+    const numeric = asNumber(input);
+    if (numeric !== null) {
+        return Math.trunc(numeric);
+    }
+    const raw = asString(input);
+    if (!raw) {
+        return Date.now();
+    }
+    const parsed = Date.parse(raw);
+    return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
 const SCAN_META_FEATURE_LIMIT = 32;
 const SCAN_META_FEATURE_MAX_DEPTH = 2;
 
@@ -4671,7 +4684,7 @@ redisSubscriber.subscribe('ml:features', (message) => {
                 sma_20: parsed.sma_20 ?? null,
                 price: parsed.price ?? null,
                 returns: parsed.returns ?? null,
-                timestamp: parsed.timestamp ?? Date.now(),
+                timestamp: normalizeTimestampMs(parsed.timestamp),
             }), { EX: 120 }); // expire after 2 min if ML service stops
         }
     } catch { /* ignore */ }
