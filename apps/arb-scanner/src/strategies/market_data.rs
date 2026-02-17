@@ -147,7 +147,7 @@ pub fn update_books_from_market_ws(
 
             let book = books
                 .entry(binding.market_key.clone())
-                .or_insert_with(BinaryBook::default);
+                .or_default();
             update_quote_for_binding(
                 book,
                 binding,
@@ -171,7 +171,7 @@ pub fn update_books_from_market_ws(
             let best_ask = change.get("best_ask").and_then(parse_f64).unwrap_or(0.0);
             let book = books
                 .entry(binding.market_key.clone())
-                .or_insert_with(BinaryBook::default);
+                .or_default();
             update_quote_for_binding(book, binding, best_bid, best_ask);
             let sides = updated_markets.entry(binding.market_key.clone()).or_insert((false, false));
             if binding.is_yes { sides.0 = true; } else { sides.1 = true; }

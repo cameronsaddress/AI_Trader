@@ -4,19 +4,28 @@ export interface AuthRequest extends Request {
     user?: any;
 }
 
-function parseToken(raw: string | undefined): string | null {
-    if (!raw) {
+export function extractBearerToken(raw: unknown): string | null {
+    if (typeof raw !== 'string') {
         return null;
     }
+
     const trimmed = raw.trim();
     if (!trimmed) {
         return null;
     }
+
     if (trimmed.toLowerCase().startsWith('bearer ')) {
         const token = trimmed.slice(7).trim();
         return token.length > 0 ? token : null;
     }
     return trimmed;
+}
+
+export function validateControlPlaneToken(token: string | null, expected: string): boolean {
+    if (!expected || expected.length === 0) {
+        return false;
+    }
+    return token === expected;
 }
 
 export const authenticate = (req: AuthRequest, res: Response, next: NextFunction) => {
@@ -26,11 +35,11 @@ export const authenticate = (req: AuthRequest, res: Response, next: NextFunction
         return;
     }
 
-    const authHeader = parseToken(req.header('Authorization'));
-    const directHeader = parseToken(req.header('x-control-plane-token'));
+    const authHeader = extractBearerToken(req.header('Authorization'));
+    const directHeader = extractBearerToken(req.header('x-control-plane-token'));
     const token = authHeader || directHeader;
 
-    if (token !== expected) {
+    if (!validateControlPlaneToken(token, expected)) {
         res.status(401).json({ error: 'Unauthorized' });
         return;
     }

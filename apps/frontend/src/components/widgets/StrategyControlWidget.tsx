@@ -114,6 +114,24 @@ const STRATEGIES: Strategy[] = [
         color: 'text-lime-300',
         status: 'active',
         stats: { pnl: '$0.00', daily_trades: 0 }
+    },
+    {
+        id: 'AS_MARKET_MAKER',
+        name: 'A-S Market Maker',
+        description: 'Avellaneda-Stoikov optimal market making with dynamic reservation price and spread. Captures bid-ask spread across binary option markets.',
+        icon: <Activity size={18} />,
+        color: 'text-cyan-300',
+        status: 'active',
+        stats: { pnl: '$0.00', daily_trades: 0 }
+    },
+    {
+        id: 'LONGSHOT_BIAS',
+        name: 'Longshot Bias Fade',
+        description: 'Exploits systematic longshot bias mispricing in prediction markets. Fades overpriced extreme contracts for statistical edge.',
+        icon: <BarChart2 size={18} />,
+        color: 'text-purple-300',
+        status: 'active',
+        stats: { pnl: '$0.00', daily_trades: 0 }
     }
 ];
 
@@ -211,14 +229,12 @@ export const StrategyControlWidget: React.FC = () => {
 
     const toggleStrategy = (e: React.MouseEvent, id: string) => {
         e.stopPropagation();
-        setStrategies(prev => prev.map((s) => {
-            if (s.id !== id) return s;
-            const active = s.status !== 'active';
-            if (socket) {
-                socket.emit('toggle_strategy', { id, active, timestamp: Date.now() });
-            }
-            return { ...s, status: active ? 'active' : 'paused' };
-        }));
+        const currentStatus = strategies.find(s => s.id === id)?.status;
+        const active = currentStatus !== 'active';
+        if (socket) {
+            socket.emit('toggle_strategy', { id, active, timestamp: Date.now() });
+            // Don't update local state — wait for strategy_status_update event from backend
+        }
     };
 
     const updateRiskConfig = (model: 'FIXED' | 'PERCENT', value: number) => {

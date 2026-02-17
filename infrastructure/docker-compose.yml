@@ -28,9 +28,23 @@ services:
       - INTELLIGENCE_GATE_ENABLED=${INTELLIGENCE_GATE_ENABLED:-true}
       - INTELLIGENCE_GATE_MAX_STALENESS_MS=${INTELLIGENCE_GATE_MAX_STALENESS_MS:-3000}
       - INTELLIGENCE_GATE_MIN_MARGIN=${INTELLIGENCE_GATE_MIN_MARGIN:-0}
-      - DEFAULT_DISABLED_STRATEGIES=SOL_15M,SYNDICATE,ETH_15M
+      - DEFAULT_DISABLED_STRATEGIES=
       - STRATEGY_WEIGHT_CAP=2.0
       - STRATEGY_ALLOCATOR_EMA_ALPHA=0.05
+      - RISK_GUARD_STRATEGIES=BTC_5M,BTC_15M,ETH_15M,SOL_15M,CEX_SNIPER,OBI_SCALPER,SYNDICATE,ATOMIC_ARB,GRAPH_ARB,CONVERGENCE_CARRY,MAKER_MM,AS_MARKET_MAKER,LONGSHOT_BIAS
+      - VAULT_ENABLED=true
+      - VAULT_BANKROLL_CEILING=1100
+      - RISK_GUARD_TRAILING_STOP=100
+      - RISK_GUARD_DAILY_TARGET=300
+      - RISK_GUARD_DAY_RESET_HOUR_UTC=8
+      - RISK_GUARD_CONSEC_LOSS_LIMIT=4
+      - RISK_GUARD_CONSEC_LOSS_COOLDOWN_MS=1800000
+      - RISK_GUARD_POST_LOSS_COOLDOWN_MS=300000
+      - RISK_GUARD_ANTI_MARTINGALE_AFTER=2
+      - RISK_GUARD_ANTI_MARTINGALE_FACTOR=0.5
+      - RISK_GUARD_DIRECTION_LIMIT=3
+      - RISK_GUARD_PROFIT_TAPER_START=200
+      - RISK_GUARD_PROFIT_TAPER_FLOOR=0.5
     env_file:
       - ../apps/backend/.env
     depends_on:
@@ -40,6 +54,18 @@ services:
       - ../apps/backend:/app/apps/backend
       - ../packages:/app/packages
     command: npm run dev --workspace=@ai-trader/backend
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -T 4 -t 1 -O- http://localhost:5114/health >/dev/null && touch /tmp/backend_healthy_once && rm -f /tmp/backend_hc_failures && exit 0; if [ -f /tmp/backend_healthy_once ]; then n=$$(cat /tmp/backend_hc_failures 2>/dev/null || echo 0); n=$$((n+1)); echo \"$$n\" >/tmp/backend_hc_failures; [ \"$$n\" -ge 3 ] && kill -s TERM 1; fi; exit 1",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    mem_limit: 1g
 
   frontend:
     build:
@@ -54,6 +80,12 @@ services:
       - ../apps/frontend:/app/apps/frontend
       - ../packages:/app/packages
     command: npm run dev --workspace=@ai-trader/frontend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3112 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
 
   postgres:
     image: postgres:16-alpine
@@ -65,13 +97,27 @@ services:
       - "5544:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7-alpine
+    command: redis-server --appendonly yes --appendfsync everysec --save 900 1 --save 300 10
     ports:
       - "6491:6379"
     volumes:
       - redis_data:/data
+    restart: unless-stopped
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   ml-service:
     build:
@@ -86,8 +132,32 @@ services:
     volumes:
       - ../apps/ml-service:/app
     command: uvicorn src.main:app --host 0.0.0.0 --port 8112 --reload
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8112/health')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    mem_limit: 512m
 
-  # --- Swarm Strategy Containers ---
+  # ── Shared Rust builder ────────────────────────────────────────────
+  # Compiles the arb-scanner binary ONCE. All 13 strategy containers
+  # share the build artifacts via the arb_target named volume.
+  arb-builder:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - arb_target:/usr/src/app/target
+    command: cargo build
+    mem_limit: 4g
+    # No restart — runs once, exits 0, scanners start
+
+  # ── Swarm Strategy Containers ──────────────────────────────────────
+  # Each scanner runs the pre-built binary directly (no recompilation).
+  # STRATEGY_TYPE env var selects which strategy logic to execute.
 
   arb-scanner-btc:
     build:
@@ -106,11 +176,16 @@ services:
     dns:
       - 8.8.8.8
     depends_on:
-      - redis
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     volumes:
       - ../apps/arb-scanner:/usr/src/app
-      - /usr/src/app/target
-    command: cargo run
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
 
   arb-scanner-btc-5m:
     build:
@@ -127,14 +202,34 @@ services:
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
       - BTC_5M_MIN_EXPECTED_NET_RETURN=0.003
+      - BTC_5M_NOTIONAL_CAP=35
+      - BTC_5M_FAIR_PRICE_EXTRA_BPS=100
+      - BTC_5M_FAIR_PRICE_BAND=0.03
+      - BTC_5M_MOMENTUM_FILTER_ENABLED=true
+      - BTC_5M_MOMENTUM_RSI_HIGH=72
+      - BTC_5M_MOMENTUM_RSI_LOW=28
+      - BTC_5M_MOMENTUM_PENALTY_BPS=80
+      - BTC_5M_REGIME_FILTER_ENABLED=true
+      - BTC_5M_REGIME_CHOP_PENALTY_BPS=50
+      - BTC_5M_SPREAD_QUALITY_PENALTY_BPS=60
+      - BTC_5M_COINFLIP_BLOCK_BAND=0.03
+      - BTC_5M_KELLY_SCALE_FLOOR=0.20
+      - BTC_5M_EDGE_SCALE_TARGET_RATIO=1.25
+      - BTC_5M_EDGE_SCALE_FLOOR=0.40
+      - BTC_5M_FEE_CURVE_BASE_RATE=0.02
     dns:
       - 8.8.8.8
     depends_on:
-      - redis
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     volumes:
       - ../apps/arb-scanner:/usr/src/app
-      - /usr/src/app/target
-    command: cargo run
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
 
   arb-scanner-eth:
     build:
@@ -151,11 +246,16 @@ services:
     dns:
       - 8.8.8.8
     depends_on:
-      - redis
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     volumes:
       - ../apps/arb-scanner:/usr/src/app
-      - /usr/src/app/target
-    command: cargo run
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
 
   arb-scanner-sol:
     build:
@@ -172,11 +272,16 @@ services:
     dns:
       - 8.8.8.8
     depends_on:
-      - redis
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     volumes:
       - ../apps/arb-scanner:/usr/src/app
-      - /usr/src/app/target
-    command: cargo run
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
 
   arb-scanner-cex:
     build:
@@ -193,11 +298,16 @@ services:
     dns:
       - 8.8.8.8
     depends_on:
-      - redis
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     volumes:
       - ../apps/arb-scanner:/usr/src/app
-      - /usr/src/app/target
-    command: cargo run
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
 
   arb-scanner-copy:
     build:
@@ -214,11 +324,16 @@ services:
     dns:
       - 8.8.8.8
     depends_on:
-      - redis
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     volumes:
       - ../apps/arb-scanner:/usr/src/app
-      - /usr/src/app/target
-    command: cargo run
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
 
   arb-scanner-atomic:
     build:
@@ -232,14 +347,23 @@ services:
       - STRATEGY_VARIANT=baseline
       - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - SIM_FEE_BPS_PER_SIDE=0
+      - SIM_SLIPPAGE_BPS_PER_SIDE=2
+      - ATOMIC_ARB_MIN_NET_EDGE=0.0010
+      - ATOMIC_ARB_MIN_BUFFER_FLOOR=0.0020
     dns:
       - 8.8.8.8
     depends_on:
-      - redis
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     volumes:
       - ../apps/arb-scanner:/usr/src/app
-      - /usr/src/app/target
-    command: cargo run
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
 
   arb-scanner-obi:
     build:
@@ -256,11 +380,16 @@ services:
     dns:
       - 8.8.8.8
     depends_on:
-      - redis
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     volumes:
       - ../apps/arb-scanner:/usr/src/app
-      - /usr/src/app/target
-    command: cargo run
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
 
   arb-scanner-graph:
     build:
@@ -274,14 +403,24 @@ services:
       - STRATEGY_VARIANT=baseline
       - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - SIM_FEE_BPS_PER_SIDE=0
+      - SIM_SLIPPAGE_BPS_PER_SIDE=2
+      - GRAPH_ARB_MIN_NET_EDGE=0.0015
+      - GRAPH_ARB_MIN_BUFFER_FLOOR=0.0010
+      - GRAPH_ARB_HORIZON_PENALTY_COEFF=0.0005
     dns:
       - 8.8.8.8
     depends_on:
-      - redis
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     volumes:
       - ../apps/arb-scanner:/usr/src/app
-      - /usr/src/app/target
-    command: cargo run
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
 
   arb-scanner-convergence:
     build:
@@ -295,14 +434,23 @@ services:
       - STRATEGY_VARIANT=baseline
       - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - SIM_FEE_BPS_PER_SIDE=0
+      - SIM_SLIPPAGE_BPS_PER_SIDE=2
+      - CONVERGENCE_CARRY_MIN_PARITY_EDGE=0.008
+      - CONVERGENCE_CARRY_EXIT_PARITY_EDGE=0.002
     dns:
       - 8.8.8.8
     depends_on:
-      - redis
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     volumes:
       - ../apps/arb-scanner:/usr/src/app
-      - /usr/src/app/target
-    command: cargo run
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
 
   arb-scanner-maker:
     build:
@@ -316,15 +464,88 @@ services:
       - STRATEGY_VARIANT=baseline
       - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - SIM_FEE_BPS_PER_SIDE=0
+      - SIM_SLIPPAGE_BPS_PER_SIDE=2
+      - MAKER_MM_MIN_EXPECTED_NET_RETURN=0.001
     dns:
       - 8.8.8.8
     depends_on:
-      - redis
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     volumes:
       - ../apps/arb-scanner:/usr/src/app
-      - /usr/src/app/target
-    command: cargo run
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
+
+  arb-scanner-as-mm:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=AS_MARKET_MAKER
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - SIM_FEE_BPS_PER_SIDE=0
+      - SIM_SLIPPAGE_BPS_PER_SIDE=2
+      - AS_MM_GAMMA=0.3
+      - AS_MM_KAPPA=1.5
+      - AS_MM_MIN_HALF_SPREAD=0.015
+      - AS_MM_MIN_EDGE_BPS=15
+      - AS_MM_FEE_CURVE_BASE_RATE=0.02
+    dns:
+      - 8.8.8.8
+    depends_on:
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
+
+  arb-scanner-longshot:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=LONGSHOT_BIAS
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - SIM_FEE_BPS_PER_SIDE=0
+      - SIM_SLIPPAGE_BPS_PER_SIDE=2
+      - LONGSHOT_PRICE_CEILING=0.15
+      - LONGSHOT_MIN_NET_EDGE=0.04
+      - LONGSHOT_FEE_CURVE_BASE_RATE=0.02
+    dns:
+      - 8.8.8.8
+    depends_on:
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
 
 volumes:
   postgres_data:
   redis_data:
+  arb_target:

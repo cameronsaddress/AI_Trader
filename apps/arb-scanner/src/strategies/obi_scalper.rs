@@ -19,6 +19,7 @@ use crate::strategies::control::{
     is_strategy_enabled,
     publish_heartbeat,
     read_risk_config,
+    read_risk_guard_cooldown,
     read_sim_available_cash,
     read_simulation_reset_ts,
     strategy_variant,
@@ -30,6 +31,7 @@ use crate::strategies::control::{
 };
 use crate::strategies::market_data::{update_book_from_market_ws, BinaryBook};
 use crate::strategies::simulation::{realized_pnl, SimCostModel};
+use crate::strategies::vol_regime::{detect_regime, regime_exit_multipliers};
 use crate::strategies::Strategy;
 
 const COINBASE_ADVANCED_WS_URL: &str = "wss://advanced-trade-ws.coinbase.com";
@@ -206,6 +208,35 @@ fn rolling_std(values: &std::collections::VecDeque<f64>) -> f64 {
     var.max(0.0).sqrt()
 }
 
+/// Compute composite OBI from multiple venue snapshots.
+/// Each venue has weight proportional to its reliability and depth.
+/// Currently only Coinbase is wired in; Binance/OKX feeds will pass Some(obi)
+/// once their WebSocket connections are integrated.
+fn composite_obi(
+    coinbase_obi: f64,
+    binance_obi: Option<f64>,
+    okx_obi: Option<f64>,
+) -> f64 {
+    let mut total_weight = 0.40;
+    let mut weighted_sum = 0.40 * coinbase_obi;
+
+    if let Some(b_obi) = binance_obi {
+        if b_obi.is_finite() {
+            total_weight += 0.35;
+            weighted_sum += 0.35 * b_obi;
+        }
+    }
+
+    if let Some(o_obi) = okx_obi {
+        if o_obi.is_finite() {
+            total_weight += 0.25;
+            weighted_sum += 0.25 * o_obi;
+        }
+    }
+
+    if total_weight > 0.0 { weighted_sum / total_weight } else { coinbase_obi }
+}
+
 fn apply_coinbase_book_message(
     book: &mut LocalOrderBook,
     payload: &str,
@@ -326,7 +357,7 @@ impl Strategy for ObiScalperStrategy {
     async fn run(&self, redis_client: redis::Client) {
         info!("Starting OBI Scalper [Coinbase level2 order book]");
 
-        let mut conn = match redis_client.get_async_connection().await {
+        let mut conn = match redis_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
             Err(e) => {
                 error!("Redis Connect Fail: {}", e);
@@ -487,6 +518,13 @@ impl Strategy for ObiScalperStrategy {
                         }
 
                         let now_ms = Utc::now().timestamp_millis();
+
+                        // Risk guard cooldown — skip entry if backend set a post-loss cooldown.
+                        let cooldown_until = read_risk_guard_cooldown(&mut conn, "OBI_SCALPER").await;
+                        if cooldown_until > 0 && now_ms < cooldown_until {
+                            publish_heartbeat(&mut conn, "obi_scalper").await;
+                            continue;
+                        }
                         let remaining_ms = market_expiry.saturating_mul(1000) - now_ms;
                         if remaining_ms <= 0 {
                             break;
@@ -494,8 +532,12 @@ impl Strategy for ObiScalperStrategy {
 
                         let (obi, book_last_update_ms, best_bid, best_ask, mid) = {
                             let b = self.book.read().await;
+                            let coinbase_obi = b.calculate_obi(OBI_DEPTH_LEVELS);
+                            // Multi-venue composite OBI: currently Coinbase-only.
+                            // Pass Some(obi) for binance/okx once their feeds are wired.
+                            let obi = composite_obi(coinbase_obi, None, None);
                             (
-                                b.calculate_obi(OBI_DEPTH_LEVELS),
+                                obi,
                                 b.last_update_ms,
                                 b.best_bid(),
                                 b.best_ask(),
@@ -740,15 +782,29 @@ impl Strategy for ObiScalperStrategy {
                                     PositionSide::Short => (pos.entry_mid - mark_price) / pos.entry_mid,
                                 };
                                 let hold_ms = now_ms - pos.timestamp_ms;
-                                let close_reason = if gross_return >= TAKE_PROFIT_PCT {
+
+                                // Adaptive exit via vol-regime detection
+                                let price_history_slice: Vec<(i64, f64)> = vec![
+                                    (pos.timestamp_ms, pos.entry_mid),
+                                    (now_ms, mark_price),
+                                ];
+                                let (tp_mult, sl_mult) = if let Some(regime) = detect_regime(&price_history_slice) {
+                                    regime_exit_multipliers(&regime)
+                                } else {
+                                    (1.0, 1.0)
+                                };
+                                let adjusted_tp = TAKE_PROFIT_PCT * tp_mult;
+                                let adjusted_sl = STOP_LOSS_PCT * sl_mult;
+
+                                let signal_decay = (matches!(pos.side, PositionSide::Long) && obi < 0.05)
+                                    || (matches!(pos.side, PositionSide::Short) && obi > -0.05);
+                                let close_reason = if gross_return >= adjusted_tp {
                                     Some("TAKE_PROFIT")
-                                } else if gross_return <= STOP_LOSS_PCT {
+                                } else if gross_return <= adjusted_sl {
                                     Some("STOP_LOSS")
                                 } else if hold_ms >= MAX_HOLD_MS {
                                     Some("TIME_EXIT")
-                                } else if matches!(pos.side, PositionSide::Long) && obi < 0.05 {
-                                    Some("SIGNAL_DECAY")
-                                } else if matches!(pos.side, PositionSide::Short) && obi > -0.05 {
+                                } else if signal_decay {
                                     Some("SIGNAL_DECAY")
                                 } else {
                                     None
@@ -756,8 +812,7 @@ impl Strategy for ObiScalperStrategy {
 
                                 if let Some(reason) = close_reason {
                                     let capped_gross_return = gross_return
-                                        .max(-MAX_ABS_SETTLEMENT_RETURN)
-                                        .min(MAX_ABS_SETTLEMENT_RETURN);
+                                        .clamp(-MAX_ABS_SETTLEMENT_RETURN, MAX_ABS_SETTLEMENT_RETURN);
                                     let return_capped = (capped_gross_return - gross_return).abs() > f64::EPSILON;
                                     let pnl = realized_pnl(pos.size, capped_gross_return, cost_model);
                                     let new_bankroll = settle_sim_position_for_strategy(&mut conn, "OBI_SCALPER", pos.size, pnl).await;
@@ -814,8 +869,13 @@ impl Strategy for ObiScalperStrategy {
                             }
                         }
 
-                        if open_position.is_none()
-                            && passes_threshold
+                        // Skip if already positioned in this market
+                        if open_position.is_some() {
+                            publish_heartbeat(&mut conn, "obi_scalper").await;
+                            continue;
+                        }
+
+                        if passes_threshold
                             && pass_streak >= MIN_OBI_PASS_STREAK
                             && now_ms - last_signal_ms >= SIGNAL_COOLDOWN_MS
                             && spread_bps <= MAX_ENTRY_SPREAD_BPS

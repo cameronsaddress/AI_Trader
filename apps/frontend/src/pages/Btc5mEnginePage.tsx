@@ -3,6 +3,18 @@ import { useNavigate } from 'react-router-dom';
 import { useSocket } from '../context/SocketContext';
 import { ExecutionLayout } from '../components/layout/ExecutionLayout';
 import { apiUrl } from '../lib/api';
+import type {
+  TradingModeEvent,
+  StrategyMetricsEvent,
+  ExecutionLogEvent,
+  StrategyPnlEvent,
+  ScannerUpdateEvent,
+  RiskConfigEvent,
+  StrategyRiskMultiplierEvent,
+  StrategyRiskMultiplierSnapshot,
+  StrategyStatusEvent,
+  VaultUpdateEvent,
+} from '../types/socket-events';
 
 type TradingMode = 'PAPER' | 'LIVE';
 
@@ -282,6 +294,8 @@ export const Btc5mEnginePage: React.FC = () => {
   const countdown = windowEnd - nowSec;
   const windowLabel = useMemo(() => formatEtWindow(windowStart, windowEnd), [windowStart, windowEnd]);
 
+  const [lastScannerUpdate, setLastScannerUpdate] = useState(Date.now());
+
   const [traceExecutionId, setTraceExecutionId] = useState<string | null>(null);
   const [executionTrace, setExecutionTrace] = useState<ExecutionTrace | null>(null);
   const [executionTraceError, setExecutionTraceError] = useState<string | null>(null);
@@ -295,6 +309,7 @@ export const Btc5mEnginePage: React.FC = () => {
     multiplier: number; sample_count: number; ema_return: number;
   } | null>(null);
   const [strategyStatuses, setStrategyStatuses] = useState<Record<string, boolean>>({});
+  const [vaultBalance, setVaultBalance] = useState(0);
 
   const closeTrace = React.useCallback(() => {
     setTraceExecutionId(null);
@@ -328,7 +343,7 @@ export const Btc5mEnginePage: React.FC = () => {
   useEffect(() => {
     if (!socket) return;
 
-    const handleTradingMode = (payload: { mode?: TradingMode; live_order_posting_enabled?: boolean }) => {
+    const handleTradingMode = (payload: TradingModeEvent) => {
       if (payload?.mode === 'PAPER' || payload?.mode === 'LIVE') {
         setMode(payload.mode);
       }
@@ -337,12 +352,12 @@ export const Btc5mEnginePage: React.FC = () => {
       }
     };
 
-    const handleStrategyMetrics = (payload: unknown) => {
+    const handleStrategyMetrics = (payload: StrategyMetricsEvent) => {
       if (!payload || typeof payload !== 'object') return;
       setStrategyMetrics(payload as StrategyMetrics);
     };
 
-    const handleExecutionLog = (payload: unknown) => {
+    const handleExecutionLog = (payload: ExecutionLogEvent) => {
       if (!payload || typeof payload !== 'object') return;
       const log = payload as ExecutionLog;
 
@@ -399,7 +414,7 @@ export const Btc5mEnginePage: React.FC = () => {
       }
     };
 
-    const handleStrategyPnl = (payload: unknown) => {
+    const handleStrategyPnl = (payload: StrategyPnlEvent) => {
       if (!payload || typeof payload !== 'object') return;
       const parsed = payload as StrategyPnlPayload;
       if (parsed?.strategy !== STRATEGY_ID) return;
@@ -442,12 +457,13 @@ export const Btc5mEnginePage: React.FC = () => {
       });
     };
 
-    const handleScannerUpdate = (payload: unknown) => {
+    const handleScannerUpdate = (payload: ScannerUpdateEvent) => {
       if (!payload || typeof payload !== 'object') return;
-      const scan = payload as any;
+      const scan = payload as ScannerUpdateEvent;
       if (scan?.strategy !== STRATEGY_ID) return;
 
       const ts = typeof scan.timestamp === 'number' ? scan.timestamp : Date.now();
+      setLastScannerUpdate(Date.now());
       setLatestScanPasses(Boolean(scan?.passes_threshold));
 
       const meta = scan?.meta ?? {};
@@ -549,11 +565,11 @@ export const Btc5mEnginePage: React.FC = () => {
     };
 
     // Engine Tuning panel listeners
-    const handleRiskConfig = (cfg: { model?: string; value?: number }) => {
+    const handleRiskConfig = (cfg: RiskConfigEvent) => {
       if (cfg?.model === 'FIXED' || cfg?.model === 'PERCENT') setRiskModel(cfg.model);
       if (typeof cfg?.value === 'number') setRiskValue(cfg.value);
     };
-    const handleMultiplierUpdate = (payload: { strategy?: string; multiplier?: number; sample_count?: number; ema_return?: number }) => {
+    const handleMultiplierUpdate = (payload: StrategyRiskMultiplierEvent) => {
       if (payload?.strategy === STRATEGY_ID) {
         setStrategyMultiplierInfo({
           multiplier: payload.multiplier ?? 1,
@@ -562,7 +578,7 @@ export const Btc5mEnginePage: React.FC = () => {
         });
       }
     };
-    const handleMultiplierSnapshot = (snapshot: Record<string, { multiplier?: number; sample_count?: number; ema_return?: number }>) => {
+    const handleMultiplierSnapshot = (snapshot: StrategyRiskMultiplierSnapshot) => {
       const entry = snapshot?.[STRATEGY_ID];
       if (entry) {
         setStrategyMultiplierInfo({
@@ -572,7 +588,7 @@ export const Btc5mEnginePage: React.FC = () => {
         });
       }
     };
-    const handleStrategyStatus = (statusMap: Record<string, boolean>) => {
+    const handleStrategyStatus = (statusMap: StrategyStatusEvent) => {
       setStrategyStatuses(statusMap);
     };
 
@@ -585,8 +601,19 @@ export const Btc5mEnginePage: React.FC = () => {
     socket.on('strategy_risk_multiplier_update', handleMultiplierUpdate);
     socket.on('strategy_risk_multiplier_snapshot', handleMultiplierSnapshot);
     socket.on('strategy_status_update', handleStrategyStatus);
-    socket.emit('request_trading_mode');
-    socket.emit('request_risk_config');
+    const handleVault = (data: VaultUpdateEvent) => {
+      if (typeof data?.vault === 'number') setVaultBalance(data.vault);
+    };
+    socket.on('vault_update', handleVault);
+
+    const requestAllState = () => {
+      socket.emit('request_trading_mode');
+      socket.emit('request_risk_config');
+      socket.emit('request_vault');
+      socket.emit('request_strategy_metrics');
+    };
+    socket.on('connect', requestAllState);
+    requestAllState();
 
     return () => {
       socket.off('trading_mode_update', handleTradingMode);
@@ -598,6 +625,8 @@ export const Btc5mEnginePage: React.FC = () => {
       socket.off('strategy_risk_multiplier_update', handleMultiplierUpdate);
       socket.off('strategy_risk_multiplier_snapshot', handleMultiplierSnapshot);
       socket.off('strategy_status_update', handleStrategyStatus);
+      socket.off('vault_update', handleVault);
+      socket.off('connect', requestAllState);
     };
   }, [socket]);
 
@@ -615,6 +644,12 @@ export const Btc5mEnginePage: React.FC = () => {
         }
         if (typeof json?.live_order_posting_enabled === 'boolean') {
           setLiveOrderPostingEnabled(json.live_order_posting_enabled);
+        }
+        const strategyUpdatedAt = parseNumber(json?.strategy_quality?.[STRATEGY_ID]?.updated_at);
+        const scannerHeartbeat = parseNumber(json?.scanner_last_heartbeat_ms);
+        const fallbackTs = strategyUpdatedAt ?? scannerHeartbeat;
+        if (fallbackTs !== null && fallbackTs > 0) {
+          setLastScannerUpdate((prev) => Math.max(prev, fallbackTs));
         }
       } catch {
         // ignore
@@ -840,10 +875,17 @@ export const Btc5mEnginePage: React.FC = () => {
           winRate={winRate}
           trades={trades}
           openNotional={openNotional}
+          vault={vaultBalance}
           countdown={formatCountdown(countdown)}
           windowLabel={windowLabel}
           onExit={() => navigate('/polymarket')}
         />
+
+        {nowMs - lastScannerUpdate > 60000 && (
+          <div className="bg-red-900/50 text-red-300 px-3 py-1 text-sm rounded mx-3 mt-1">
+            SCANNER OFFLINE — No updates for {Math.round((nowMs - lastScannerUpdate) / 1000)}s
+          </div>
+        )}
 
         <EngineTuningPanel
           open={tuningOpen}
@@ -1027,6 +1069,7 @@ function TopBar(props: {
   winRate: number;
   trades: number;
   openNotional: number;
+  vault: number;
   countdown: string;
   windowLabel: string;
   onExit?: () => void;
@@ -1035,6 +1078,7 @@ function TopBar(props: {
     { label: 'BTC', value: props.btcPrice, className: 'text-gray-100' },
     { label: 'PNL', value: formatUsdSigned0Spaces(props.pnl), className: props.pnl >= 0 ? 'text-emerald-300' : 'text-rose-300' },
     { label: 'TODAY', value: formatUsdSigned0Spaces(props.today), className: props.today >= 0 ? 'text-emerald-300' : 'text-rose-300' },
+    { label: 'VAULT', value: `$${props.vault.toFixed(0)}`, className: props.vault > 0 ? 'text-amber-300' : 'text-gray-500' },
     { label: 'WIN', value: `${(props.winRate * 100).toFixed(1)}%`, className: props.winRate >= 0.55 ? 'text-emerald-300' : 'text-gray-200' },
     { label: 'TRADES', value: formatIntSpaces(props.trades), className: 'text-gray-100' },
     { label: 'OPEN', value: formatUsd0Spaces(props.openNotional), className: props.openNotional > 0 ? 'text-amber-300' : 'text-gray-200' },

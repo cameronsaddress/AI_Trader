@@ -117,6 +117,43 @@ pub fn pair_net_edge_after_cost(gross_edge: f64, model: SimCostModel) -> f64 {
     gross_edge - (2.0 * model.per_side_cost_rate())
 }
 
+/// Polymarket dynamic taker fee for binary option contracts.
+/// Formula: fee(p) = p * (1-p) * base_fee_rate
+/// Maximum at p=0.50 (= 25% of base_rate), approaches 0 at price extremes.
+/// For 15-min crypto markets, base_rate ≈ 2% → max fee ≈ 50 bps at 0.50.
+pub fn polymarket_taker_fee(price: f64, base_fee_rate: f64) -> f64 {
+    if !price.is_finite() || price <= 0.0 || price >= 1.0 || !base_fee_rate.is_finite() {
+        return 0.0;
+    }
+    price * (1.0 - price) * base_fee_rate
+}
+
+/// Adaptive slippage that blends static model with recent observed slippage.
+/// `base_bps`: static slippage estimate from SimCostModel
+/// `hour_utc`: current hour (0-23) for time-of-day adjustment
+/// `recent_slippage_bps`: observed slippage from recent trades (0.0 if unknown)
+pub fn adaptive_slippage(base_bps: f64, hour_utc: u32, recent_slippage_bps: f64) -> f64 {
+    // Time-of-day multiplier: higher slippage during thin liquidity periods
+    let time_mult = match hour_utc {
+        0..=4 => 1.3,    // Asian quiet hours
+        5..=7 => 1.1,    // Pre-London
+        8..=10 => 0.9,   // London open (deep liquidity)
+        11..=13 => 1.0,  // Mid-day
+        14..=16 => 0.85, // US open (deepest liquidity)
+        17..=20 => 1.0,  // US afternoon
+        21..=23 => 1.2,  // Post-US close
+        _ => 1.0,
+    };
+
+    if recent_slippage_bps > 0.0 {
+        // Blend: 70% recent data, 30% static model
+        let blended = 0.7 * recent_slippage_bps + 0.3 * base_bps;
+        (blended * time_mult).max(2.0)
+    } else {
+        (base_bps * time_mult).max(2.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +219,25 @@ mod tests {
             FillStyle::Taker,
         );
         assert!(maker_entry_round_trip > taker_round_trip);
+    }
+
+    #[test]
+    fn polymarket_fee_curve_peaks_at_half() {
+        let rate = 0.02; // 2% base
+        let fee_50 = polymarket_taker_fee(0.50, rate);
+        let fee_30 = polymarket_taker_fee(0.30, rate);
+        let fee_10 = polymarket_taker_fee(0.10, rate);
+        // At p=0.50: 0.50*0.50*0.02 = 0.005 (50 bps)
+        assert!((fee_50 - 0.005).abs() < 1e-12);
+        // At p=0.30: 0.30*0.70*0.02 = 0.0042 (42 bps)
+        assert!((fee_30 - 0.0042).abs() < 1e-12);
+        // At p=0.10: 0.10*0.90*0.02 = 0.0018 (18 bps)
+        assert!((fee_10 - 0.0018).abs() < 1e-12);
+        // Fee at 0.50 > 0.30 > 0.10
+        assert!(fee_50 > fee_30);
+        assert!(fee_30 > fee_10);
+        // Edge cases
+        assert_eq!(polymarket_taker_fee(0.0, rate), 0.0);
+        assert_eq!(polymarket_taker_fee(1.0, rate), 0.0);
     }
 }

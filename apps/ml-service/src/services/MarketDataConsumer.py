@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import redis.asyncio as redis
 from dotenv import load_dotenv
@@ -19,7 +20,7 @@ class MarketDataConsumer:
         self.pubsub = None
         self.channel = "market_data:ticker"
         self.running = False
-        self.feature_engineer = FeatureEngineer()
+        self.feature_engineers: dict[str, FeatureEngineer] = {}
 
     async def connect(self):
         self.redis = redis.from_url(self.redis_url, decode_responses=True)
@@ -46,8 +47,11 @@ class MarketDataConsumer:
         try:
             ticker = json.loads(data)
             # logger.debug(f"Received ticker: {ticker}")
-            
-            features = self.feature_engineer.update(ticker['timestamp'], ticker['price'])
+
+            symbol = ticker.get('symbol', 'UNKNOWN')
+            if symbol not in self.feature_engineers:
+                self.feature_engineers[symbol] = FeatureEngineer()
+            features = self.feature_engineers[symbol].update(ticker['timestamp'], ticker['price'])
             if features:
                 # Add symbol to features
                 features['symbol'] = ticker['symbol']
@@ -55,6 +59,12 @@ class MarketDataConsumer:
                 
                 logger.info(f"Valid Signal: {ticker['symbol']} RSI={features['rsi_14']:.2f} SMA={features['sma_20']:.2f}")
                 
+                # Sanitize NaN/Inf before JSON serialization (RSI can be NaN
+                # when the rolling window has no losses).
+                for k, v in list(features.items()):
+                    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                        features[k] = None
+
                 # Publish to Redis
                 if self.redis:
                     await self.redis.publish("ml:features", json.dumps(features))

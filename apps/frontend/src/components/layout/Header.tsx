@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Shield, Zap, Power, AlertTriangle, KeyRound } from 'lucide-react';
+import { Shield, Zap, Power, AlertTriangle, KeyRound, Lock } from 'lucide-react';
 import { useSocket } from '../../context/SocketContext';
 
 type TradingMode = 'PAPER' | 'LIVE';
@@ -11,11 +11,23 @@ export const Header = () => {
     const [intelligenceGateEnabled, setIntelligenceGateEnabled] = useState(true);
     const [liveSignals, setLiveSignals] = useState(0);
     const [pendingSettlements, setPendingSettlements] = useState(0);
+    const [vaultBalance, setVaultBalance] = useState(0);
     const [showLiveConfirm, setShowLiveConfirm] = useState(false);
     const [showAuthPrompt, setShowAuthPrompt] = useState(false);
     const [confirmText, setConfirmText] = useState('');
     const [authText, setAuthText] = useState('');
     const [modeError, setModeError] = useState<string | null>(null);
+    const [connected, setConnected] = useState(false);
+
+    useEffect(() => {
+        if (!socket) return;
+        const onConnect = () => setConnected(true);
+        const onDisconnect = () => setConnected(false);
+        socket.on('connect', onConnect);
+        socket.on('disconnect', onDisconnect);
+        setConnected(socket.connected);
+        return () => { socket.off('connect', onConnect); socket.off('disconnect', onDisconnect); };
+    }, [socket]);
 
     const isPaperMode = tradingMode === 'PAPER';
     const canConfirmLive = useMemo(() => confirmText.trim().toUpperCase() === 'LIVE', [confirmText]);
@@ -95,6 +107,12 @@ export const Header = () => {
             setLiveSignals(activeSignals.size);
         };
 
+        const handleVaultUpdate = (payload: { vault?: number }) => {
+            if (typeof payload?.vault === 'number') {
+                setVaultBalance(payload.vault);
+            }
+        };
+
         socket.on('trading_mode_update', handleTradingMode);
         socket.on('trading_mode_error', handleTradingModeError);
         socket.on('auth_error', handleAuthError);
@@ -102,7 +120,9 @@ export const Header = () => {
         socket.on('intelligence_snapshot', handleIntelligenceSnapshot);
         socket.on('intelligence_update', handleIntelligenceUpdate);
         socket.on('settlement_snapshot', handleSettlementSnapshot);
+        socket.on('vault_update', handleVaultUpdate);
         socket.emit('request_trading_mode');
+        socket.emit('request_vault');
         const timer = window.setInterval(recomputeLiveSignals, 1000);
 
         return () => {
@@ -113,6 +133,7 @@ export const Header = () => {
             socket.off('intelligence_snapshot', handleIntelligenceSnapshot);
             socket.off('intelligence_update', handleIntelligenceUpdate);
             socket.off('settlement_snapshot', handleSettlementSnapshot);
+            socket.off('vault_update', handleVaultUpdate);
             window.clearInterval(timer);
         };
     }, [socket]);
@@ -156,10 +177,12 @@ export const Header = () => {
                         <Zap className="text-black fill-black" size={20} />
                     </div>
                     <div>
-                        <h1 className="text-lg font-bold text-white leading-none tracking-tight">AI TRADER <span className="text-emerald-500">V2.0</span></h1>
+                        <h1 className="text-lg font-bold text-white leading-none tracking-tight">AI TRADER</h1>
                         <div className="flex items-center gap-2 text-[10px] text-gray-500 font-mono">
-                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                            SYSTEM OPERATIONAL
+                            <span className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
+                            <span className={connected ? 'text-emerald-400' : 'text-red-400'}>
+                                {connected ? 'CONNECTED' : 'DISCONNECTED'}
+                            </span>
                         </div>
                     </div>
                 </div>
@@ -185,6 +208,11 @@ export const Header = () => {
 
                     <div className={`px-3 py-1 rounded-md text-[10px] font-mono border ${pendingSettlements > 0 ? 'text-amber-300 border-amber-500/30 bg-amber-500/10' : 'text-gray-400 border-white/10 bg-white/5'}`}>
                         SETTLEMENTS {pendingSettlements}
+                    </div>
+
+                    <div className={`px-3 py-1 rounded-md text-[10px] font-mono border inline-flex items-center gap-1 ${vaultBalance > 0 ? 'text-amber-300 border-amber-500/30 bg-amber-500/10' : 'text-gray-400 border-white/10 bg-white/5'}`}>
+                        <Lock size={12} />
+                        VAULT ${Math.round(vaultBalance)}
                     </div>
 
                     {/* Mode Toggle Switch */}

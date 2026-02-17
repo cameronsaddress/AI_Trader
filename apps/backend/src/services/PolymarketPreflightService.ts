@@ -85,6 +85,19 @@ export type PolymarketLiveExecutionResult = {
     orders: LiveExecutionOrderResult[];
 };
 
+export type PolymarketPreflightReadiness = {
+    ready: boolean;
+    configured: boolean;
+    clientInitialized: boolean;
+    livePostingEnabled: boolean;
+    strategyAllowlist: string[];
+    disabledReason: string | null;
+    failures: string[];
+    host: string;
+    chainId: number;
+    funderAddress: string | null;
+};
+
 type SignedOrderCandidate = {
     tokenId: string;
     conditionId?: string;
@@ -219,7 +232,10 @@ function parseExecutionCandidate(input: unknown): ParsedExecutionCandidate | nul
         return null;
     }
 
-    const strategy = asString(preflight?.strategy) || asString(payload.side) || 'UNKNOWN';
+    const strategy = asString(preflight?.strategy)
+        || asString(details?.strategy)
+        || asString(payload.strategy)
+        || 'UNKNOWN';
     const market = asString(payload.market) || 'Polymarket';
     const timestamp = asNumber(payload.timestamp) ?? Date.now();
     const fingerprint = `${strategy}:${orders
@@ -251,6 +267,7 @@ export class PolymarketPreflightService {
     private readonly lastExecutionByFingerprint = new Map<string, number>();
     private readonly retryOnError: boolean;
     private readonly livePostingEnabled: boolean;
+    private readonly liveStrategyAllowlist: Set<string>;
 
     private client: ClobClient | null = null;
     private initPromise: Promise<void> | null = null;
@@ -269,6 +286,12 @@ export class PolymarketPreflightService {
         this.liveOrderType = parseLiveOrderType(process.env.POLY_LIVE_ORDER_TYPE);
         this.retryOnError = process.env.POLY_PREFLIGHT_RETRY_ON_ERROR === 'true';
         this.livePostingEnabled = process.env.LIVE_ORDER_POSTING_ENABLED === 'true';
+        this.liveStrategyAllowlist = new Set(
+            (process.env.POLY_LIVE_STRATEGY_ALLOWLIST || 'ATOMIC_ARB,GRAPH_ARB')
+                .split(',')
+                .map((entry) => entry.trim().toUpperCase())
+                .filter((entry) => entry.length > 0),
+        );
 
         if (!this.privateKey) {
             this.disabledReason = 'PRIVATE_KEY/POLY_PRIVATE_KEY not set';
@@ -351,6 +374,14 @@ export class PolymarketPreflightService {
         }
         this.lastExecutionByFingerprint.set(candidate.fingerprint, now);
         return false;
+    }
+
+    private isStrategyLiveEnabled(strategy: string): boolean {
+        const normalized = strategy.trim().toUpperCase();
+        if (!normalized) {
+            return false;
+        }
+        return this.liveStrategyAllowlist.has('*') || this.liveStrategyAllowlist.has(normalized);
     }
 
     private buildUnavailablePreflight(candidate: ParsedExecutionCandidate): PolymarketPreflightResult {
@@ -512,6 +543,40 @@ export class PolymarketPreflightService {
         return this.livePostingEnabled;
     }
 
+    public async getReadinessSnapshot(): Promise<PolymarketPreflightReadiness> {
+        const failures: string[] = [];
+        const configured = !this.disabledReason;
+        let clientInitialized = this.client !== null;
+
+        if (!configured) {
+            failures.push(this.disabledReason || 'Polymarket preflight is not configured');
+        }
+        if (this.liveStrategyAllowlist.size === 0) {
+            failures.push('POLY_LIVE_STRATEGY_ALLOWLIST is empty');
+        }
+
+        if (configured && this.livePostingEnabled) {
+            const available = await this.ensureClient();
+            clientInitialized = this.client !== null;
+            if (!available || !clientInitialized) {
+                failures.push(this.disabledReason || 'Polymarket client is not initialized for live posting');
+            }
+        }
+
+        return {
+            ready: failures.length === 0,
+            configured,
+            clientInitialized,
+            livePostingEnabled: this.livePostingEnabled,
+            strategyAllowlist: [...this.liveStrategyAllowlist],
+            disabledReason: this.disabledReason,
+            failures,
+            host: this.host,
+            chainId: this.chainId,
+            funderAddress: this.funderAddress,
+        };
+    }
+
     public async preflightFromExecution(input: unknown): Promise<PolymarketPreflightResult | null> {
         const candidate = parseExecutionCandidate(input);
         if (!candidate) {
@@ -556,6 +621,32 @@ export class PolymarketPreflightService {
 
         if (this.shouldThrottleExecution(candidate)) {
             return null;
+        }
+
+        if (!this.isStrategyLiveEnabled(candidate.strategy)) {
+            return {
+                market: candidate.market,
+                strategy: candidate.strategy,
+                mode: candidate.mode,
+                timestamp: candidate.timestamp,
+                total: candidate.orders.length,
+                posted: 0,
+                failed: 0,
+                ok: true,
+                dryRun: true,
+                reason: `Strategy ${candidate.strategy} is not enabled in POLY_LIVE_STRATEGY_ALLOWLIST`,
+                orders: candidate.orders.map((order) => ({
+                    tokenId: order.tokenId,
+                    conditionId: order.conditionId,
+                    side: order.side,
+                    price: order.price,
+                    inputSize: order.inputSize,
+                    sizeUnit: order.sizeUnit,
+                    notionalUsd: order.notionalUsd,
+                    size: order.size,
+                    ok: true,
+                })),
+            };
         }
 
         const notionalError = this.validateExecutionNotional(candidate);

@@ -2,6 +2,36 @@ import fs from 'fs/promises';
 import path from 'path';
 import { logger } from '../utils/logger';
 
+type ClosureClass = 'SIGNAL' | 'TIMEOUT' | 'FORCED' | 'MANUAL' | 'UNKNOWN';
+
+export function classifyClosureReason(reason: string | undefined): { closure_class: ClosureClass; label_eligible: boolean } {
+    if (!reason) {
+        return { closure_class: 'UNKNOWN', label_eligible: false };
+    }
+    const upper = reason.trim().toUpperCase();
+    // Signal-driven exits: model produced a definitive TP/SL/edge-decay
+    if ([
+        'TP', 'SL', 'TAKE_PROFIT', 'STOP_LOSS',
+        'SIGNAL_TP', 'SIGNAL_SL', 'EDGE_DECAY',
+        'EXPIRY', 'EXPIRY_EXIT',
+    ].includes(upper)) {
+        return { closure_class: 'SIGNAL', label_eligible: true };
+    }
+    // Time-based exits: still usable for labelling
+    if (['TIMEOUT', 'TIME_EXPIRY', 'MAX_HOLD', 'TIME_EXIT'].includes(upper)) {
+        return { closure_class: 'TIMEOUT', label_eligible: true };
+    }
+    // Forced exits: data quality issues — should NOT be used for ML labels
+    if (['STALE_FORCE_CLOSE', 'STALE_TIMEOUT', 'RESET', 'DRAWDOWN_BREACH', 'COOLDOWN'].includes(upper)) {
+        return { closure_class: 'FORCED', label_eligible: false };
+    }
+    // Manual exits
+    if (['MANUAL', 'USER'].includes(upper)) {
+        return { closure_class: 'MANUAL', label_eligible: false };
+    }
+    return { closure_class: 'UNKNOWN', label_eligible: false };
+}
+
 type StrategyTradeRecord = {
     timestamp: number;
     strategy: string;
@@ -17,10 +47,13 @@ type StrategyTradeRecord = {
     cost_drag_return?: number;
     side?: string;
     entry_price?: number;
+    closure_class?: ClosureClass;
+    label_eligible?: boolean;
 };
 
 type Row = Record<string, unknown>;
 
+const CSV_HEADER_V4 = 'timestamp,strategy,variant,pnl,notional,mode,reason,gross_return,net_return,round_trip_cost_rate,cost_drag_return,execution_id,side,entry_price,closure_class,label_eligible\n';
 const CSV_HEADER_V3 = 'timestamp,strategy,variant,pnl,notional,mode,reason,gross_return,net_return,round_trip_cost_rate,cost_drag_return,execution_id,side,entry_price\n';
 const CSV_HEADER_V2 = 'timestamp,strategy,variant,pnl,notional,mode,reason,gross_return,net_return,round_trip_cost_rate,cost_drag_return,execution_id\n';
 const CSV_HEADER_V1 = 'timestamp,strategy,variant,pnl,notional,mode,reason,gross_return,net_return,round_trip_cost_rate,cost_drag_return\n';
@@ -74,12 +107,12 @@ function parseCsvLine(line: string): string[] {
     return out;
 }
 
-async function migrateCsvToHeaderV3(filePath: string): Promise<void> {
+async function migrateCsvToLatestHeader(filePath: string): Promise<void> {
     const content = await fs.readFile(filePath, 'utf8');
     const lines = content.split('\n');
     const trimmedLines = lines.map((line) => line.trim()).filter((line) => line.length > 0);
     if (trimmedLines.length === 0) {
-        await fs.writeFile(filePath, CSV_HEADER_V3, { encoding: 'utf8' });
+        await fs.writeFile(filePath, CSV_HEADER_V4, { encoding: 'utf8' });
         return;
     }
 
@@ -88,13 +121,15 @@ async function migrateCsvToHeaderV3(filePath: string): Promise<void> {
     const hasSide = headerCols.includes('side');
     const hasEntry = headerCols.includes('entry_price');
     const hasExecution = headerCols.includes('execution_id');
-    const needs = !(hasSide && hasEntry && hasExecution);
-    if (!needs) {
+    const hasClosureClass = headerCols.includes('closure_class');
+    const hasLabelEligible = headerCols.includes('label_eligible');
+    const isLatest = hasSide && hasEntry && hasExecution && hasClosureClass && hasLabelEligible;
+    if (isLatest) {
         return;
     }
 
-    const targetCols = parseCsvLine(CSV_HEADER_V3.trim()).length;
-    const updated: string[] = [CSV_HEADER_V3.trim()];
+    const targetCols = parseCsvLine(CSV_HEADER_V4.trim()).length;
+    const updated: string[] = [CSV_HEADER_V4.trim()];
     for (let i = 1; i < trimmedLines.length; i += 1) {
         const line = trimmedLines[i] as string;
         const cells = parseCsvLine(line);
@@ -155,6 +190,8 @@ function toRecord(payload: unknown): StrategyTradeRecord | null {
         ?? parseNumber(details?.entry_price)
         ?? undefined;
 
+    const { closure_class, label_eligible } = classifyClosureReason(reason);
+
     return {
         timestamp: ts,
         strategy,
@@ -170,10 +207,12 @@ function toRecord(payload: unknown): StrategyTradeRecord | null {
         cost_drag_return: costDragReturn,
         side,
         entry_price: entryPrice,
+        closure_class,
+        label_eligible,
     };
 }
 
-function recordToCsv(record: StrategyTradeRecord, config: { extended: boolean; includeExecutionId: boolean; includeSide: boolean; includeEntryPrice: boolean }): string {
+function recordToCsv(record: StrategyTradeRecord, config: { extended: boolean; includeExecutionId: boolean; includeSide: boolean; includeEntryPrice: boolean; includeClosureTaxonomy: boolean }): string {
     const base = [
         String(Math.round(record.timestamp)),
         csvEscape(record.strategy),
@@ -203,6 +242,10 @@ function recordToCsv(record: StrategyTradeRecord, config: { extended: boolean; i
     if (config.includeEntryPrice) {
         cells.push(record.entry_price !== undefined ? record.entry_price.toFixed(8) : '');
     }
+    if (config.includeClosureTaxonomy) {
+        cells.push(csvEscape(record.closure_class || ''));
+        cells.push(record.label_eligible !== undefined ? String(record.label_eligible) : '');
+    }
     return `${cells.join(',')}\n`;
 }
 
@@ -228,10 +271,12 @@ export class StrategyTradeRecorder {
     private readonly filePath: string;
     private initialized = false;
     private writeQueue: Promise<void> = Promise.resolve();
+    private rowCount = 0;
     private extendedCsv = true;
     private includeExecutionId = true;
     private includeSide = true;
     private includeEntryPrice = true;
+    private includeClosureTaxonomy = true;
 
     constructor(filePath?: string) {
         this.filePath = resolveRecorderPath(filePath);
@@ -247,27 +292,33 @@ export class StrategyTradeRecorder {
 
         try {
             await fs.access(this.filePath);
-            await migrateCsvToHeaderV3(this.filePath);
+            await migrateCsvToLatestHeader(this.filePath);
             const content = await fs.readFile(this.filePath, 'utf8');
-            const firstLine = content.split('\n', 1)[0]?.trim() || '';
+            const nonEmptyLines = content.split('\n').map((line) => line.trim()).filter((line) => line.length > 0);
+            this.rowCount = Math.max(0, nonEmptyLines.length - 1);
+            const firstLine = nonEmptyLines[0] || '';
             if (firstLine === LEGACY_CSV_HEADER) {
                 this.extendedCsv = false;
                 this.includeExecutionId = false;
                 this.includeSide = false;
                 this.includeEntryPrice = false;
+                this.includeClosureTaxonomy = false;
             } else if (firstLine.length > 0) {
                 const columns = firstLine.split(',').map((col) => col.trim());
                 this.extendedCsv = columns.includes('gross_return') && columns.includes('cost_drag_return');
                 this.includeExecutionId = columns.includes('execution_id');
                 this.includeSide = columns.includes('side');
                 this.includeEntryPrice = columns.includes('entry_price');
+                this.includeClosureTaxonomy = columns.includes('closure_class') && columns.includes('label_eligible');
             }
         } catch {
-            await fs.writeFile(this.filePath, CSV_HEADER_V3, { encoding: 'utf8' });
+            await fs.writeFile(this.filePath, CSV_HEADER_V4, { encoding: 'utf8' });
+            this.rowCount = 0;
             this.extendedCsv = true;
             this.includeExecutionId = true;
             this.includeSide = true;
             this.includeEntryPrice = true;
+            this.includeClosureTaxonomy = true;
         }
 
         this.initialized = true;
@@ -289,7 +340,9 @@ export class StrategyTradeRecorder {
                 includeExecutionId: this.includeExecutionId,
                 includeSide: this.includeSide,
                 includeEntryPrice: this.includeEntryPrice,
+                includeClosureTaxonomy: this.includeClosureTaxonomy,
             }), { encoding: 'utf8' });
+            this.rowCount += 1;
         }).catch((error) => {
             logger.error(`[StrategyTradeRecorder] failed to persist trade row: ${String(error)}`);
         });
@@ -304,11 +357,13 @@ export class StrategyTradeRecorder {
             if (!this.initialized) {
                 await this.init();
             }
-            await fs.writeFile(this.filePath, CSV_HEADER_V3, { encoding: 'utf8' });
+            await fs.writeFile(this.filePath, CSV_HEADER_V4, { encoding: 'utf8' });
             this.extendedCsv = true;
             this.includeExecutionId = true;
             this.includeSide = true;
             this.includeEntryPrice = true;
+            this.includeClosureTaxonomy = true;
+            this.rowCount = 0;
         });
 
         this.writeQueue = task.catch((error) => {
@@ -323,9 +378,6 @@ export class StrategyTradeRecorder {
             await this.init();
         }
         await this.writeQueue;
-
-        const content = await fs.readFile(this.filePath, 'utf8');
-        const lines = content.split('\n').filter((line) => line.trim().length > 0);
-        return Math.max(0, lines.length - 1);
+        return this.rowCount;
     }
 }

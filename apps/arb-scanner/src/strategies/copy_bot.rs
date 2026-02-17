@@ -20,6 +20,7 @@ use crate::strategies::control::{
     read_simulation_reset_ts,
     strategy_variant,
     reserve_sim_notional_for_strategy,
+    read_risk_guard_cooldown,
     release_sim_notional_for_strategy,
     settle_sim_position_for_strategy,
     read_trading_mode,
@@ -88,7 +89,7 @@ impl Strategy for SyndicateStrategy {
     async fn run(&self, redis_client: redis::Client) {
         info!("Starting Syndicate strategy [on-chain cluster follower]");
 
-        let mut conn = match redis_client.get_async_connection().await {
+        let mut conn = match redis_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to connect to Redis: {}", e);
@@ -106,7 +107,7 @@ impl Strategy for SyndicateStrategy {
         let event_cost_model = cost_model;
 
         tokio::spawn(async move {
-            let mut event_conn = match redis_client_clone.get_async_connection().await {
+            let mut event_conn = match redis_client_clone.get_multiplexed_async_connection().await {
                 Ok(c) => c,
                 Err(e) => {
                     error!("Syndicate event Redis connection failed: {}", e);
@@ -306,7 +307,7 @@ impl Strategy for SyndicateStrategy {
                 if released_notional > 0.0 {
                     let _ = release_sim_notional_for_strategy(&mut conn, "SYNDICATE", released_notional).await;
                 }
-                publish_heartbeat(&mut conn, "copy_bot").await;
+                publish_heartbeat(&mut conn, "SYNDICATE").await;
                 continue;
             }
 
@@ -343,7 +344,7 @@ impl Strategy for SyndicateStrategy {
                     let mut last_entry = self.last_entry_ts.write().await;
                     last_entry.clear();
                 }
-                publish_heartbeat(&mut conn, "copy_bot").await;
+                publish_heartbeat(&mut conn, "SYNDICATE").await;
                 continue;
             }
 
@@ -452,6 +453,13 @@ impl Strategy for SyndicateStrategy {
                     });
                     let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
                 }
+            }
+
+            let now_ms = Utc::now().timestamp_millis();
+            let cooldown_until = read_risk_guard_cooldown(&mut conn, "SYNDICATE").await;
+            if cooldown_until > 0 && now_ms < cooldown_until {
+                publish_heartbeat(&mut conn, "SYNDICATE").await;
+                continue;
             }
 
             for (token_id, trades) in window_snapshot.iter() {
@@ -791,7 +799,7 @@ impl Strategy for SyndicateStrategy {
                 );
             }
 
-            publish_heartbeat(&mut conn, "copy_bot").await;
+            publish_heartbeat(&mut conn, "SYNDICATE").await;
         }
     }
 }

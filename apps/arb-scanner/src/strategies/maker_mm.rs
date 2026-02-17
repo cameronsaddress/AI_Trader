@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use redis::AsyncCommands;
@@ -16,6 +16,7 @@ use crate::strategies::control::{
     is_strategy_enabled,
     publish_heartbeat,
     read_risk_config,
+    read_risk_guard_cooldown,
     read_sim_available_cash,
     read_simulation_reset_ts,
     read_trading_mode,
@@ -26,7 +27,10 @@ use crate::strategies::control::{
     TradingMode,
 };
 use crate::strategies::market_data::{update_books_from_market_ws, BinaryBook, TokenBinding};
-use crate::strategies::simulation::{realized_pnl_with_fill, side_cost_rate, FillStyle, SimCostModel};
+use crate::strategies::simulation::{
+    adaptive_slippage, polymarket_taker_fee, realized_pnl_with_fill, FillStyle, SimCostModel,
+};
+use crate::strategies::vol_regime::{detect_regime, regime_exit_multipliers};
 use crate::strategies::Strategy;
 
 const BOOK_STALE_MS: i64 = 2_000;
@@ -42,7 +46,17 @@ const MAX_ENTRY_PRICE: f64 = 0.92;
 const MIN_SPREAD: f64 = 0.02;
 const MAX_SPREAD: f64 = 0.16;
 const MAX_PARITY_DEVIATION: f64 = 0.03;
-const MIN_EXPECTED_NET_RETURN: f64 = 0.009; // 90 bps expected edge.
+fn min_expected_net_return() -> f64 {
+    std::env::var("MAKER_MM_MIN_EXPECTED_NET_RETURN")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(0.001) // 10 bps default (was 90)
+}
+fn fee_curve_rate() -> f64 {
+    std::env::var("POLYMARKET_FEE_CURVE_RATE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 0.10)
+        .unwrap_or(0.022)
+}
 const TAKE_PROFIT_PCT: f64 = 0.018;
 const STOP_LOSS_PCT: f64 = -0.015;
 const MAX_HOLD_MS: i64 = 90_000;
@@ -132,7 +146,7 @@ impl Strategy for MakerMmStrategy {
     async fn run(&self, redis_client: redis::Client) {
         info!("Starting Maker MM [spread capture + inventory discipline]");
 
-        let mut conn = match redis_client.get_async_connection().await {
+        let mut conn = match redis_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
             Err(e) => {
                 error!("Redis connect failed: {}", e);
@@ -142,8 +156,6 @@ impl Strategy for MakerMmStrategy {
 
         let variant = strategy_variant();
         let cost_model = SimCostModel::from_env();
-        let maker_entry_cost = side_cost_rate(cost_model, FillStyle::Maker);
-        let maker_exit_cost = side_cost_rate(cost_model, FillStyle::Taker);
 
         let mut books: HashMap<String, BinaryBook> = HashMap::new();
         let mut open_positions: Vec<Position> = Vec::new();
@@ -279,6 +291,13 @@ impl Strategy for MakerMmStrategy {
                             continue;
                         }
 
+                        // Risk guard cooldown — skip entry if backend set a post-loss cooldown.
+                        let cooldown_until = read_risk_guard_cooldown(&mut conn, "MAKER_MM").await;
+                        if cooldown_until > 0 && now_ms < cooldown_until {
+                            publish_heartbeat(&mut conn, "maker_mm").await;
+                            continue;
+                        }
+
                         // Exit management.
                         let mut keep_positions: Vec<Position> = Vec::new();
                         for pos in open_positions.drain(..) {
@@ -291,17 +310,31 @@ impl Strategy for MakerMmStrategy {
                                 continue;
                             }
 
-                            let (_, ask) = Self::side_bid_ask(book, pos.side);
-                            if ask <= 0.0 || pos.entry_price <= 0.0 {
+                            let (bid, _) = Self::side_bid_ask(book, pos.side);
+                            if bid <= 0.0 || pos.entry_price <= 0.0 {
                                 keep_positions.push(pos);
                                 continue;
                             }
 
                             let hold_ms = now_ms - pos.timestamp_ms;
-                            let gross_return = (ask - pos.entry_price) / pos.entry_price;
-                            let close_reason = if gross_return >= TAKE_PROFIT_PCT {
+                            let gross_return = (bid - pos.entry_price) / pos.entry_price;
+
+                            // Adaptive exit via vol-regime detection
+                            let price_history_slice: Vec<(i64, f64)> = vec![
+                                (pos.timestamp_ms, pos.entry_price),
+                                (now_ms, bid),
+                            ];
+                            let (tp_mult, sl_mult) = if let Some(regime) = detect_regime(&price_history_slice) {
+                                regime_exit_multipliers(&regime)
+                            } else {
+                                (1.0, 1.0)
+                            };
+                            let adjusted_tp = TAKE_PROFIT_PCT * tp_mult;
+                            let adjusted_sl = STOP_LOSS_PCT * sl_mult;
+
+                            let close_reason = if gross_return >= adjusted_tp {
                                 Some("TAKE_PROFIT")
-                            } else if gross_return <= STOP_LOSS_PCT {
+                            } else if gross_return <= adjusted_sl {
                                 Some("STOP_LOSS")
                             } else if hold_ms >= MAX_HOLD_MS {
                                 Some("TIME_EXIT")
@@ -335,7 +368,7 @@ impl Strategy for MakerMmStrategy {
                                         "question": pos.question,
                                         "side": Self::side_label(pos.side),
                                         "entry": pos.entry_price,
-                                        "exit": ask,
+                                        "exit": bid,
                                         "gross_return": gross_return,
                                         "hold_ms": hold_ms,
                                         "fill_model": "MAKER_TAKER",
@@ -349,6 +382,11 @@ impl Strategy for MakerMmStrategy {
                         open_positions = keep_positions;
 
                         let mut best_candidate: Option<(&MarketTarget, Side, f64, f64, f64, f64, i64)> = None;
+                        let dynamic_slippage_rate = adaptive_slippage(
+                            cost_model.slippage_bps_per_side,
+                            Utc::now().hour(),
+                            0.0,
+                        ) / 10_000.0;
                         for market in market_by_id.values() {
                             let Some(book) = books.get(&market.market_id) else {
                                 continue;
@@ -375,7 +413,7 @@ impl Strategy for MakerMmStrategy {
                             } else {
                                 (Side::No, no_spread)
                             };
-                            if spread < MIN_SPREAD || spread > MAX_SPREAD {
+                            if !(MIN_SPREAD..=MAX_SPREAD).contains(&spread) {
                                 continue;
                             }
 
@@ -385,8 +423,11 @@ impl Strategy for MakerMmStrategy {
                             }
 
                             let gross_capture = (ask - bid) / bid.max(0.01);
-                            let expected_net_return = gross_capture - maker_entry_cost - maker_exit_cost;
-                            let threshold = MIN_EXPECTED_NET_RETURN;
+                            let entry_fee = polymarket_taker_fee(bid, fee_curve_rate());
+                            let exit_fee = polymarket_taker_fee(ask, fee_curve_rate());
+                            let expected_net_return =
+                                gross_capture - entry_fee - exit_fee - 2.0 * dynamic_slippage_rate;
+                            let threshold = min_expected_net_return();
 
                             match best_candidate {
                                 Some((_, _, current_expected, _, _, _, _)) if expected_net_return <= current_expected => {}
@@ -447,8 +488,9 @@ impl Strategy for MakerMmStrategy {
                                 "entry_price": entry_price,
                                 "spread": spread,
                                 "time_to_expiry_secs": time_to_expiry,
-                                "maker_entry_cost_rate": maker_entry_cost,
-                                "maker_exit_cost_rate": maker_exit_cost,
+                                "entry_fee_dynamic": polymarket_taker_fee(entry_price, fee_curve_rate()),
+                                "exit_fee_dynamic": polymarket_taker_fee(spread + entry_price, fee_curve_rate()),
+                                "slippage_rate": dynamic_slippage_rate,
                             }),
                         );
                         let _: () = conn.publish("arbitrage:scan", scan_msg.to_string()).await.unwrap_or_default();
@@ -518,6 +560,13 @@ impl Strategy for MakerMmStrategy {
                                     last_entry_ms = now_ms;
                                 }
                             }
+                            publish_heartbeat(&mut conn, "maker_mm").await;
+                            continue;
+                        }
+
+                        // Skip if already positioned in this market
+                        let already_in = open_positions.iter().any(|p| p.market_id == market.market_id);
+                        if already_in {
                             publish_heartbeat(&mut conn, "maker_mm").await;
                             continue;
                         }

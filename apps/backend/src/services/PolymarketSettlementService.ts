@@ -18,6 +18,7 @@ const DEFAULT_MIN_REDEEMABLE_SHARES = 0.01;
 const DEFAULT_SETTLEMENT_STALE_MS = 60 * 60 * 1000;
 const POSITION_INDEX_SETS = [1n, 2n];
 const REDIS_KEY = 'system:polymarket:settlement:atomic:v1';
+const TRACKED_PAIRED_STRATEGIES = new Set(['ATOMIC_ARB', 'GRAPH_ARB']);
 
 type PositionStatus =
     | 'TRACKED'
@@ -277,7 +278,8 @@ export class PolymarketSettlementService {
     }
 
     public async registerAtomicExecution(result: PolymarketLiveExecutionResult): Promise<SettlementEvent[]> {
-        if (result.strategy !== 'ATOMIC_ARB' || result.dryRun) {
+        const strategy = (result.strategy || '').trim().toUpperCase();
+        if (!TRACKED_PAIRED_STRATEGIES.has(strategy) || result.dryRun) {
             return [];
         }
 
@@ -305,7 +307,7 @@ export class PolymarketSettlementService {
                     type: 'WARNING',
                     timestamp: now,
                     conditionId,
-                    message: 'Atomic execution posted fewer than two BUY legs; manual hedge review required',
+                    message: 'Paired execution posted fewer than two BUY legs; manual hedge review required',
                     details: { postedLegs: orders.length },
                 });
                 continue;
@@ -317,7 +319,7 @@ export class PolymarketSettlementService {
                     type: 'WARNING',
                     timestamp: now,
                     conditionId,
-                    message: 'Atomic execution BUY legs did not span two distinct outcomes',
+                    message: 'Paired execution BUY legs did not span two distinct outcomes',
                     details: { tokenIds: [...uniqueTokenIds] },
                 });
                 continue;
@@ -365,7 +367,7 @@ export class PolymarketSettlementService {
                 timestamp: now,
                 conditionId,
                 positionId: id,
-                message: `Tracked atomic pair for settlement (${shares.toFixed(4)} shares)`,
+                message: `Tracked paired position for settlement (${shares.toFixed(4)} shares)`,
                 details: {
                     yesTokenId: position.yesTokenId,
                     noTokenId: position.noTokenId,

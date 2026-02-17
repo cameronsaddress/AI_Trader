@@ -20,6 +20,7 @@ use crate::strategies::control::{
     is_strategy_enabled,
     publish_heartbeat,
     read_risk_config,
+    read_risk_guard_cooldown,
     read_sim_available_cash,
     read_simulation_reset_ts,
     strategy_variant,
@@ -31,6 +32,7 @@ use crate::strategies::control::{
 };
 use crate::strategies::market_data::{update_book_from_market_ws, BinaryBook};
 use crate::strategies::simulation::{realized_pnl, SimCostModel};
+use crate::strategies::vol_regime::{detect_regime, regime_exit_multipliers};
 use crate::strategies::Strategy;
 
 const COINBASE_ADVANCED_WS_URL: &str = "wss://advanced-trade-ws.coinbase.com";
@@ -55,6 +57,7 @@ const MAX_PARITY_DEVIATION: f64 = 0.02;
 const DEFAULT_MIN_EDGE_TO_SPREAD_RATIO: f64 = 1.25;
 const ENTRY_COOLDOWN_MS: i64 = 8_000;
 const MIN_HOLD_MS: i64 = 1_500;
+const MAX_HOLD_MS: i64 = 300_000;
 const DEFAULT_MAX_TRADES_PER_WINDOW: usize = 3;
 const DEFAULT_MAX_CONSECUTIVE_LOSSES: u32 = 3;
 const DEFAULT_MAX_POSITION_FRACTION: f64 = 0.20;
@@ -76,17 +79,17 @@ struct StrategyParams {
 impl StrategyParams {
     fn for_asset(asset: &str) -> Self {
         match asset {
-            // BTC gets tighter downside and lower concentration to improve long-run risk-adjusted return.
+            // BTC: tighter filters to reduce low-edge churn (was 130 trades/day for ~$0 PnL).
             "BTC" => Self {
-                entry_edge_threshold: 0.045,
+                entry_edge_threshold: 0.06,
                 max_entry_edge_threshold: 0.095,
-                exit_edge_threshold: 0.012,
-                take_profit_pct: 0.065,
-                stop_loss_pct: -0.035,
-                max_entry_spread: 0.07,
-                min_edge_to_spread_ratio: 1.40,
-                max_trades_per_window: 2,
-                max_consecutive_losses: 2,
+                exit_edge_threshold: 0.015,
+                take_profit_pct: 0.08,
+                stop_loss_pct: -0.04,
+                max_entry_spread: 0.06,
+                min_edge_to_spread_ratio: 1.60,
+                max_trades_per_window: 1,
+                max_consecutive_losses: 1,
                 max_position_fraction: 0.16,
             },
             // SOL showed negative expectancy overnight; keep sizing and turnover conservative.
@@ -216,6 +219,7 @@ fn parse_coinbase_message_sequence(payload: &str) -> Option<u64> {
 #[derive(Debug, Clone)]
 struct Position {
     execution_id: String,
+    market_id: String,
     entry_price: f64,
     size: f64,
     timestamp_ms: i64,
@@ -363,7 +367,7 @@ impl Strategy for MarketNeutralStrategy {
     async fn run(&self, redis_client: redis::Client) {
         info!("Starting fair-value strategy for {}", self.asset);
 
-        let mut conn = match redis_client.get_async_connection().await {
+        let mut conn = match redis_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
             Err(e) => {
                 error!("Redis connect failed: {}", e);
@@ -558,7 +562,42 @@ impl Strategy for MarketNeutralStrategy {
                         }
 
                         let now_ms = Utc::now().timestamp_millis();
+
+                        // Force-close if book stale beyond MAX_HOLD to free capital
                         if now_ms - book.last_update_ms > BOOK_STALE_MS {
+                            let mut pos_lock = self.open_position.write().await;
+                            if let Some(pos) = pos_lock.as_ref() {
+                                let hold_ms = now_ms - pos.timestamp_ms;
+                                if hold_ms >= MAX_HOLD_MS {
+                                    let pos_owned = pos.clone();
+                                    *pos_lock = None;
+                                    drop(pos_lock);
+                                    let _ = settle_sim_position_for_strategy(&mut conn, &strategy_id, pos_owned.size, 0.0).await;
+                                    let stale_msg = serde_json::json!({
+                                        "execution_id": pos_owned.execution_id,
+                                        "strategy": strategy_id,
+                                        "pnl": 0.0,
+                                        "notional": pos_owned.size,
+                                        "timestamp": now_ms,
+                                        "mode": "PAPER",
+                                        "details": {
+                                            "action": "STALE_FORCE_CLOSE",
+                                            "reason": "STALE_FORCE_CLOSE",
+                                            "entry": pos_owned.entry_price,
+                                            "hold_ms": hold_ms,
+                                        }
+                                    });
+                                    let _: () = conn.publish("strategy:pnl", stale_msg.to_string()).await.unwrap_or_default();
+                                    info!("{} STALE_FORCE_CLOSE after {}ms", strategy_id, hold_ms);
+                                }
+                            }
+                            publish_heartbeat(&mut conn, &heartbeat_id).await;
+                            continue;
+                        }
+
+                        // Risk guard cooldown — skip entry if backend set a post-loss cooldown.
+                        let cooldown_until = read_risk_guard_cooldown(&mut conn, &strategy_id).await;
+                        if cooldown_until > 0 && now_ms < cooldown_until {
                             publish_heartbeat(&mut conn, &heartbeat_id).await;
                             continue;
                         }
@@ -569,9 +608,116 @@ impl Strategy for MarketNeutralStrategy {
                             continue;
                         }
 
+                        // Safety guard: never carry a position across market rollovers.
+                        let rollover_position = {
+                            let mut pos_lock = self.open_position.write().await;
+                            if let Some(pos) = pos_lock.as_ref() {
+                                if pos.market_id != target_market.market_id {
+                                    let owned = pos.clone();
+                                    *pos_lock = None;
+                                    Some(owned)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(pos) = rollover_position {
+                            let new_bankroll = settle_sim_position_for_strategy(&mut conn, &strategy_id, pos.size, 0.0).await;
+                            let pnl_msg = serde_json::json!({
+                                "execution_id": pos.execution_id,
+                                "strategy": strategy_id.clone(),
+                                "variant": variant.as_str(),
+                                "pnl": 0.0,
+                                "notional": pos.size,
+                                "timestamp": now_ms,
+                                "bankroll": new_bankroll,
+                                "mode": "PAPER",
+                                "details": {
+                                    "action": "MARKET_ROLLOVER_CLOSE",
+                                    "reason": "MARKET_ROLLOVER",
+                                    "expected_market_id": pos.market_id,
+                                    "active_market_id": target_market.market_id.clone(),
+                                }
+                            });
+                            let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                            warn!("{} MARKET_ROLLOVER close emitted to prevent cross-market state leakage", strategy_id);
+                        }
+
                         let now_ts = Utc::now().timestamp();
                         let remaining_seconds = expiry_ts - now_ts;
                         if remaining_seconds <= 0 {
+                            let maybe_pos = {
+                                let mut pos_lock = self.open_position.write().await;
+                                pos_lock.take()
+                            };
+                            if let Some(pos) = maybe_pos {
+                                let best_bid = book.yes.best_bid;
+                                let mid = book.yes.mid();
+                                let mut exit_price = if best_bid.is_finite() && best_bid > 0.0 {
+                                    best_bid
+                                } else if mid.is_finite() && mid > 0.0 {
+                                    mid
+                                } else {
+                                    pos.entry_price
+                                };
+                                exit_price = exit_price.clamp(0.001, 0.999);
+
+                                let gross_return = ((exit_price - pos.entry_price) / pos.entry_price).max(-0.999);
+                                let pnl = realized_pnl(pos.size, gross_return, cost_model);
+                                let new_bankroll = settle_sim_position_for_strategy(&mut conn, &strategy_id, pos.size, pnl).await;
+                                if pnl < 0.0 {
+                                    consecutive_losses = consecutive_losses.saturating_add(1);
+                                } else {
+                                    consecutive_losses = 0;
+                                }
+                                let net_return = if pos.size > 0.0 { pnl / pos.size } else { 0.0 };
+                                let execution_id = pos.execution_id.clone();
+
+                                let pnl_msg = serde_json::json!({
+                                    "execution_id": execution_id.clone(),
+                                    "strategy": strategy_id.clone(),
+                                    "variant": variant.as_str(),
+                                    "pnl": pnl,
+                                    "notional": pos.size,
+                                    "timestamp": now_ms,
+                                    "bankroll": new_bankroll,
+                                    "mode": "PAPER",
+                                    "details": {
+                                        "action": "FORCE_CLOSE_EXPIRY",
+                                        "reason": "TIME_EXPIRY",
+                                        "entry": pos.entry_price,
+                                        "exit": exit_price,
+                                        "hold_ms": now_ms - pos.timestamp_ms,
+                                        "gross_return": gross_return,
+                                        "net_return": net_return,
+                                        "roi": format!("{:.2}%", net_return * 100.0),
+                                        "consecutive_losses": consecutive_losses,
+                                        "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
+                                    }
+                                });
+                                let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+
+                                let settle_msg = serde_json::json!({
+                                    "execution_id": execution_id,
+                                    "market": format!("Long {}", self.asset),
+                                    "side": "TIME_EXPIRY",
+                                    "price": exit_price,
+                                    "size": pos.size,
+                                    "timestamp": now_ms,
+                                    "mode": "PAPER",
+                                    "details": {
+                                        "strategy": strategy_id.clone(),
+                                        "pnl": pnl,
+                                        "net_return": net_return,
+                                        "hold_ms": now_ms - pos.timestamp_ms,
+                                        "reason": "TIME_EXPIRY",
+                                    }
+                                });
+                                let _: () = conn.publish("arbitrage:execution", settle_msg.to_string()).await.unwrap_or_default();
+                                info!("{} TIME_EXPIRY close pnl=${:.2}", strategy_id, pnl);
+                            }
                             break;
                         }
 
@@ -749,6 +895,7 @@ impl Strategy for MarketNeutralStrategy {
                                     });
                                     let _: () = conn.publish("arbitrage:execution", preview_msg.to_string()).await.unwrap_or_default();
                                     last_live_preview_ms = now_ms;
+                                    last_entry_ms = now_ms;
                                 }
                             }
                             let released_notional = {
@@ -775,6 +922,19 @@ impl Strategy for MarketNeutralStrategy {
                             continue;
                         }
 
+                        // Adaptive exit thresholds based on volatility regime.
+                        let (tp_mult, sl_mult) = {
+                            let history = self.spot_history.read().await;
+                            let price_vec: Vec<(i64, f64)> = history.iter().copied().collect();
+                            if let Some(regime) = detect_regime(&price_vec) {
+                                regime_exit_multipliers(&regime)
+                            } else {
+                                (1.0, 1.0)
+                            }
+                        };
+                        let adjusted_tp = params.take_profit_pct * tp_mult;
+                        let adjusted_sl = params.stop_loss_pct * sl_mult;
+
                         let mut close_event: Option<(Position, f64, f64, f64, i64, &'static str)> = None;
                         let mut entry_signal_price: Option<f64> = None;
 
@@ -788,9 +948,9 @@ impl Strategy for MarketNeutralStrategy {
                                     let mark_return = (mark_price - pos.entry_price) / pos.entry_price;
                                     let executable_return = (executable_exit_price - pos.entry_price) / pos.entry_price;
                                     let hold_ms = now_ms - pos.timestamp_ms;
-                                    let close_reason = if mark_return >= params.take_profit_pct {
+                                    let close_reason = if mark_return >= adjusted_tp {
                                         Some("TAKE_PROFIT")
-                                    } else if hold_ms >= MIN_HOLD_MS && executable_return <= params.stop_loss_pct {
+                                    } else if hold_ms >= MIN_HOLD_MS && executable_return <= adjusted_sl {
                                         Some("STOP_LOSS")
                                     } else if hold_ms >= MIN_HOLD_MS && edge < params.exit_edge_threshold {
                                         Some("EDGE_DECAY")
@@ -807,6 +967,7 @@ impl Strategy for MarketNeutralStrategy {
                                 }
                             }
 
+                            // Skip if already positioned in this market (duplicate market guard)
                             if pos_lock.is_none()
                                 && passes_threshold
                                 && remaining_seconds > ENTRY_EXPIRY_CUTOFF_SECS
@@ -882,6 +1043,7 @@ impl Strategy for MarketNeutralStrategy {
                                     let id = Uuid::new_v4().to_string();
                                     *pos_lock = Some(Position {
                                         execution_id: id.clone(),
+                                        market_id: target_market.market_id.clone(),
                                         entry_price,
                                         size,
                                         timestamp_ms: now_ms,

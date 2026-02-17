@@ -414,6 +414,8 @@ const STRATEGY_NAME_MAP: Record<string, string> = {
     GRAPH_ARB: 'Graph Constraint Arb',
     CONVERGENCE_CARRY: 'Convergence Carry',
     MAKER_MM: 'Maker Micro-MM',
+    AS_MARKET_MAKER: 'A-S Market Maker',
+    LONGSHOT_BIAS: 'Longshot Bias Fade',
 };
 
 function inferAssetScope(strategy: string): Exclude<IntelligenceAssetScope, 'ALL'> {
@@ -2109,7 +2111,16 @@ export const PolymarketPage: React.FC = () => {
         socket.on('simulation_reset', handleSimulationReset);
         socket.on('simulation_reset_error', handleSimulationResetError);
         socket.on('runtime_status_update', handleRuntimeStatus);
-        socket.emit('request_trading_mode');
+
+        const requestAllState = () => {
+            socket.emit('request_trading_mode');
+            socket.emit('request_strategy_metrics');
+            socket.emit('request_vault');
+            socket.emit('request_risk_guard');
+            socket.emit('request_ledger');
+        };
+        socket.on('connect', requestAllState);
+        requestAllState();
 
         return () => {
             socket.off('system_health_update', handleSystemHealth);
@@ -2142,6 +2153,7 @@ export const PolymarketPage: React.FC = () => {
             socket.off('simulation_reset', handleSimulationReset);
             socket.off('simulation_reset_error', handleSimulationResetError);
             socket.off('runtime_status_update', handleRuntimeStatus);
+            socket.off('connect', requestAllState);
         };
     }, [socket]);
 

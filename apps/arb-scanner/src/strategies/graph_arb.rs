@@ -16,6 +16,7 @@ use crate::strategies::control::{
     is_strategy_enabled,
     publish_heartbeat,
     read_risk_config,
+    read_risk_guard_cooldown,
     read_sim_available_cash,
     read_simulation_reset_ts,
     read_trading_mode,
@@ -26,11 +27,28 @@ use crate::strategies::control::{
     TradingMode,
 };
 use crate::strategies::market_data::{update_books_from_market_ws, BinaryBook, TokenBinding};
-use crate::strategies::simulation::{pair_net_edge_after_cost, SimCostModel};
+use crate::strategies::simulation::{polymarket_taker_fee, SimCostModel};
 use crate::strategies::Strategy;
 
-const MIN_NET_EDGE: f64 = 0.0045; // 45 bps minimum expected lock edge after costs.
-const MIN_BUFFER_FLOOR: f64 = 0.0060; // Additional conservative floor for stale quotes.
+fn min_net_edge() -> f64 {
+    std::env::var("GRAPH_ARB_MIN_NET_EDGE")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(0.0015) // 15 bps default (was 45)
+}
+fn min_buffer_floor() -> f64 {
+    std::env::var("GRAPH_ARB_MIN_BUFFER_FLOOR")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(0.0010) // 10 bps default (was 60)
+}
+fn horizon_penalty_coeff() -> f64 {
+    std::env::var("GRAPH_ARB_HORIZON_PENALTY_COEFF")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(0.0005) // was 0.0025 (5x reduction)
+}
+fn fee_curve_rate() -> f64 {
+    std::env::var("POLYMARKET_FEE_CURVE_RATE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 0.10)
+        .unwrap_or(0.022)
+}
 const BOOK_STALE_MS: i64 = 2_000;
 const ENTRY_COOLDOWN_MS: i64 = 2_000;
 const REFRESH_UNIVERSE_MS: i64 = 45_000;
@@ -121,7 +139,7 @@ impl Strategy for GraphArbStrategy {
     async fn run(&self, redis_client: redis::Client) {
         info!("Starting Graph Arb [multi-market no-arb scanner]");
 
-        let mut conn = match redis_client.get_async_connection().await {
+        let mut conn = match redis_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
             Err(e) => {
                 error!("Redis Connect Fail: {}", e);
@@ -305,6 +323,13 @@ impl Strategy for GraphArbStrategy {
                             continue;
                         }
 
+                        // Risk guard cooldown — skip entry if backend set a post-loss cooldown.
+                        let cooldown_until = read_risk_guard_cooldown(&mut conn, "GRAPH_ARB").await;
+                        if cooldown_until > 0 && now_ms < cooldown_until {
+                            publish_heartbeat(&mut conn, "graph_arb").await;
+                            continue;
+                        }
+
                         let mut best_candidate: Option<(&MarketTarget, f64, f64, f64, f64, i64, f64, f64)> = None;
                         for market in market_by_id.values() {
                             let Some(book) = books.get(&market.market_id) else {
@@ -329,10 +354,14 @@ impl Strategy for GraphArbStrategy {
 
                             let ask_sum = book.yes.best_ask + book.no.best_ask;
                             let gross_edge = Self::gross_pair_edge(ask_sum);
-                            let modeled_edge = pair_net_edge_after_cost(gross_edge, cost_model);
-                            let net_edge = modeled_edge.min(gross_edge - MIN_BUFFER_FLOOR);
-                            let horizon_penalty = ((seconds_to_expiry as f64) / (max_horizon_secs as f64)) * 0.0025;
-                            let required_edge = MIN_NET_EDGE + horizon_penalty;
+                            let yes_fee = polymarket_taker_fee(book.yes.best_ask, fee_curve_rate());
+                            let no_fee = polymarket_taker_fee(book.no.best_ask, fee_curve_rate());
+                            let slippage_rate = cost_model.slippage_bps_per_side / 10_000.0;
+                            let total_dynamic_cost = yes_fee + no_fee + 2.0 * slippage_rate;
+                            let modeled_edge = gross_edge - total_dynamic_cost;
+                            let net_edge = modeled_edge.min(gross_edge - min_buffer_floor());
+                            let horizon_penalty = ((seconds_to_expiry as f64) / (max_horizon_secs as f64)) * horizon_penalty_coeff();
+                            let required_edge = min_net_edge() + horizon_penalty;
                             if !net_edge.is_finite() || !required_edge.is_finite() {
                                 continue;
                             }
@@ -397,7 +426,7 @@ impl Strategy for GraphArbStrategy {
                                 "net_edge": net_edge,
                                 "required_edge": required_edge,
                                 "seconds_to_expiry": seconds_to_expiry,
-                                "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
+                                "dynamic_cost_rate": polymarket_taker_fee(yes_ask, fee_curve_rate()) + polymarket_taker_fee(no_ask, fee_curve_rate()) + 2.0 * (cost_model.slippage_bps_per_side / 10_000.0),
                                 "active_pending_settlements": pending_settlements.len(),
                             }),
                         );
@@ -478,7 +507,8 @@ impl Strategy for GraphArbStrategy {
                             continue;
                         }
 
-                        if passes_threshold && (now_ms - last_fire_ms) >= ENTRY_COOLDOWN_MS {
+                        let already_in_market = pending_settlements.iter().any(|t| t.market_id == market.market_id);
+                        if passes_threshold && (now_ms - last_fire_ms) >= ENTRY_COOLDOWN_MS && !already_in_market {
                             let available_cash = read_sim_available_cash(&mut conn).await;
                             let risk_cfg = read_risk_config(&mut conn).await;
                             let investment_usd = compute_strategy_bet_size(

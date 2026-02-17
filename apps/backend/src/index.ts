@@ -21,6 +21,7 @@ import type { PolymarketLiveExecutionResult } from './services/PolymarketPreflig
 import { PolymarketSettlementService, settlementEventToExecutionLog } from './services/PolymarketSettlementService';
 import { StrategyTradeRecorder } from './services/StrategyTradeRecorder';
 import { FeatureRegistryRecorder } from './services/FeatureRegistryRecorder';
+import { extractBearerToken } from './middleware/auth';
 import { connectRedis, redisClient, subscriber as redisSubscriber } from './config/redis';
 
 dotenv.config();
@@ -73,655 +74,299 @@ app.get('/health', (_req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-type RiskModel = 'FIXED' | 'PERCENT';
+// ── Types ────────────────────────────────────────────────────────────
+// All shared type definitions live in types/backend-types.ts
+import type {
+    RiskModel, RiskConfig, StrategyTogglePayload, TradingModePayload,
+    SimulationResetPayload, StrategyMetric, StrategyPerformance,
+    RuntimePhase, RuntimeHealth, RuntimeModuleState,
+    StrategyScanState, StrategyQuality,
+    DataIntegrityCategory, DataIntegrityAlertSeverity, DataIntegrityCounters,
+    StrategyDataIntegrity, DataIntegrityAlert, DataIntegrityState,
+    StrategyCostDiagnostics, StrategyTradeSample,
+    WalkForwardSplit, WalkForwardSummary,
+    StrategyGovernanceDecision, GovernanceState,
+    FeatureSnapshot, FeatureRegistrySummary,
+    RegimeLabel, MetaControllerState,
+    MlPipelineStatus, SignalModelArtifact,
+    ModelInferenceEntry, ModelInferenceState,
+    ModelDriftPerStrategy, ModelDriftStatus, ModelDriftState,
+    ModelPredictionTrace,
+    ExecutionTraceEventType, ExecutionTraceEvent, ExecutionTrace,
+    MetricFamily, MetricDirection,
+    StrategySignalSummary, ComparableGroupSummary,
+} from './types/backend-types';
 
-type RiskConfig = {
-    model: RiskModel;
-    value: number;
-    timestamp: number;
-};
+// ── Constants ────────────────────────────────────────────────────────
+// All configuration constants live in config/constants.ts
+import {
+    STRATEGY_IDS, SCANNER_HEARTBEAT_IDS,
+    EXECUTION_TRACE_TTL_MS, EXECUTION_TRACE_MAX_EVENTS,
+    DEFAULT_SIM_BANKROLL, STRATEGY_METRICS_KEY,
+    SIM_BANKROLL_KEY, SIM_LEDGER_CASH_KEY, SIM_LEDGER_RESERVED_KEY,
+    SIM_LEDGER_REALIZED_PNL_KEY, SIM_LEDGER_RESERVED_BY_STRATEGY_PREFIX,
+    SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX,
+    SIM_STRATEGY_CONCENTRATION_CAP_PCT, SIM_FAMILY_CONCENTRATION_CAP_PCT,
+    SIM_GLOBAL_UTILIZATION_CAP_PCT,
+    STRATEGY_RISK_MULTIPLIER_PREFIX, STRATEGY_WEIGHT_FLOOR, STRATEGY_WEIGHT_CAP,
+    STRATEGY_ALLOCATOR_EPSILON, STRATEGY_ALLOCATOR_MIN_SAMPLES,
+    STRATEGY_ALLOCATOR_TARGET_SHARPE, DEFAULT_DISABLED_STRATEGIES,
+    VAULT_ENABLED, VAULT_BANKROLL_CEILING, VAULT_REDIS_KEY,
+    RISK_GUARD_TRAILING_STOP, RISK_GUARD_CONSEC_LOSS_LIMIT,
+    RISK_GUARD_CONSEC_LOSS_COOLDOWN_MS, RISK_GUARD_POST_LOSS_COOLDOWN_MS,
+    RISK_GUARD_ANTI_MARTINGALE_AFTER, RISK_GUARD_ANTI_MARTINGALE_FACTOR,
+    RISK_GUARD_DIRECTION_LIMIT, RISK_GUARD_PROFIT_TAPER_START,
+    RISK_GUARD_PROFIT_TAPER_FLOOR, RISK_GUARD_DAILY_TARGET,
+    RISK_GUARD_DAY_RESET_HOUR_UTC, RISK_GUARD_STRATEGIES,
+    SIGNAL_WINDOW_MS, SIM_RESET_ON_BOOT, RESET_VALIDATION_TRADES_ON_SIM_RESET,
+    CONTROL_PLANE_TOKEN,
+    INTELLIGENCE_GATE_ENABLED, INTELLIGENCE_GATE_MAX_STALENESS_MS,
+    INTELLIGENCE_GATE_MIN_MARGIN, INTELLIGENCE_GATE_CONFIRMATION_WINDOW_MS,
+    INTELLIGENCE_GATE_REQUIRE_PEER_CONFIRMATION, INTELLIGENCE_GATE_STRONG_MARGIN,
+    INTELLIGENCE_GATE_CONFIRMATION_STRATEGIES, INTELLIGENCE_SCAN_RETENTION_MS,
+    DATA_INTEGRITY_ALERT_COOLDOWN_MS, DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_WARN,
+    DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_CRITICAL, DATA_INTEGRITY_ALERT_RING_LIMIT,
+    STRATEGY_SAMPLE_RETENTION,
+    STRATEGY_GOVERNANCE_ENABLED, STRATEGY_GOVERNANCE_AUTOPILOT,
+    STRATEGY_GOVERNANCE_INTERVAL_MS, STRATEGY_GOVERNANCE_MIN_TRADES,
+    STRATEGY_GOVERNANCE_MIN_TRADES_DEMOTE, STRATEGY_GOVERNANCE_ACTION_COOLDOWN_MS,
+    STRATEGY_GOVERNANCE_AUDIT_LIMIT, STRATEGY_GOVERNANCE_WALK_FORWARD_SPLITS,
+    STRATEGY_GOVERNANCE_MIN_TEST_TRADES,
+    FEATURE_REGISTRY_MAX_ROWS, FEATURE_REGISTRY_LABEL_LOOKBACK_MS,
+    META_CONTROLLER_ENABLED, META_CONTROLLER_ADVISORY_ONLY, META_CONTROLLER_REFRESH_DEBOUNCE_MS,
+    MODEL_PROBABILITY_GATE_ENABLED, MODEL_PROBABILITY_GATE_ENFORCE_PAPER,
+    MODEL_PROBABILITY_GATE_ENFORCE_LIVE, LEGACY_BRAIN_LOOP_ENABLED,
+    MODEL_PROBABILITY_GATE_MIN_PROB, MODEL_PROBABILITY_GATE_MAX_STALENESS_MS,
+    MODEL_PROBABILITY_GATE_REQUIRE_MODEL, MODEL_PROBABILITY_GATE_DISABLE_ON_DRIFT,
+    MODEL_PROBABILITY_GATE_DRIFT_DISABLE_MS,
+    MODEL_TRAINER_ENABLED, MODEL_TRAINER_INTERVAL_MS,
+    MODEL_TRAINER_MIN_LABELED_ROWS, MODEL_TRAINER_MIN_NEW_LABELS, MODEL_TRAINER_MAX_ROWS,
+    MODEL_TRAINER_SPLITS, MODEL_TRAINER_PURGE_ROWS, MODEL_TRAINER_EMBARGO_ROWS,
+    MODEL_PREDICTION_TRACE_MAX, MODEL_INFERENCE_MAX_TRACKED_ROWS,
+    BACKEND_APP_ROOT, FEATURE_REGISTRY_EVENT_LOG_PATH,
+    FEATURE_DATASET_MANIFEST_PATH, SIGNAL_MODEL_REPORT_PATH,
+    SIGNAL_MODEL_ARTIFACT_PATH,
+    BUILD_ACTIVE_PHASE, RUNTIME_OFFLINE_MULTIPLIER, RUNTIME_MODULE_CATALOG,
+} from './config/constants';
 
-type StrategyTogglePayload = {
-    id: string;
-    active: boolean;
-    timestamp?: number;
-};
-
-type TradingModePayload = {
-    mode: TradingMode;
-    confirmation?: string;
-    timestamp?: number;
-    live_order_posting_enabled?: boolean;
-};
-
-type SimulationResetPayload = {
-    bankroll?: number;
-    confirmation?: string;
-    timestamp?: number;
-    force_defaults?: boolean;
-};
-
-type StrategyMetric = {
-    pnl: number;
-    daily_trades: number;
-    updated_at: number;
-};
-
-type StrategyPerformance = {
-    sample_count: number;
-    win_count: number;
-    loss_count: number;
-    ema_return: number;
-    downside_ema: number;
-    return_var_ema: number;
-    multiplier: number;
-    updated_at: number;
-};
-
-type RuntimePhase = 'PHASE_1' | 'PHASE_2' | 'PHASE_3';
-type RuntimeHealth = 'ONLINE' | 'DEGRADED' | 'OFFLINE' | 'STANDBY';
-
-type RuntimeModuleState = {
-    id: string;
-    label: string;
-    phase: RuntimePhase;
-    health: RuntimeHealth;
-    expected_interval_ms: number;
-    heartbeat_ms: number;
-    events: number;
-    last_detail: string;
-};
-
-type StrategyScanState = {
-    strategy: string;
-    symbol: string;
-    market_key: string;
-    timestamp: number;
-    passes_threshold: boolean;
-    score: number;
-    threshold: number;
-    reason: string;
-    signal_type: string;
-    unit: string;
-    metric_family: MetricFamily;
-    directionality: MetricDirection;
-    comparable_group: string;
-};
-
-type StrategyQuality = {
-    total_scans: number;
-    pass_scans: number;
-    hold_scans: number;
-    threshold_blocks: number;
-    spread_blocks: number;
-    parity_blocks: number;
-    stale_blocks: number;
-    risk_blocks: number;
-    other_blocks: number;
-    last_reason: string;
-    updated_at: number;
-};
-
-type DataIntegrityCategory = 'threshold' | 'spread' | 'parity' | 'stale' | 'risk' | 'other';
-type DataIntegrityAlertSeverity = 'WARN' | 'CRITICAL';
-
-type DataIntegrityCounters = {
-    threshold: number;
-    spread: number;
-    parity: number;
-    stale: number;
-    risk: number;
-    other: number;
-};
-
-type StrategyDataIntegrity = DataIntegrityCounters & {
-    total_scans: number;
-    hold_scans: number;
-    consecutive_holds: number;
-    last_category: DataIntegrityCategory | null;
-    last_reason: string;
-    updated_at: number;
-    last_alert_at: number;
-};
-
-type DataIntegrityAlert = {
-    id: string;
-    strategy: string;
-    market_key: string;
-    category: DataIntegrityCategory;
-    severity: DataIntegrityAlertSeverity;
-    reason: string;
-    consecutive_holds: number;
-    timestamp: number;
-};
-
-type DataIntegrityState = {
-    totals: DataIntegrityCounters & {
-        total_scans: number;
-        hold_scans: number;
-    };
-    strategies: Record<string, StrategyDataIntegrity>;
-    recent_alerts: DataIntegrityAlert[];
-    updated_at: number;
-};
-
-type StrategyCostDiagnostics = {
-    trades: number;
-    notional_sum: number;
-    net_pnl_sum: number;
-    gross_return_sum: number;
-    gross_return_samples: number;
-    net_return_sum: number;
-    cost_drag_sum: number;
-    cost_drag_samples: number;
-    estimated_cost_usd_sum: number;
-    missing_cost_fields: number;
-    avg_cost_drag_bps: number;
-    avg_net_return_bps: number;
-    avg_gross_return_bps: number;
-    updated_at: number;
-};
-
-type StrategyTradeSample = {
-    strategy: string;
-    timestamp: number;
-    pnl: number;
-    notional: number;
-    net_return: number;
-    gross_return: number | null;
-    cost_drag: number | null;
-    reason: string;
-};
-
-type WalkForwardSplit = {
-    split: number;
-    train_trades: number;
-    test_trades: number;
-    oos_mean_return: number;
-    oos_sharpe: number;
-    oos_total_pnl: number;
-    oos_max_drawdown: number;
-    oos_win_rate: number;
-};
-
-type WalkForwardSummary = {
-    eligible: boolean;
-    splits: WalkForwardSplit[];
-    oos_splits: number;
-    pass_splits: number;
-    pass_rate_pct: number;
-    avg_oos_return: number;
-    avg_oos_sharpe: number;
-    worst_oos_drawdown: number;
-};
-
-type StrategyGovernanceDecision = {
-    strategy: string;
-    action: 'PROMOTE' | 'HOLD' | 'DEMOTE_DISABLE';
-    reason: string;
-    trades: number;
-    net_pnl: number;
-    avg_return: number;
-    sharpe: number;
-    win_rate_pct: number;
-    cost_drag_bps: number;
-    walk_forward: WalkForwardSummary;
-    confidence: number;
-    score: number;
-    timestamp: number;
-    autopilot_applied: boolean;
-    multiplier_before: number;
-    multiplier_after: number;
-    enabled_before: boolean;
-    enabled_after: boolean;
-};
-
-type GovernanceState = {
-    autopilot_enabled: boolean;
-    autopilot_effective: boolean;
-    trading_mode: TradingMode;
-    interval_ms: number;
-    updated_at: number;
-    decisions: Record<string, StrategyGovernanceDecision>;
-    audit: StrategyGovernanceDecision[];
-};
-
-type FeatureSnapshot = {
-    id: string;
-    strategy: string;
-    market_key: string;
-    timestamp: number;
-    signal_type: string;
-    metric_family: MetricFamily;
-    features: Record<string, number>;
-    label_net_return: number | null;
-    label_pnl: number | null;
-    label_timestamp: number | null;
-    label_source: string | null;
-};
-
-type FeatureRegistrySummary = {
-    rows: number;
-    labeled_rows: number;
-    unlabeled_rows: number;
-    leakage_violations: number;
-    by_strategy: Record<string, {
-        rows: number;
-        labeled_rows: number;
-        unlabeled_rows: number;
-    }>;
-    latest_rows: FeatureSnapshot[];
-    updated_at: number;
-};
-
-type RegimeLabel = 'TREND' | 'MEAN_REVERT' | 'LOW_LIQUIDITY' | 'CHOP' | 'UNKNOWN';
-
-type MetaControllerState = {
-    enabled: boolean;
-    advisory_only: boolean;
-    regime: RegimeLabel;
-    confidence: number;
-    signal_count: number;
-    pass_rate_pct: number;
-    mean_abs_normalized_margin: number;
-    family_scores: Record<string, number>;
-    allowed_families: string[];
-    strategy_overrides: Record<string, {
-        family: string;
-        recommended_multiplier: number;
-        rationale: string;
-    }>;
-    updated_at: number;
-};
-
-type MlPipelineStatus = {
-    feature_event_log_path: string;
-    feature_event_log_rows: number;
-    dataset_manifest_path: string;
-    dataset_rows: number;
-    dataset_labeled_rows: number;
-    dataset_feature_count: number;
-    dataset_leakage_violations: number;
-    model_report_path: string;
-    model_eligible: boolean;
-    model_rows: number;
-    model_feature_count: number;
-    model_cv_folds: number;
-    model_reason: string | null;
-    updated_at: number;
-};
-
-type SignalModelArtifact = {
-    eligible: boolean;
-    generated_at: string | null;
-    feature_columns: string[];
-    weights: number[];
-    bias: number;
-    normalization: {
-        means: number[];
-        stds: number[];
-    };
-};
-
-type ModelInferenceEntry = {
-    strategy: string;
-    market_key: string;
-    timestamp: number;
-    probability_positive: number | null;
-    probability_gate: number;
-    pass_probability_gate: boolean;
-    model_loaded: boolean;
-    reason: string;
-    feature_count: number;
-    model_generated_at: string | null;
-};
-
-type ModelInferenceState = {
-    model_path: string;
-    model_loaded: boolean;
-    model_generated_at: string | null;
-    tracked_rows: number;
-    latest: Record<string, ModelInferenceEntry>;
-    updated_at: number;
-};
-
-type ModelDriftPerStrategy = {
-    sample_count: number;
-    brier_ema: number;
-    logloss_ema: number;
-    accuracy_pct: number;
-    updated_at: number;
-};
-
-type ModelDriftStatus = 'HEALTHY' | 'WARN' | 'CRITICAL';
-
-type ModelDriftState = {
-    status: ModelDriftStatus;
-    sample_count: number;
-    brier_ema: number;
-    logloss_ema: number;
-    calibration_error_ema: number;
-    accuracy_pct: number;
-    gate_enabled: boolean;
-    gate_enforcing: boolean;
-    gate_disabled_until: number;
-    issues: string[];
-    by_strategy: Record<string, ModelDriftPerStrategy>;
-    updated_at: number;
-};
-
-type ModelPredictionTrace = {
-    row_id: string;
-    strategy: string;
-    market_key: string;
-    timestamp: number;
-    probability_positive: number | null;
-    probability_gate: number;
-    model_loaded: boolean;
-};
-
-type ExecutionTraceEventType =
-    | 'EXECUTION_EVENT'
-    | 'INTELLIGENCE_GATE'
-    | 'MODEL_GATE'
-    | 'PREFLIGHT'
-    | 'LIVE_EXECUTION'
-    | 'PNL';
-
-type ExecutionTraceEvent = {
-    type: ExecutionTraceEventType;
-    timestamp: number;
-    payload: unknown;
-};
-
-type ExecutionTrace = {
-    execution_id: string;
-    strategy: string | null;
-    market_key: string | null;
-    created_at: number;
-    updated_at: number;
-    scan_snapshot: StrategyScanState | null;
-    events: ExecutionTraceEvent[];
-};
-
-const STRATEGY_IDS = [
-    'BTC_5M',
-    'BTC_15M',
-    'ETH_15M',
-    'SOL_15M',
-    'CEX_SNIPER',
-    'SYNDICATE',
-    'ATOMIC_ARB',
-    'OBI_SCALPER',
-    'GRAPH_ARB',
-    'CONVERGENCE_CARRY',
-    'MAKER_MM',
-];
-
-const EXECUTION_TRACE_TTL_MS = Math.max(60_000, Number(process.env.EXECUTION_TRACE_TTL_MS || String(6 * 60 * 60 * 1000)));
-const EXECUTION_TRACE_MAX_EVENTS = Math.max(10, Number(process.env.EXECUTION_TRACE_MAX_EVENTS || '80'));
+// Runtime state (not extractable — mutable per-process)
 const executionTraces = new Map<string, ExecutionTrace>();
-const SCANNER_HEARTBEAT_IDS = [
-    'scanner_swarms',
-    'btc_5m',
-    'btc_15m',
-    'eth_15m',
-    'sol_15m',
-    'cex_arb',
-    'copy_bot',
-    'atomic_arb',
-    'obi_scalper',
-    'graph_arb',
-    'convergence_carry',
-    'maker_mm',
-];
-const DEFAULT_SIM_BANKROLL = 1000;
-const STRATEGY_METRICS_KEY = 'system:strategy_metrics:paper:v1';
-const SIM_BANKROLL_KEY = 'sim_bankroll';
-const SIM_LEDGER_CASH_KEY = 'sim_ledger:cash';
-const SIM_LEDGER_RESERVED_KEY = 'sim_ledger:reserved';
-const SIM_LEDGER_REALIZED_PNL_KEY = 'sim_ledger:realized_pnl';
-const SIM_LEDGER_RESERVED_BY_STRATEGY_PREFIX = 'sim_ledger:reserved:strategy:';
-const SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX = 'sim_ledger:reserved:family:';
-const SIM_STRATEGY_CONCENTRATION_CAP_PCT = Math.min(
-    1,
-    Math.max(0.05, Number(process.env.SIM_STRATEGY_CONCENTRATION_CAP_PCT || '0.35')),
-);
-const SIM_FAMILY_CONCENTRATION_CAP_PCT = Math.min(
-    1,
-    Math.max(0.10, Number(process.env.SIM_FAMILY_CONCENTRATION_CAP_PCT || '0.60')),
-);
-const SIM_GLOBAL_UTILIZATION_CAP_PCT = Math.min(
-    1,
-    Math.max(0.10, Number(process.env.SIM_GLOBAL_UTILIZATION_CAP_PCT || '0.90')),
-);
-const STRATEGY_RISK_MULTIPLIER_PREFIX = 'strategy:risk_multiplier:';
-const STRATEGY_WEIGHT_FLOOR = 0.25;
-const STRATEGY_WEIGHT_CAP = Math.min(3.0, Math.max(1.0, Number(process.env.STRATEGY_WEIGHT_CAP || '2.0')));
-const STRATEGY_ALLOCATOR_EPSILON = 1e-6;
-const STRATEGY_ALLOCATOR_MIN_SAMPLES = Math.max(4, Number(process.env.STRATEGY_ALLOCATOR_MIN_SAMPLES || '30'));
-const STRATEGY_ALLOCATOR_TARGET_SHARPE = Number(process.env.STRATEGY_ALLOCATOR_TARGET_SHARPE || '0.55');
-const DEFAULT_DISABLED_STRATEGIES = new Set(
-    (process.env.DEFAULT_DISABLED_STRATEGIES || 'SOL_15M,SYNDICATE')
-        .split(',')
-        .map((value) => value.trim().toUpperCase())
-        .filter((value) => value.length > 0 && STRATEGY_IDS.includes(value)),
-);
-const SIGNAL_WINDOW_MS = 30_000;
-const SIM_RESET_ON_BOOT = process.env.SIM_RESET_ON_BOOT === 'true';
-const RESET_VALIDATION_TRADES_ON_SIM_RESET = process.env.RESET_VALIDATION_TRADES_ON_SIM_RESET !== 'false';
-const CONTROL_PLANE_TOKEN = (process.env.CONTROL_PLANE_TOKEN || '').trim();
-const INTELLIGENCE_GATE_ENABLED = process.env.INTELLIGENCE_GATE_ENABLED !== 'false';
-const INTELLIGENCE_GATE_MAX_STALENESS_MS = Math.max(500, Number(process.env.INTELLIGENCE_GATE_MAX_STALENESS_MS || '3000'));
-const INTELLIGENCE_GATE_MIN_MARGIN = Number(process.env.INTELLIGENCE_GATE_MIN_MARGIN || '0');
-const INTELLIGENCE_GATE_CONFIRMATION_WINDOW_MS = Math.max(
-    INTELLIGENCE_GATE_MAX_STALENESS_MS,
-    Number(process.env.INTELLIGENCE_GATE_CONFIRMATION_WINDOW_MS || '5000'),
-);
-const INTELLIGENCE_GATE_REQUIRE_PEER_CONFIRMATION = process.env.INTELLIGENCE_GATE_REQUIRE_PEER_CONFIRMATION !== 'false';
-const INTELLIGENCE_GATE_STRONG_MARGIN = Math.max(0, Number(process.env.INTELLIGENCE_GATE_STRONG_MARGIN || '0.01'));
-const INTELLIGENCE_GATE_CONFIRMATION_STRATEGIES = new Set([
-    'BTC_5M',
-    'BTC_15M',
-    'ETH_15M',
-    'SOL_15M',
-    'CEX_SNIPER',
-    'OBI_SCALPER',
-    'SYNDICATE',
-    'CONVERGENCE_CARRY',
-    'GRAPH_ARB',
-    'MAKER_MM',
-]);
-const INTELLIGENCE_SCAN_RETENTION_MS = Math.max(60_000, INTELLIGENCE_GATE_CONFIRMATION_WINDOW_MS * 20);
-const DATA_INTEGRITY_ALERT_COOLDOWN_MS = Math.max(10_000, Number(process.env.DATA_INTEGRITY_ALERT_COOLDOWN_MS || '60000'));
-const DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_WARN = Math.max(2, Number(process.env.DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_WARN || '4'));
-const DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_CRITICAL = Math.max(
-    DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_WARN + 1,
-    Number(process.env.DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_CRITICAL || '8'),
-);
-const DATA_INTEGRITY_ALERT_RING_LIMIT = Math.max(10, Number(process.env.DATA_INTEGRITY_ALERT_RING_LIMIT || '120'));
-const STRATEGY_SAMPLE_RETENTION = Math.max(100, Number(process.env.STRATEGY_SAMPLE_RETENTION || '2000'));
-const STRATEGY_GOVERNANCE_ENABLED = process.env.STRATEGY_GOVERNANCE_ENABLED !== 'false';
-const STRATEGY_GOVERNANCE_AUTOPILOT = process.env.STRATEGY_GOVERNANCE_AUTOPILOT === 'true';
-const STRATEGY_GOVERNANCE_INTERVAL_MS = Math.max(10_000, Number(process.env.STRATEGY_GOVERNANCE_INTERVAL_MS || '60000'));
-const STRATEGY_GOVERNANCE_MIN_TRADES = Math.max(10, Number(process.env.STRATEGY_GOVERNANCE_MIN_TRADES || '24'));
-const STRATEGY_GOVERNANCE_MIN_TRADES_DEMOTE = Math.max(
-    STRATEGY_GOVERNANCE_MIN_TRADES,
-    Number(process.env.STRATEGY_GOVERNANCE_MIN_TRADES_DEMOTE || '36'),
-);
-const STRATEGY_GOVERNANCE_ACTION_COOLDOWN_MS = Math.max(
-    STRATEGY_GOVERNANCE_INTERVAL_MS,
-    Number(process.env.STRATEGY_GOVERNANCE_ACTION_COOLDOWN_MS || '180000'),
-);
-const STRATEGY_GOVERNANCE_AUDIT_LIMIT = Math.max(30, Number(process.env.STRATEGY_GOVERNANCE_AUDIT_LIMIT || '250'));
-const STRATEGY_GOVERNANCE_WALK_FORWARD_SPLITS = Math.max(
-    2,
-    Number(process.env.STRATEGY_GOVERNANCE_WALK_FORWARD_SPLITS || '3'),
-);
-const STRATEGY_GOVERNANCE_MIN_TEST_TRADES = Math.max(
-    6,
-    Number(process.env.STRATEGY_GOVERNANCE_MIN_TEST_TRADES || '8'),
-);
-const FEATURE_REGISTRY_MAX_ROWS = Math.max(1000, Number(process.env.FEATURE_REGISTRY_MAX_ROWS || '12000'));
-const FEATURE_REGISTRY_LABEL_LOOKBACK_MS = Math.max(
-    60_000,
-    Number(process.env.FEATURE_REGISTRY_LABEL_LOOKBACK_MS || '1800000'),
-);
-const META_CONTROLLER_ENABLED = process.env.META_CONTROLLER_ENABLED !== 'false';
-const META_CONTROLLER_ADVISORY_ONLY = process.env.META_CONTROLLER_ADVISORY_ONLY !== 'false';
-const MODEL_PROBABILITY_GATE_ENABLED = process.env.MODEL_PROBABILITY_GATE_ENABLED !== 'false';
-const MODEL_PROBABILITY_GATE_ENFORCE_PAPER = process.env.MODEL_PROBABILITY_GATE_ENFORCE_PAPER !== 'false';
-const MODEL_PROBABILITY_GATE_ENFORCE_LIVE = process.env.MODEL_PROBABILITY_GATE_ENFORCE_LIVE === 'true';
-const MODEL_PROBABILITY_GATE_MIN_PROB = Math.min(
-    0.95,
-    Math.max(0.50, Number(process.env.MODEL_PROBABILITY_GATE_MIN_PROB || '0.55')),
-);
-const MODEL_PROBABILITY_GATE_MAX_STALENESS_MS = Math.max(
-    500,
-    Number(process.env.MODEL_PROBABILITY_GATE_MAX_STALENESS_MS || '5000'),
-);
-const MODEL_PROBABILITY_GATE_REQUIRE_MODEL = process.env.MODEL_PROBABILITY_GATE_REQUIRE_MODEL === 'true';
-const MODEL_PROBABILITY_GATE_DISABLE_ON_DRIFT = process.env.MODEL_PROBABILITY_GATE_DISABLE_ON_DRIFT !== 'false';
-const MODEL_PROBABILITY_GATE_DRIFT_DISABLE_MS = Math.max(
-    60_000,
-    Number(process.env.MODEL_PROBABILITY_GATE_DRIFT_DISABLE_MS || '900000'),
-);
-const MODEL_TRAINER_ENABLED = process.env.MODEL_TRAINER_ENABLED !== 'false';
-const MODEL_TRAINER_INTERVAL_MS = Math.max(30_000, Number(process.env.MODEL_TRAINER_INTERVAL_MS || '120000'));
-const MODEL_TRAINER_MIN_LABELED_ROWS = Math.max(40, Number(process.env.MODEL_TRAINER_MIN_LABELED_ROWS || '80'));
-const MODEL_TRAINER_MIN_NEW_LABELS = Math.max(1, Number(process.env.MODEL_TRAINER_MIN_NEW_LABELS || '8'));
-const MODEL_TRAINER_SPLITS = Math.max(3, Number(process.env.MODEL_TRAINER_SPLITS || '5'));
-const MODEL_TRAINER_PURGE_ROWS = Math.max(8, Number(process.env.MODEL_TRAINER_PURGE_ROWS || '24'));
-const MODEL_TRAINER_EMBARGO_ROWS = Math.max(8, Number(process.env.MODEL_TRAINER_EMBARGO_ROWS || '24'));
-const MODEL_PREDICTION_TRACE_MAX = Math.max(5_000, Number(process.env.MODEL_PREDICTION_TRACE_MAX || '100000'));
-const BACKEND_APP_ROOT = path.resolve(__dirname, '..');
-const FEATURE_REGISTRY_EVENT_LOG_PATH = path.resolve(
-    BACKEND_APP_ROOT,
-    process.env.FEATURE_REGISTRY_EVENT_LOG_PATH || 'logs/feature_registry_events.jsonl',
-);
-const FEATURE_DATASET_MANIFEST_PATH = path.resolve(
-    BACKEND_APP_ROOT,
-    process.env.FEATURE_DATASET_MANIFEST_PATH || '../../reports/feature_dataset_manifest.json',
-);
-const SIGNAL_MODEL_REPORT_PATH = path.resolve(
-    BACKEND_APP_ROOT,
-    process.env.SIGNAL_MODEL_REPORT_PATH || '../../reports/models/signal_model_report.json',
-);
-const SIGNAL_MODEL_ARTIFACT_PATH = path.resolve(
-    BACKEND_APP_ROOT,
-    process.env.SIGNAL_MODEL_ARTIFACT_PATH || '../../reports/models/signal_model_latest.json',
-);
-const BUILD_ACTIVE_PHASE: RuntimePhase = 'PHASE_1';
-const RUNTIME_OFFLINE_MULTIPLIER = 3;
-const RUNTIME_MODULE_CATALOG: Array<Omit<RuntimeModuleState, 'heartbeat_ms' | 'events' | 'last_detail'>> = [
-    {
-        id: 'MARKET_DATA_PIPELINE',
-        label: 'Market Data Pipeline',
-        phase: 'PHASE_1',
-        health: 'STANDBY',
-        expected_interval_ms: 5_000,
-    },
-    {
-        id: 'SCAN_INGEST',
-        label: 'Scanner Ingest',
-        phase: 'PHASE_1',
-        health: 'STANDBY',
-        expected_interval_ms: 5_000,
-    },
-    {
-        id: 'INTELLIGENCE_GATE',
-        label: 'Intelligence Gate',
-        phase: 'PHASE_1',
-        health: 'STANDBY',
-        expected_interval_ms: 10_000,
-    },
-    {
-        id: 'RISK_ALLOCATOR',
-        label: 'Risk Allocator',
-        phase: 'PHASE_1',
-        health: 'STANDBY',
-        expected_interval_ms: 0,
-    },
-    {
-        id: 'PNL_LEDGER',
-        label: 'PnL Ledger',
-        phase: 'PHASE_1',
-        health: 'STANDBY',
-        expected_interval_ms: 0,
-    },
-    {
-        id: 'SETTLEMENT_ENGINE',
-        label: 'Settlement Engine',
-        phase: 'PHASE_1',
-        health: 'STANDBY',
-        expected_interval_ms: 60_000,
-    },
-    {
-        id: 'EXECUTION_PREFLIGHT',
-        label: 'Execution Preflight',
-        phase: 'PHASE_1',
-        health: 'STANDBY',
-        expected_interval_ms: 10_000,
-    },
-    {
-        id: 'TRADING_MODE_GUARD',
-        label: 'Trading Mode Guard',
-        phase: 'PHASE_1',
-        health: 'ONLINE',
-        expected_interval_ms: 0,
-    },
-    {
-        id: 'FEATURE_REGISTRY',
-        label: 'Feature Registry',
-        phase: 'PHASE_2',
-        health: 'STANDBY',
-        expected_interval_ms: 0,
-    },
-    {
-        id: 'ML_TRAINER',
-        label: 'ML Trainer',
-        phase: 'PHASE_2',
-        health: 'STANDBY',
-        expected_interval_ms: 0,
-    },
-    {
-        id: 'MODEL_INFERENCE',
-        label: 'Model Inference',
-        phase: 'PHASE_2',
-        health: 'STANDBY',
-        expected_interval_ms: 0,
-    },
-    {
-        id: 'DRIFT_MONITOR',
-        label: 'Drift Monitor',
-        phase: 'PHASE_2',
-        health: 'STANDBY',
-        expected_interval_ms: 0,
-    },
-    {
-        id: 'ENSEMBLE_ROUTER',
-        label: 'Ensemble Router',
-        phase: 'PHASE_3',
-        health: 'STANDBY',
-        expected_interval_ms: 0,
-    },
-    {
-        id: 'REGIME_ENGINE',
-        label: 'Regime Engine',
-        phase: 'PHASE_3',
-        health: 'STANDBY',
-        expected_interval_ms: 0,
-    },
-    {
-        id: 'UNCERTAINTY_GATE',
-        label: 'Uncertainty Gate',
-        phase: 'PHASE_3',
-        health: 'STANDBY',
-        expected_interval_ms: 0,
-    },
-];
 
 const strategyStatus: Record<string, boolean> = Object.fromEntries(STRATEGY_IDS.map((id) => [id, true]));
+
+// ── Risk Guard state ─────────────────────────────────────────────────
+interface RiskGuardState {
+    cumPnl: number;
+    peakPnl: number;
+    consecutiveLosses: number;
+    lastLossAt: number;
+    lastDirection: string | null;
+    consecutiveSameDirLosses: number;
+    pausedUntil: number;
+    dayStartMs: number;
+}
+const riskGuardState: Record<string, RiskGuardState> = {};
+
+function computeDayStartMs(): number {
+    // Trading day boundary: configurable hour in UTC (default 8 = midnight PST).
+    // E.g. RISK_GUARD_DAY_RESET_HOUR_UTC=8 means the "trading day" runs 08:00 UTC → 08:00 UTC.
+    const now = new Date();
+    const boundary = new Date(now);
+    boundary.setUTCHours(RISK_GUARD_DAY_RESET_HOUR_UTC, 0, 0, 0);
+    // If we haven't passed today's boundary yet, the day started at yesterday's boundary.
+    if (now.getTime() < boundary.getTime()) {
+        boundary.setUTCDate(boundary.getUTCDate() - 1);
+    }
+    return boundary.getTime();
+}
+
+function nextDayBoundaryMs(): number {
+    const dayStart = computeDayStartMs();
+    return dayStart + 86_400_000;
+}
+
+function ensureRiskGuardState(strategyId: string): RiskGuardState {
+    const dayStart = computeDayStartMs();
+    if (!riskGuardState[strategyId] || riskGuardState[strategyId].dayStartMs < dayStart) {
+        riskGuardState[strategyId] = {
+            cumPnl: 0, peakPnl: 0,
+            consecutiveLosses: 0, lastLossAt: 0,
+            lastDirection: null, consecutiveSameDirLosses: 0,
+            pausedUntil: 0, dayStartMs: dayStart,
+        };
+    }
+    return riskGuardState[strategyId];
+}
+
+async function processRiskGuard(strategyId: string, pnl: number, parsed: Record<string, unknown>): Promise<void> {
+    if (!RISK_GUARD_STRATEGIES.has(strategyId)) return;
+
+    const state = ensureRiskGuardState(strategyId);
+    const now = Date.now();
+    const direction = typeof parsed?.side === 'string' ? parsed.side : null;
+    const isLoss = pnl < 0;
+
+    // ── Update tracking ──
+    state.cumPnl += pnl;
+    if (state.cumPnl > state.peakPnl) state.peakPnl = state.cumPnl;
+
+    if (isLoss) {
+        state.consecutiveLosses += 1;
+        state.lastLossAt = now;
+        if (direction && direction === state.lastDirection) {
+            state.consecutiveSameDirLosses += 1;
+        } else {
+            state.consecutiveSameDirLosses = 1;
+        }
+    } else {
+        state.consecutiveLosses = 0;
+        state.consecutiveSameDirLosses = 0;
+    }
+    state.lastDirection = direction;
+
+    // ── Guard 5: Size factor (anti-martingale + profit taper) ──
+    let sizeFactor = 1.0;
+
+    // Anti-martingale: halve after consecutive losses
+    if (state.consecutiveLosses >= RISK_GUARD_ANTI_MARTINGALE_AFTER) {
+        const reductions = state.consecutiveLosses - RISK_GUARD_ANTI_MARTINGALE_AFTER + 1;
+        sizeFactor = Math.min(sizeFactor, Math.max(0.1, Math.pow(RISK_GUARD_ANTI_MARTINGALE_FACTOR, reductions)));
+    }
+
+    // Profit taper: reduce sizing after big profit run to prevent give-back
+    if (RISK_GUARD_PROFIT_TAPER_START > 0 && state.cumPnl > RISK_GUARD_PROFIT_TAPER_START) {
+        const excess = state.cumPnl - RISK_GUARD_PROFIT_TAPER_START;
+        const taperFactor = Math.max(RISK_GUARD_PROFIT_TAPER_FLOOR, 1.0 - (excess / (RISK_GUARD_PROFIT_TAPER_START * 2)));
+        sizeFactor = Math.min(sizeFactor, taperFactor);
+    }
+
+    if (sizeFactor < 1.0) {
+        await redisClient.set(`risk_guard:size_factor:${strategyId}`, String(sizeFactor));
+        await redisClient.expire(`risk_guard:size_factor:${strategyId}`, 7200);
+    } else {
+        await redisClient.del(`risk_guard:size_factor:${strategyId}`);
+    }
+
+    // ── Guard 4: Post-loss cooldown (set Redis key for scanner) ──
+    if (isLoss && RISK_GUARD_POST_LOSS_COOLDOWN_MS > 0) {
+        const cooldownUntil = now + RISK_GUARD_POST_LOSS_COOLDOWN_MS;
+        await redisClient.set(`risk_guard:cooldown:${strategyId}`, String(cooldownUntil));
+        await redisClient.expire(`risk_guard:cooldown:${strategyId}`, Math.ceil(RISK_GUARD_POST_LOSS_COOLDOWN_MS / 1000) + 60);
+    }
+
+    // ── Check pause triggers (most severe first) ──
+    let shouldPause = false;
+    let pauseReason = '';
+    let pauseDurationMs = 0;
+
+    // Guard 1: Daily trailing stop
+    if (RISK_GUARD_TRAILING_STOP > 0) {
+        const drawdown = state.peakPnl - state.cumPnl;
+        if (drawdown >= RISK_GUARD_TRAILING_STOP) {
+            shouldPause = true;
+            pauseReason = `trailing_stop: drawdown $${drawdown.toFixed(2)} >= $${RISK_GUARD_TRAILING_STOP}`;
+            pauseDurationMs = nextDayBoundaryMs() - now;
+        }
+    }
+
+    // Guard 8: Daily profit target — once you've made enough, stop trading.
+    // Prevents giving back a great day by over-trading into a regime change.
+    if (!shouldPause && RISK_GUARD_DAILY_TARGET > 0 && state.cumPnl >= RISK_GUARD_DAILY_TARGET) {
+        shouldPause = true;
+        pauseReason = `daily_target: cumPnl $${state.cumPnl.toFixed(2)} >= target $${RISK_GUARD_DAILY_TARGET}`;
+        pauseDurationMs = nextDayBoundaryMs() - now;
+    }
+
+    // Guard 2: Consecutive loss circuit breaker
+    if (!shouldPause && state.consecutiveLosses >= RISK_GUARD_CONSEC_LOSS_LIMIT) {
+        shouldPause = true;
+        pauseReason = `consecutive_losses: ${state.consecutiveLosses} >= ${RISK_GUARD_CONSEC_LOSS_LIMIT}`;
+        pauseDurationMs = RISK_GUARD_CONSEC_LOSS_COOLDOWN_MS;
+    }
+
+    // Guard 7: Directional diversity
+    if (!shouldPause && state.consecutiveSameDirLosses >= RISK_GUARD_DIRECTION_LIMIT) {
+        shouldPause = true;
+        pauseReason = `direction_lock: ${state.consecutiveSameDirLosses} same-dir losses (${direction}) >= ${RISK_GUARD_DIRECTION_LIMIT}`;
+        pauseDurationMs = RISK_GUARD_POST_LOSS_COOLDOWN_MS;
+    }
+
+    if (shouldPause && now < state.pausedUntil) {
+        // Already paused from a prior trigger, skip re-setting
+        return;
+    }
+
+    if (shouldPause) {
+        state.pausedUntil = now + pauseDurationMs;
+        await redisClient.set(`strategy:enabled:${strategyId}`, '0');
+        await redisClient.expire(`strategy:enabled:${strategyId}`, 86400); // 24 hours
+        strategyStatus[strategyId] = false;
+        io.emit('strategy_status_update', strategyStatus);
+        console.info(`[RiskGuard] PAUSED ${strategyId}: ${pauseReason} | resume at ${new Date(state.pausedUntil).toISOString()}`);
+
+        // Schedule auto-resume (if not trailing stop to EOD)
+        if (pauseDurationMs > 0 && pauseDurationMs < 86_400_000) {
+            setTimeout(async () => {
+                try {
+                    const s = ensureRiskGuardState(strategyId);
+                    if (s.pausedUntil <= Date.now()) {
+                        await redisClient.set(`strategy:enabled:${strategyId}`, '1');
+                        await redisClient.expire(`strategy:enabled:${strategyId}`, 86400); // 24 hours
+                        strategyStatus[strategyId] = true;
+                        io.emit('strategy_status_update', strategyStatus);
+                        console.info(`[RiskGuard] RESUMED ${strategyId} after cooldown`);
+                    }
+                } catch (err) {
+                    console.error(`[RiskGuard] Error resuming ${strategyId}:`, err);
+                }
+            }, pauseDurationMs);
+        }
+    }
+
+    io.emit('risk_guard_update', { strategy: strategyId, ...state });
+
+    // Persist risk guard state to Redis so it survives restarts.
+    await redisClient.set(`risk_guard:state:${strategyId}`, JSON.stringify(state));
+    await redisClient.expire(`risk_guard:state:${strategyId}`, 72 * 60 * 60); // 72 hours
+}
+
+// ── Profit Vault: sweep excess cash into protected vault ─────────────
+async function sweepProfitsToVault(): Promise<void> {
+    if (!VAULT_ENABLED || VAULT_BANKROLL_CEILING <= 0) return;
+    try {
+        const cash = parseFloat(await redisClient.get('sim_ledger:cash') || '0');
+        if (cash <= VAULT_BANKROLL_CEILING) return;
+        const excess = Math.round((cash - VAULT_BANKROLL_CEILING) * 100) / 100;
+        if (excess <= 0.01) return;
+
+        await redisClient.incrByFloat('sim_ledger:cash', -excess);
+        await redisClient.incrByFloat('sim_bankroll', -excess);
+        await redisClient.incrByFloat(VAULT_REDIS_KEY, excess);
+
+        const vault = parseFloat(await redisClient.get(VAULT_REDIS_KEY) || '0');
+        console.info(`[Vault] Swept $${excess.toFixed(2)} to vault (total locked: $${vault.toFixed(2)})`);
+        io.emit('vault_update', { swept: excess, vault: Math.round(vault * 100) / 100, ceiling: VAULT_BANKROLL_CEILING });
+    } catch (err) {
+        console.error('[Vault] sweep error:', err);
+    }
+}
+
+// Load risk guard state from Redis on boot.
+async function loadRiskGuardStates(): Promise<void> {
+    for (const id of RISK_GUARD_STRATEGIES) {
+        try {
+            const raw = await redisClient.get(`risk_guard:state:${id}`);
+            if (!raw) continue;
+            const saved = JSON.parse(raw) as RiskGuardState;
+            const dayStart = computeDayStartMs();
+            if (saved.dayStartMs >= dayStart) {
+                riskGuardState[id] = saved;
+                console.info(`[RiskGuard] Restored state for ${id}: cumPnl=$${saved.cumPnl.toFixed(2)}, peak=$${saved.peakPnl.toFixed(2)}, consec=${saved.consecutiveLosses}`);
+            }
+        } catch { /* ignore corrupt state */ }
+    }
+}
+
 const strategyMetrics: Record<string, StrategyMetric> = Object.fromEntries(
     STRATEGY_IDS.map((id) => [id, { pnl: 0, daily_trades: 0, updated_at: 0 }]),
 );
@@ -841,8 +486,14 @@ let ledgerHealthState: LedgerHealthState = {
     top_family_exposure: [],
 };
 const featureRegistryRows: FeatureSnapshot[] = [];
+const featureRegistryIndexById = new Map<string, number>();
+const featureRegistryCountsByStrategy: Record<string, { rows: number; labeled_rows: number; unlabeled_rows: number }> = {};
+let featureRegistryLabeledRows = 0;
 let featureRegistryLeakageViolations = 0;
 let featureRegistryUpdatedAt = 0;
+const FEATURE_REGISTRY_TRIM_BATCH_ROWS = Math.max(200, Math.floor(FEATURE_REGISTRY_MAX_ROWS * 0.10));
+const FEATURE_REGISTRY_TRIM_TRIGGER_ROWS = FEATURE_REGISTRY_MAX_ROWS + FEATURE_REGISTRY_TRIM_BATCH_ROWS;
+const FEATURE_REGISTRY_TRIM_TARGET_ROWS = Math.max(1_000, FEATURE_REGISTRY_MAX_ROWS - FEATURE_REGISTRY_TRIM_BATCH_ROWS);
 let metaControllerState: MetaControllerState = {
     enabled: META_CONTROLLER_ENABLED,
     advisory_only: META_CONTROLLER_ADVISORY_ONLY,
@@ -881,6 +532,12 @@ let modelInferenceState: ModelInferenceState = {
     latest: {},
     updated_at: 0,
 };
+const modelInferenceTimestampByKey = new Map<string, number>();
+const MODEL_INFERENCE_TRIM_BATCH_ROWS = Math.max(
+    100,
+    Math.floor(MODEL_INFERENCE_MAX_TRACKED_ROWS * 0.10),
+);
+const MODEL_INFERENCE_TRIM_TRIGGER_ROWS = MODEL_INFERENCE_MAX_TRACKED_ROWS + MODEL_INFERENCE_TRIM_BATCH_ROWS;
 let modelDriftState: ModelDriftState = {
     status: 'HEALTHY',
     sample_count: 0,
@@ -899,6 +556,10 @@ const modelPredictionByRowId = new Map<string, ModelPredictionTrace>();
 let modelTrainerInFlight = false;
 let modelTrainerLastLabeledRows = 0;
 let governanceCycleInFlight = false;
+let lastScannerParseErrorLogMs = 0;
+let metaControllerRefreshTimer: NodeJS.Timeout | null = null;
+let metaControllerRefreshScheduled = false;
+let metaControllerRefreshInFlight = false;
 const heartbeats: Record<string, number> = {};
 const latestStrategyScans = new Map<string, StrategyScanState>();
 const latestStrategyScansByMarket = new Map<string, StrategyScanState>();
@@ -921,23 +582,6 @@ const polymarketPreflight = new PolymarketPreflightService();
 const settlementService = new PolymarketSettlementService(redisClient);
 const strategyTradeRecorder = new StrategyTradeRecorder();
 const featureRegistryRecorder = new FeatureRegistryRecorder();
-
-function extractBearerToken(raw: unknown): string | null {
-    if (typeof raw !== 'string') {
-        return null;
-    }
-
-    const trimmed = raw.trim();
-    if (!trimmed) {
-        return null;
-    }
-
-    if (trimmed.toLowerCase().startsWith('bearer ')) {
-        const token = trimmed.slice(7).trim();
-        return token.length > 0 ? token : null;
-    }
-    return trimmed;
-}
 
 function isControlPlaneTokenConfigured(): boolean {
     return CONTROL_PLANE_TOKEN.length > 0;
@@ -994,47 +638,6 @@ function enforceSocketControlAuth(socket: { emit: (event: string, payload: Recor
     });
     return false;
 }
-
-type MetricFamily =
-    | 'ARBITRAGE_EDGE'
-    | 'MOMENTUM'
-    | 'FAIR_VALUE'
-    | 'MARKET_MAKING'
-    | 'ORDER_FLOW'
-    | 'FLOW_PRESSURE'
-    | 'UNKNOWN';
-
-type MetricDirection = 'ABSOLUTE' | 'SIGNED';
-
-type StrategySignalSummary = {
-    strategy: string;
-    symbol: string;
-    market_key: string;
-    timestamp: number;
-    age_ms: number;
-    passes_threshold: boolean;
-    score: number;
-    threshold: number;
-    margin: number;
-    normalized_margin: number;
-    signal_type: string;
-    unit: string;
-    metric_family: MetricFamily;
-    directionality: MetricDirection;
-    comparable_group: string;
-    reason: string;
-};
-
-type ComparableGroupSummary = {
-    comparable_group: string;
-    metric_family: MetricFamily;
-    unit: string;
-    sample_size: number;
-    pass_rate_pct: number;
-    mean_margin: number;
-    mean_normalized_margin: number;
-    strategies: string[];
-};
 
 type SimulationLedgerSnapshot = {
     cash: number;
@@ -1131,7 +734,7 @@ function parseMetricDirection(input: unknown): MetricDirection | null {
 
 function strategyFamily(strategyRaw: string): string {
     const strategy = strategyRaw.trim().toUpperCase();
-    if (strategy === 'BTC_15M' || strategy === 'ETH_15M' || strategy === 'SOL_15M') {
+    if (strategy === 'BTC_5M' || strategy === 'BTC_15M' || strategy === 'ETH_15M' || strategy === 'SOL_15M') {
         return 'FAIR_VALUE';
     }
     if (strategy === 'ATOMIC_ARB' || strategy === 'GRAPH_ARB') {
@@ -1149,8 +752,11 @@ function strategyFamily(strategyRaw: string): string {
     if (strategy === 'CONVERGENCE_CARRY') {
         return 'CARRY_PARITY';
     }
-    if (strategy === 'MAKER_MM') {
+    if (strategy === 'MAKER_MM' || strategy === 'AS_MARKET_MAKER') {
         return 'MARKET_MAKING';
+    }
+    if (strategy === 'LONGSHOT_BIAS') {
+        return 'BIAS_EXPLOITATION';
     }
     return 'GENERIC';
 }
@@ -1216,6 +822,16 @@ function inferScanDescriptor(strategyRaw: string, signalTypeRaw: string | null, 
         };
     }
 
+    if (strategy === 'AS_MARKET_MAKER') {
+        return {
+            signal_type: signalType,
+            unit: unit === 'RAW' ? 'RATIO' : unit,
+            metric_family: 'MARKET_MAKING',
+            directionality: 'ABSOLUTE',
+            comparable_group: 'AS_MARKET_MAKER_EDGE',
+        };
+    }
+
     if (strategy === 'SYNDICATE' || strategy === 'COPY_BOT') {
         return {
             signal_type: signalType,
@@ -1243,6 +859,16 @@ function inferScanDescriptor(strategyRaw: string, signalTypeRaw: string | null, 
             metric_family: 'FAIR_VALUE',
             directionality: 'SIGNED',
             comparable_group: 'CONVERGENCE_CARRY_PARITY',
+        };
+    }
+
+    if (strategy === 'LONGSHOT_BIAS') {
+        return {
+            signal_type: signalType,
+            unit: unit === 'RAW' ? 'RATIO' : unit,
+            metric_family: 'ARBITRAGE_EDGE',
+            directionality: 'ABSOLUTE',
+            comparable_group: 'LONGSHOT_BIAS_EDGE',
         };
     }
 
@@ -1363,6 +989,67 @@ function asNumber(input: unknown): number | null {
     return Number.isFinite(parsed) ? parsed : null;
 }
 
+const SCAN_META_FEATURE_LIMIT = 32;
+const SCAN_META_FEATURE_MAX_DEPTH = 2;
+
+function normalizeFeatureColumn(input: string, prefix = 'meta'): string | null {
+    const normalized = `${prefix}_${input}`
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '');
+    if (!normalized) {
+        return null;
+    }
+    return normalized.slice(0, 48);
+}
+
+function collectNumericMetaFeatures(
+    input: unknown,
+    prefix: string,
+    out: Record<string, number>,
+    depth = 0,
+): void {
+    if (Object.keys(out).length >= SCAN_META_FEATURE_LIMIT || depth > SCAN_META_FEATURE_MAX_DEPTH) {
+        return;
+    }
+
+    if (Array.isArray(input)) {
+        return;
+    }
+
+    const numeric = asNumber(input);
+    if (numeric !== null && Number.isFinite(numeric)) {
+        const key = normalizeFeatureColumn(prefix, 'meta');
+        if (key && !Object.prototype.hasOwnProperty.call(out, key)) {
+            out[key] = numeric;
+        }
+        return;
+    }
+
+    const record = asRecord(input);
+    if (!record) {
+        return;
+    }
+
+    for (const [rawKey, value] of Object.entries(record)) {
+        if (Object.keys(out).length >= SCAN_META_FEATURE_LIMIT) {
+            break;
+        }
+        const key = rawKey.trim();
+        if (!key) {
+            continue;
+        }
+        const childPrefix = depth === 0 ? key : `${prefix}_${key}`;
+        collectNumericMetaFeatures(value, childPrefix, out, depth + 1);
+    }
+}
+
+function extractScanMetaFeatures(meta: unknown): Record<string, number> {
+    const out: Record<string, number> = {};
+    collectNumericMetaFeatures(meta, 'meta', out, 0);
+    return out;
+}
+
 function normalizeMarketKey(input: unknown): string | null {
     const raw = asString(input);
     if (!raw) {
@@ -1422,6 +1109,22 @@ function extractScanMarketKey(payload: unknown): string | null {
     );
 }
 
+function inferExecutionStrategyFromMarketLabel(record: Record<string, unknown>): string | null {
+    const market = asString(record.market)?.toLowerCase() || '';
+    if (!market) {
+        return null;
+    }
+    if (market.includes('cex sniper')) return 'CEX_SNIPER';
+    if (market.includes('syndicate')) return 'SYNDICATE';
+    if (market.includes('graph arb')) return 'GRAPH_ARB';
+    if (market.includes('atomic arb')) return 'ATOMIC_ARB';
+    if (market.includes('convergence carry')) return 'CONVERGENCE_CARRY';
+    if (market.includes('maker micro-mm') || market.includes('maker mm')) return 'MAKER_MM';
+    if (market.includes('as market maker')) return 'AS_MARKET_MAKER';
+    if (market.includes('longshot bias')) return 'LONGSHOT_BIAS';
+    return null;
+}
+
 function extractExecutionStrategy(payload: unknown): string | null {
     const record = asRecord(payload);
     if (!record) {
@@ -1430,15 +1133,18 @@ function extractExecutionStrategy(payload: unknown): string | null {
 
     const details = asRecord(record.details);
     const preflight = details ? asRecord(details.preflight) : null;
-    const strategy = asString(preflight?.strategy)
+    const strategyRaw = asString(preflight?.strategy)
         || asString(details?.strategy)
+        || asString(details?.strategy_id)
         || asString(record.strategy)
-        || asString(record.side);
+        || asString(record.strategy_id)
+        || inferExecutionStrategyFromMarketLabel(record);
 
-    if (!strategy) {
+    if (!strategyRaw) {
         return null;
     }
 
+    const strategy = strategyRaw.toUpperCase();
     if (STRATEGY_IDS.includes(strategy)) {
         return strategy;
     }
@@ -1477,7 +1183,16 @@ function extractExecutionMarketKey(payload: unknown): string | null {
 
     return normalizeMarketKey(
         asString(record.market_id)
+        || asString(preflight?.condition_id)
+        || asString(preflight?.conditionId)
+        || asString(preflight?.token_id)
+        || asString(preflight?.tokenId)
+        || asString(details?.condition_id)
+        || asString(details?.conditionId)
+        || asString(details?.token_id)
+        || asString(details?.tokenId)
         || asString(record.symbol)
+        || asString(details?.symbol)
         || asString(record.market),
     );
 }
@@ -1870,6 +1585,45 @@ async function setTradingMode(mode: TradingMode): Promise<void> {
 
 function isLiveOrderPostingEnabled(): boolean {
     return process.env.LIVE_ORDER_POSTING_ENABLED === 'true';
+}
+
+interface LiveReadinessResult {
+    ready: boolean;
+    failures: string[];
+}
+
+async function isLiveReady(): Promise<LiveReadinessResult> {
+    const failures: string[] = [];
+
+    if (!isLiveOrderPostingEnabled()) {
+        failures.push('LIVE_ORDER_POSTING_ENABLED is not set');
+    }
+
+    const now = Date.now();
+    const scannerLastBeat = Math.max(...SCANNER_HEARTBEAT_IDS.map((id) => heartbeats[id] || 0));
+    if (now - scannerLastBeat > 15_000) {
+        failures.push('Scanner heartbeat stale (no heartbeat in 15s)');
+    }
+
+    try {
+        await redisClient.ping();
+    } catch {
+        failures.push('Redis connection failed');
+    }
+
+    const preflightReadiness = await polymarketPreflight.getReadinessSnapshot();
+    for (const issue of preflightReadiness.failures) {
+        failures.push(`Polymarket preflight: ${issue}`);
+    }
+    if (isLiveOrderPostingEnabled() && !preflightReadiness.clientInitialized) {
+        failures.push('Polymarket preflight client is not initialized for live posting');
+    }
+
+    if (!MODEL_PROBABILITY_GATE_ENFORCE_LIVE) {
+        failures.push('MODEL_PROBABILITY_GATE_ENFORCE_LIVE is disabled');
+    }
+
+    return { ready: failures.length === 0, failures };
 }
 
 function normalizeResetBankroll(value: unknown): number | null {
@@ -2417,6 +2171,12 @@ function parseTradeSample(payload: unknown): StrategyTradeSample | null {
 
     const details = asRecord(record.details);
     const timestamp = asNumber(record.timestamp) ?? Date.now();
+    const executionId = asString(record.execution_id)
+        || asString(record.executionId)
+        || asString(details?.execution_id)
+        || asString(details?.executionId);
+    const marketKey = extractExecutionMarketKey(record)
+        || (executionId ? executionTraces.get(executionId)?.market_key || null : null);
     const rawNotional = asNumber(record.notional)
         ?? asNumber(details?.notional)
         ?? Math.abs(pnl);
@@ -2433,6 +2193,9 @@ function parseTradeSample(payload: unknown): StrategyTradeSample | null {
         costDrag = roundTripCostRate;
     }
 
+    const reason = asString(record.reason) || asString(details?.reason) || '';
+    const labelEligible = isLabelEligibleReason(reason);
+
     return {
         strategy,
         timestamp,
@@ -2441,8 +2204,20 @@ function parseTradeSample(payload: unknown): StrategyTradeSample | null {
         net_return: netReturn,
         gross_return: grossReturn,
         cost_drag: costDrag,
-        reason: asString(record.reason) || asString(details?.reason) || '',
+        reason,
+        label_eligible: labelEligible,
+        execution_id: executionId || undefined,
+        market_key: marketKey,
     };
+}
+
+function isLabelEligibleReason(reason: string): boolean {
+    if (!reason) return false;
+    const upper = reason.trim().toUpperCase();
+    // Signal-driven and time-based exits are usable for ML labelling
+    const eligible = ['TP', 'SL', 'TAKE_PROFIT', 'STOP_LOSS', 'SIGNAL_TP', 'SIGNAL_SL',
+        'EDGE_DECAY', 'EXPIRY', 'EXPIRY_EXIT', 'TIMEOUT', 'TIME_EXPIRY', 'TIME_EXIT', 'MAX_HOLD'];
+    return eligible.includes(upper);
 }
 
 function updateStrategyCostDiagnostics(sample: StrategyTradeSample): StrategyCostDiagnostics {
@@ -2685,6 +2460,7 @@ async function maybeApplyGovernanceDecision(
         strategyStatus[decision.strategy] = true;
         await publishStrategyMultiplier(decision.strategy, promotedMultiplier);
         await redisClient.set(`strategy:enabled:${decision.strategy}`, '1');
+        await redisClient.expire(`strategy:enabled:${decision.strategy}`, 86400); // 24 hours
         await redisClient.publish('strategy:control', JSON.stringify({
             id: decision.strategy,
             active: true,
@@ -2717,6 +2493,7 @@ async function maybeApplyGovernanceDecision(
         strategyStatus[decision.strategy] = false;
         await publishStrategyMultiplier(decision.strategy, 0);
         await redisClient.set(`strategy:enabled:${decision.strategy}`, '0');
+        await redisClient.expire(`strategy:enabled:${decision.strategy}`, 86400); // 24 hours
         await redisClient.publish('strategy:control', JSON.stringify({
             id: decision.strategy,
             active: false,
@@ -2822,22 +2599,90 @@ function strategyCostDiagnosticsPayload(): Record<string, StrategyCostDiagnostic
     );
 }
 
+function ensureFeatureRegistryCounter(strategy: string): { rows: number; labeled_rows: number; unlabeled_rows: number } {
+    if (!featureRegistryCountsByStrategy[strategy]) {
+        featureRegistryCountsByStrategy[strategy] = {
+            rows: 0,
+            labeled_rows: 0,
+            unlabeled_rows: 0,
+        };
+    }
+    return featureRegistryCountsByStrategy[strategy];
+}
+
+function addFeatureRegistryRowStats(row: FeatureSnapshot): void {
+    const counter = ensureFeatureRegistryCounter(row.strategy);
+    const labeled = row.label_net_return !== null || row.label_pnl !== null;
+    counter.rows += 1;
+    if (labeled) {
+        counter.labeled_rows += 1;
+        featureRegistryLabeledRows += 1;
+    } else {
+        counter.unlabeled_rows += 1;
+    }
+}
+
+function removeFeatureRegistryRowStats(row: FeatureSnapshot): void {
+    const counter = featureRegistryCountsByStrategy[row.strategy];
+    if (!counter) {
+        return;
+    }
+
+    const labeled = row.label_net_return !== null || row.label_pnl !== null;
+    counter.rows = Math.max(0, counter.rows - 1);
+    if (labeled) {
+        counter.labeled_rows = Math.max(0, counter.labeled_rows - 1);
+        featureRegistryLabeledRows = Math.max(0, featureRegistryLabeledRows - 1);
+    } else {
+        counter.unlabeled_rows = Math.max(0, counter.unlabeled_rows - 1);
+    }
+
+    if (counter.rows === 0) {
+        delete featureRegistryCountsByStrategy[row.strategy];
+    }
+}
+
+function markFeatureRegistryRowLabeled(row: FeatureSnapshot): void {
+    const counter = ensureFeatureRegistryCounter(row.strategy);
+    counter.labeled_rows += 1;
+    counter.unlabeled_rows = Math.max(0, counter.unlabeled_rows - 1);
+    featureRegistryLabeledRows += 1;
+}
+
+function trimFeatureRegistryRowsIfNeeded(): void {
+    if (featureRegistryRows.length <= FEATURE_REGISTRY_TRIM_TRIGGER_ROWS) {
+        return;
+    }
+
+    const removeCount = Math.max(1, featureRegistryRows.length - FEATURE_REGISTRY_TRIM_TARGET_ROWS);
+    const removed = featureRegistryRows.splice(0, removeCount);
+    for (const row of removed) {
+        featureRegistryIndexById.delete(row.id);
+        modelPredictionByRowId.delete(row.id);
+        removeFeatureRegistryRowStats(row);
+    }
+
+    featureRegistryIndexById.clear();
+    for (let index = 0; index < featureRegistryRows.length; index += 1) {
+        featureRegistryIndexById.set(featureRegistryRows[index].id, index);
+    }
+}
+
 function featureRegistrySummary(): FeatureRegistrySummary {
     const byStrategy: FeatureRegistrySummary['by_strategy'] = {};
-    let labeledRows = 0;
-    for (const row of featureRegistryRows) {
-        const current = byStrategy[row.strategy] || { rows: 0, labeled_rows: 0, unlabeled_rows: 0 };
-        current.rows += 1;
-        if (row.label_net_return !== null || row.label_pnl !== null) {
-            current.labeled_rows += 1;
-            labeledRows += 1;
-        } else {
-            current.unlabeled_rows += 1;
+    for (const [strategy, counter] of Object.entries(featureRegistryCountsByStrategy)) {
+        if (counter.rows <= 0) {
+            continue;
         }
-        byStrategy[row.strategy] = current;
+        byStrategy[strategy] = {
+            rows: counter.rows,
+            labeled_rows: counter.labeled_rows,
+            unlabeled_rows: counter.unlabeled_rows,
+        };
     }
 
     const rows = featureRegistryRows.length;
+    const labeledRows = Math.min(rows, featureRegistryLabeledRows);
     return {
         rows,
         labeled_rows: labeledRows,
@@ -2851,6 +2696,11 @@ function featureRegistrySummary(): FeatureRegistrySummary {
 
 function clearFeatureRegistry(): void {
     featureRegistryRows.length = 0;
+    featureRegistryIndexById.clear();
+    for (const strategy of Object.keys(featureRegistryCountsByStrategy)) {
+        delete featureRegistryCountsByStrategy[strategy];
+    }
+    featureRegistryLabeledRows = 0;
     featureRegistryLeakageViolations = 0;
     featureRegistryUpdatedAt = Date.now();
     modelTrainerLastLabeledRows = 0;
@@ -2858,6 +2708,7 @@ function clearFeatureRegistry(): void {
 
 function clearModelInferenceState(): void {
     modelPredictionByRowId.clear();
+    modelInferenceTimestampByKey.clear();
     modelInferenceState = {
         ...modelInferenceState,
         tracked_rows: 0,
@@ -2868,18 +2719,28 @@ function clearModelInferenceState(): void {
 
 function allowedFamiliesForRegime(regime: RegimeLabel): string[] {
     if (regime === 'TREND') {
-        return ['FAIR_VALUE', 'FLOW_PRESSURE', 'ORDER_FLOW', 'CEX_MICROSTRUCTURE'];
+        return ['FAIR_VALUE', 'FLOW_PRESSURE', 'ORDER_FLOW', 'CEX_MICROSTRUCTURE', 'BIAS_EXPLOITATION'];
     }
     if (regime === 'MEAN_REVERT') {
-        return ['ARBITRAGE', 'CARRY_PARITY', 'MARKET_MAKING', 'ORDER_FLOW'];
+        return ['ARBITRAGE', 'CARRY_PARITY', 'MARKET_MAKING', 'ORDER_FLOW', 'BIAS_EXPLOITATION'];
     }
     if (regime === 'LOW_LIQUIDITY') {
-        return ['ARBITRAGE', 'MARKET_MAKING'];
+        return ['ARBITRAGE', 'MARKET_MAKING', 'BIAS_EXPLOITATION'];
     }
     if (regime === 'CHOP') {
-        return ['ARBITRAGE', 'MARKET_MAKING', 'CEX_MICROSTRUCTURE', 'ORDER_FLOW'];
+        return ['ARBITRAGE', 'MARKET_MAKING', 'CEX_MICROSTRUCTURE', 'ORDER_FLOW', 'BIAS_EXPLOITATION'];
     }
-    return ['FAIR_VALUE', 'FLOW_PRESSURE', 'ORDER_FLOW', 'ARBITRAGE', 'CEX_MICROSTRUCTURE', 'MARKET_MAKING', 'CARRY_PARITY', 'GENERIC'];
+    return [
+        'FAIR_VALUE',
+        'FLOW_PRESSURE',
+        'ORDER_FLOW',
+        'ARBITRAGE',
+        'CEX_MICROSTRUCTURE',
+        'MARKET_MAKING',
+        'CARRY_PARITY',
+        'BIAS_EXPLOITATION',
+        'GENERIC',
+    ];
 }
 
 function buildMetaControllerState(now = Date.now()): MetaControllerState {
@@ -3002,6 +2863,15 @@ function metaControllerPayload(): MetaControllerState {
 async function refreshMetaController(): Promise<void> {
     metaControllerState = buildMetaControllerState(Date.now());
     io.emit('meta_controller_update', metaControllerPayload());
+    // Persist regime to Redis so Rust scanners can read it for sizing adaptation.
+    try {
+        await redisClient.set('meta_controller:regime', JSON.stringify({
+            regime: metaControllerState.regime,
+            confidence: Math.round(metaControllerState.confidence * 1000) / 1000,
+            signal_count: metaControllerState.signal_count,
+            updated_at: metaControllerState.updated_at,
+        }));
+    } catch { /* best-effort */ }
     touchRuntimeModule(
         'REGIME_ENGINE',
         'ONLINE',
@@ -3019,6 +2889,45 @@ async function refreshMetaController(): Promise<void> {
             ? `confidence ${metaControllerState.confidence.toFixed(2)}`
             : `low confidence ${metaControllerState.confidence.toFixed(2)}`,
     );
+}
+
+async function runMetaControllerRefreshSafely(): Promise<void> {
+    try {
+        await refreshMetaController();
+    } catch (error) {
+        console.error('[MetaController] refresh error:', error);
+        touchRuntimeModule('REGIME_ENGINE', 'DEGRADED', `meta controller error: ${String(error)}`);
+        touchRuntimeModule('ENSEMBLE_ROUTER', 'DEGRADED', `meta controller error: ${String(error)}`);
+    }
+}
+
+function requestMetaControllerRefresh(): void {
+    metaControllerRefreshScheduled = true;
+    if (metaControllerRefreshTimer) {
+        return;
+    }
+
+    metaControllerRefreshTimer = setTimeout(() => {
+        metaControllerRefreshTimer = null;
+        if (metaControllerRefreshInFlight) {
+            return;
+        }
+
+        metaControllerRefreshInFlight = true;
+        void (async () => {
+            try {
+                while (metaControllerRefreshScheduled) {
+                    metaControllerRefreshScheduled = false;
+                    await runMetaControllerRefreshSafely();
+                }
+            } finally {
+                metaControllerRefreshInFlight = false;
+                if (metaControllerRefreshScheduled && !metaControllerRefreshTimer) {
+                    requestMetaControllerRefresh();
+                }
+            }
+        })();
+    }, META_CONTROLLER_REFRESH_DEBOUNCE_MS);
 }
 
 async function readJsonFileSafe(filePath: string): Promise<Record<string, unknown> | null> {
@@ -3292,6 +3201,7 @@ function buildScanFeatureMap(scan: StrategyScanState): Record<string, number> {
     const margin = computeScanMargin(scan);
     const normalizedMargin = computeNormalizedMargin(scan);
     return {
+        ...(scan.meta_features || {}),
         score: scan.score,
         threshold: scan.threshold,
         margin,
@@ -3340,6 +3250,45 @@ function modelDriftPayload(): ModelDriftState {
     };
 }
 
+function trimModelInferenceLatestIfNeeded(): void {
+    if (modelInferenceState.tracked_rows <= MODEL_INFERENCE_TRIM_TRIGGER_ROWS) {
+        return;
+    }
+
+    const removeCount = Math.max(1, modelInferenceState.tracked_rows - MODEL_INFERENCE_MAX_TRACKED_ROWS);
+    const ordered = [...modelInferenceTimestampByKey.entries()]
+        .sort((a, b) => a[1] - b[1]);
+
+    let removed = 0;
+    for (let index = 0; index < removeCount; index += 1) {
+        const key = ordered[index]?.[0];
+        if (!key) {
+            break;
+        }
+        if (Object.prototype.hasOwnProperty.call(modelInferenceState.latest, key)) {
+            delete modelInferenceState.latest[key];
+            removed += 1;
+        }
+        modelInferenceTimestampByKey.delete(key);
+    }
+
+    if (removed > 0) {
+        modelInferenceState.tracked_rows = Math.max(0, modelInferenceState.tracked_rows - removed);
+    }
+}
+
+function upsertModelInferenceEntry(key: string, entry: ModelInferenceEntry): ModelInferenceEntry {
+    const existed = Object.prototype.hasOwnProperty.call(modelInferenceState.latest, key);
+    modelInferenceState.latest[key] = entry;
+    modelInferenceTimestampByKey.set(key, entry.timestamp);
+    if (!existed) {
+        modelInferenceState.tracked_rows += 1;
+    }
+    trimModelInferenceLatestIfNeeded();
+    modelInferenceState.updated_at = Date.now();
+    return modelInferenceState.latest[key]!;
+}
+
 function pruneModelPredictionTraces(): void {
     if (modelPredictionByRowId.size <= MODEL_PREDICTION_TRACE_MAX) {
         return;
@@ -3385,10 +3334,8 @@ function updateModelInferenceFromScan(scan: StrategyScanState, rowId: string | n
     };
 
     if (!signalModelArtifact) {
-        modelInferenceState.latest[key] = fallback;
-        modelInferenceState.tracked_rows = Object.keys(modelInferenceState.latest).length;
-        modelInferenceState.updated_at = Date.now();
-        io.emit('model_inference_update', modelInferenceState.latest[key]);
+        const latest = upsertModelInferenceEntry(key, fallback);
+        io.emit('model_inference_update', latest);
         if (rowId) {
             modelPredictionByRowId.set(rowId, {
                 row_id: rowId,
@@ -3396,12 +3343,12 @@ function updateModelInferenceFromScan(scan: StrategyScanState, rowId: string | n
                 market_key: scan.market_key,
                 timestamp: scan.timestamp,
                 probability_positive: null,
-                probability_gate: fallback.probability_gate,
+                probability_gate: latest.probability_gate,
                 model_loaded: false,
             });
             pruneModelPredictionTraces();
         }
-        return modelInferenceState.latest[key];
+        return latest;
     }
 
     const vector: number[] = [];
@@ -3417,7 +3364,7 @@ function updateModelInferenceFromScan(scan: StrategyScanState, rowId: string | n
     }
     const probability = sigmoid(z);
 
-    modelInferenceState.latest[key] = {
+    const latest = upsertModelInferenceEntry(key, {
         strategy: scan.strategy,
         market_key: scan.market_key,
         timestamp: scan.timestamp,
@@ -3430,10 +3377,8 @@ function updateModelInferenceFromScan(scan: StrategyScanState, rowId: string | n
             : `prob ${probability.toFixed(3)} < ${probabilityGate.toFixed(2)}`,
         feature_count: signalModelArtifact.feature_columns.length,
         model_generated_at: signalModelArtifact.generated_at,
-    };
-    modelInferenceState.tracked_rows = Object.keys(modelInferenceState.latest).length;
-    modelInferenceState.updated_at = Date.now();
-    io.emit('model_inference_update', modelInferenceState.latest[key]);
+    });
+    io.emit('model_inference_update', latest);
     if (rowId) {
         modelPredictionByRowId.set(rowId, {
             row_id: rowId,
@@ -3446,7 +3391,7 @@ function updateModelInferenceFromScan(scan: StrategyScanState, rowId: string | n
         });
         pruneModelPredictionTraces();
     }
-    return modelInferenceState.latest[key];
+    return latest;
 }
 
 function updateModelDriftFromFeatureLabel(feature: FeatureSnapshot): void {
@@ -3648,14 +3593,17 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
 
     const exactKey = marketKey ? buildStrategyMarketKey(strategy, marketKey) : null;
     const exact = exactKey ? modelInferenceState.latest[exactKey] : null;
-    const fallback = exact || Object.values(modelInferenceState.latest)
+    const strategyRows = Object.values(modelInferenceState.latest)
         .filter((entry) => entry.strategy === strategy)
-        .sort((a, b) => b.timestamp - a.timestamp)[0];
+        .sort((a, b) => b.timestamp - a.timestamp);
+    const fallback = exact || (!marketKey ? strategyRows[0] : null);
     if (!fallback) {
         return {
             ok: !MODEL_PROBABILITY_GATE_REQUIRE_MODEL,
             blocked: MODEL_PROBABILITY_GATE_REQUIRE_MODEL,
-            reason: `no model inference row for ${strategy}`,
+            reason: marketKey
+                ? `no model inference row for ${strategy} on ${marketKey}`
+                : `no model inference row for ${strategy}`,
             strategy,
             market_key: marketKey,
             probability: null,
@@ -3717,12 +3665,16 @@ function trainSignalModelInProcess(): {
     report: Record<string, unknown>;
     labeled_rows: number;
 } {
-    const labeled = featureRegistryRows
+    const allLabeled = featureRegistryRows
         .filter((row) => row.label_net_return !== null && (row.label_timestamp ?? row.timestamp) >= row.timestamp)
         .slice()
         .sort((a, b) => a.timestamp - b.timestamp);
+    const totalLabeledRows = allLabeled.length;
+    const labeled = totalLabeledRows > MODEL_TRAINER_MAX_ROWS
+        ? allLabeled.slice(totalLabeledRows - MODEL_TRAINER_MAX_ROWS)
+        : allLabeled;
+    const trainingRows = labeled.length;
     const generatedAt = new Date().toISOString();
-    const labeledRows = labeled.length;
 
     const featureColumns = Array.from(
         new Set(
@@ -3752,21 +3704,22 @@ function trainSignalModelInProcess(): {
             generated_at: generatedAt,
             eligible: false,
             reason,
-            rows: labeledRows,
+            rows: trainingRows,
+            total_labeled_rows: totalLabeledRows,
             feature_count: featureCount,
             cv_folds: cvFolds,
         },
-        labeled_rows: labeledRows,
+        labeled_rows: totalLabeledRows,
     });
 
-    if (labeledRows < MODEL_TRAINER_MIN_LABELED_ROWS || featureCount === 0) {
-        return ineligible(`insufficient labeled rows (${labeledRows}/${MODEL_TRAINER_MIN_LABELED_ROWS})`);
+    if (totalLabeledRows < MODEL_TRAINER_MIN_LABELED_ROWS || featureCount === 0) {
+        return ineligible(`insufficient labeled rows (${totalLabeledRows}/${MODEL_TRAINER_MIN_LABELED_ROWS})`);
     }
 
     const x = labeled.map((row) => featureColumns.map((key) => asNumber(row.features[key]) ?? 0));
     const y = labeled.map((row) => ((row.label_net_return ?? 0) > 0 ? 1 : 0));
     const folds = buildPurgedEmbargoFolds(
-        labeledRows,
+        trainingRows,
         MODEL_TRAINER_SPLITS,
         MODEL_TRAINER_PURGE_ROWS,
         MODEL_TRAINER_EMBARGO_ROWS,
@@ -3866,12 +3819,14 @@ function trainSignalModelInProcess(): {
             l2: best.l2,
             objective: best.objective,
         },
-        train_rows: labeledRows,
+        train_rows: trainingRows,
+        total_labeled_rows: totalLabeledRows,
     };
     const report: Record<string, unknown> = {
         generated_at: generatedAt,
         eligible: true,
-        rows: labeledRows,
+        rows: trainingRows,
+        total_labeled_rows: totalLabeledRows,
         feature_count: featureCount,
         cv_folds: folds.length,
         purge_rows: MODEL_TRAINER_PURGE_ROWS,
@@ -3885,7 +3840,7 @@ function trainSignalModelInProcess(): {
             positive_label_rate: average(y),
         },
     };
-    return { artifact, report, labeled_rows: labeledRows };
+    return { artifact, report, labeled_rows: totalLabeledRows };
 }
 
 async function runInProcessModelTraining(force = false): Promise<void> {
@@ -3998,10 +3953,9 @@ async function refreshMlPipelineStatus(): Promise<void> {
 }
 
 function upsertFeatureSnapshot(scan: StrategyScanState): void {
-    const margin = computeScanMargin(scan);
-    const normalizedMargin = computeNormalizedMargin(scan);
     const id = `${scan.strategy}:${scan.market_key}:${scan.timestamp}`;
-    const existingIndex = featureRegistryRows.findIndex((row) => row.id === id);
+    const existingIndex = featureRegistryIndexById.get(id);
+    const features = buildScanFeatureMap(scan);
     const snapshot: FeatureSnapshot = {
         id,
         strategy: scan.strategy,
@@ -4009,22 +3963,18 @@ function upsertFeatureSnapshot(scan: StrategyScanState): void {
         timestamp: scan.timestamp,
         signal_type: scan.signal_type,
         metric_family: scan.metric_family,
-        features: {
-            score: scan.score,
-            threshold: scan.threshold,
-            margin,
-            normalized_margin: normalizedMargin,
-            pass_flag: scan.passes_threshold ? 1 : 0,
-            abs_score: Math.abs(scan.score),
-            abs_threshold: Math.abs(scan.threshold),
-        },
+        features,
         label_net_return: null,
         label_pnl: null,
         label_timestamp: null,
         label_source: null,
     };
 
-    if (existingIndex >= 0) {
+    if (
+        existingIndex !== undefined
+        && existingIndex >= 0
+        && existingIndex < featureRegistryRows.length
+    ) {
         const existing = featureRegistryRows[existingIndex];
         featureRegistryRows[existingIndex] = {
             ...snapshot,
@@ -4033,11 +3983,15 @@ function upsertFeatureSnapshot(scan: StrategyScanState): void {
             label_timestamp: existing.label_timestamp,
             label_source: existing.label_source,
         };
+        featureRegistryIndexById.set(id, existingIndex);
     } else {
-        featureRegistryRows.push(snapshot);
-        if (featureRegistryRows.length > FEATURE_REGISTRY_MAX_ROWS) {
-            featureRegistryRows.splice(0, featureRegistryRows.length - FEATURE_REGISTRY_MAX_ROWS);
+        if (existingIndex !== undefined) {
+            featureRegistryIndexById.delete(id);
         }
+        featureRegistryRows.push(snapshot);
+        featureRegistryIndexById.set(id, featureRegistryRows.length - 1);
+        addFeatureRegistryRowStats(snapshot);
+        trimFeatureRegistryRowsIfNeeded();
     }
     updateModelInferenceFromScan(scan, snapshot.id);
     featureRegistryRecorder.record({
@@ -4055,9 +4009,17 @@ function upsertFeatureSnapshot(scan: StrategyScanState): void {
 }
 
 function attachLabelToFeature(sample: StrategyTradeSample): boolean {
+    // Skip ML label assignment for non-eligible closures (stale, manual, reset)
+    if (sample.label_eligible === false) {
+        return false;
+    }
+    const sampleMarketKey = sample.market_key || null;
     for (let index = featureRegistryRows.length - 1; index >= 0; index -= 1) {
         const row = featureRegistryRows[index];
         if (row.strategy !== sample.strategy) {
+            continue;
+        }
+        if (sampleMarketKey && row.market_key !== sampleMarketKey) {
             continue;
         }
         if (row.label_net_return !== null || row.label_pnl !== null) {
@@ -4074,6 +4036,7 @@ function attachLabelToFeature(sample: StrategyTradeSample): boolean {
         row.label_pnl = sample.pnl;
         row.label_timestamp = sample.timestamp;
         row.label_source = 'strategy:pnl';
+        markFeatureRegistryRowLabeled(row);
         updateModelDriftFromFeatureLabel(row);
         featureRegistryRecorder.record({
             event_type: 'LABEL',
@@ -4123,6 +4086,7 @@ function computeStrategyMultiplier(state: StrategyPerformance): number {
 async function publishStrategyMultiplier(strategyId: string, multiplier: number): Promise<void> {
     const bounded = Math.min(STRATEGY_WEIGHT_CAP, Math.max(STRATEGY_WEIGHT_FLOOR, multiplier));
     await redisClient.set(strategyRiskMultiplierKey(strategyId), bounded.toFixed(6));
+    await redisClient.expire(strategyRiskMultiplierKey(strategyId), 86400); // 24 hours
 }
 
 async function applyDefaultStrategyStates(force = false): Promise<void> {
@@ -4133,7 +4097,37 @@ async function applyDefaultStrategyStates(force = false): Promise<void> {
             await redisClient.set(enabledKey, enabledByDefault ? '1' : '0');
         } else {
             await redisClient.setNX(enabledKey, enabledByDefault ? '1' : '0');
+
+            // Re-enable strategies whose Risk Guard cooldown expired during a restart.
+            // The setTimeout-based auto-resume is lost when the backend restarts, so
+            // strategies can get stuck disabled forever. Check the cooldown key and
+            // re-enable if expired or absent (for non-default-disabled strategies).
+            const currentVal = await redisClient.get(enabledKey);
+            if (currentVal === '0' && enabledByDefault) {
+                const cooldownUntil = await redisClient.get(`risk_guard:cooldown:${strategyId}`);
+                const now = Date.now();
+                if (!cooldownUntil || Number(cooldownUntil) <= now) {
+                    await redisClient.set(enabledKey, '1');
+                    console.info(`[Boot] Re-enabled ${strategyId}: Risk Guard cooldown expired or absent`);
+                } else {
+                    // Cooldown still active — reschedule the resume timer
+                    const remaining = Number(cooldownUntil) - now;
+                    setTimeout(async () => {
+                        try {
+                            await redisClient.set(enabledKey, '1');
+                            await redisClient.expire(enabledKey, 86400);
+                            strategyStatus[strategyId] = true;
+                            io.emit('strategy_status_update', strategyStatus);
+                            console.info(`[RiskGuard] RESUMED ${strategyId} after boot-rescheduled cooldown`);
+                        } catch (err) {
+                            console.error(`[RiskGuard] Error resuming ${strategyId} after boot:`, err);
+                        }
+                    }, remaining);
+                    console.info(`[Boot] ${strategyId} still in Risk Guard cooldown, resume in ${Math.ceil(remaining / 1000)}s`);
+                }
+            }
         }
+        await redisClient.expire(enabledKey, 86400); // 24 hours
         const raw = await redisClient.get(enabledKey);
         strategyStatus[strategyId] = raw !== '0';
     }
@@ -4195,6 +4189,7 @@ async function bootstrapStrategyMultipliers(resetToNeutral = false): Promise<voi
         } else {
             await redisClient.setNX(key, baseline.toFixed(6));
         }
+        await redisClient.expire(key, 86400); // 24 hours
         const raw = asNumber(await redisClient.get(key));
         const multiplier = Number.isFinite(raw) && raw !== null
             ? Math.min(STRATEGY_WEIGHT_CAP, Math.max(STRATEGY_WEIGHT_FLOOR, raw))
@@ -4504,7 +4499,8 @@ redisSubscriber.subscribe('strategy:pnl', (message) => {
         const parsed = JSON.parse(message);
         const executionId = ensureExecutionId(parsed);
         const pnlStrategy = asString(asRecord(parsed)?.strategy) || null;
-        pushExecutionTraceEvent(executionId, 'PNL', parsed, { strategy: pnlStrategy, market_key: null });
+        const pnlMarketKey = extractExecutionMarketKey(parsed);
+        pushExecutionTraceEvent(executionId, 'PNL', parsed, { strategy: pnlStrategy, market_key: pnlMarketKey });
         io.emit('strategy_pnl', parsed);
         strategyTradeRecorder.record(parsed);
         touchRuntimeModule('PNL_LEDGER', 'ONLINE', `${pnlStrategy || 'UNKNOWN'} pnl event recorded`);
@@ -4547,6 +4543,8 @@ redisSubscriber.subscribe('strategy:pnl', (message) => {
 
             const notional = asNumber(parsed?.notional);
             void updateStrategyAllocator(strategy, pnl, notional);
+            void processRiskGuard(strategy, pnl, parsed as Record<string, unknown>);
+            void sweepProfitsToVault();
         }
     } catch (error) {
         console.error('Error parsing pnl message:', error);
@@ -4555,31 +4553,66 @@ redisSubscriber.subscribe('strategy:pnl', (message) => {
 
 redisSubscriber.subscribe('arbitrage:scan', (message) => {
     try {
-        const parsed = JSON.parse(message);
-        const strategy = asString(parsed?.strategy);
+        const normalized = typeof message === 'string' ? message.trim() : '';
+        if (!normalized) {
+            return;
+        }
+        if (
+            normalized.includes('\r\n$9\r\nsubscribe\r\n')
+            || normalized.startsWith('*3\r\n$9\r\nsubscribe')
+        ) {
+            return;
+        }
+        if (!normalized.includes('{') || !normalized.includes('}')) {
+            return;
+        }
+
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(normalized);
+        } catch (innerError) {
+            // Some publishers occasionally include transport prefixes/suffixes.
+            // Recover by parsing the largest JSON object slice instead of dropping the scan.
+            const jsonStart = normalized.indexOf('{');
+            const jsonEnd = normalized.lastIndexOf('}');
+            if (jsonStart >= 0 && jsonEnd > jsonStart) {
+                parsed = JSON.parse(normalized.slice(jsonStart, jsonEnd + 1));
+            } else {
+                throw innerError;
+            }
+        }
+
+        const parsedRecord = asRecord(parsed);
+        if (!parsedRecord) {
+            return;
+        }
+
+        const strategy = asString(parsedRecord.strategy);
         if (strategy) {
-            const timestamp = asNumber(parsed?.timestamp) || Date.now();
-            const marketKey = extractScanMarketKey(parsed) || strategy.toLowerCase();
-            const rawSignalType = asString(parsed?.signal_type);
-            const rawUnit = asString(parsed?.unit);
+            const timestamp = asNumber(parsedRecord.timestamp) || Date.now();
+            const marketKey = extractScanMarketKey(parsedRecord) || strategy.toLowerCase();
+            const rawSignalType = asString(parsedRecord.signal_type);
+            const rawUnit = asString(parsedRecord.unit);
+            const metaFeatures = extractScanMetaFeatures(parsedRecord.meta);
             const inferred = inferScanDescriptor(strategy, rawSignalType, rawUnit);
-            const metricFamily = parseMetricFamily(parsed?.metric_family) || inferred.metric_family;
-            const directionality = parseMetricDirection(parsed?.directionality) || inferred.directionality;
-            const comparableGroup = asString(parsed?.comparable_group) || inferred.comparable_group;
+            const metricFamily = parseMetricFamily(parsedRecord.metric_family) || inferred.metric_family;
+            const directionality = parseMetricDirection(parsedRecord.directionality) || inferred.directionality;
+            const comparableGroup = asString(parsedRecord.comparable_group) || inferred.comparable_group;
             const scanState: StrategyScanState = {
                 strategy,
-                symbol: asString(parsed?.symbol) || strategy,
+                symbol: asString(parsedRecord.symbol) || strategy,
                 market_key: marketKey,
                 timestamp,
-                passes_threshold: parsed?.passes_threshold === true,
-                score: asNumber(parsed?.score) ?? asNumber(parsed?.gap) ?? 0,
-                threshold: asNumber(parsed?.threshold) ?? 0,
-                reason: asString(parsed?.reason) || '',
+                passes_threshold: parsedRecord.passes_threshold === true,
+                score: asNumber(parsedRecord.score) ?? asNumber(parsedRecord.gap) ?? 0,
+                threshold: asNumber(parsedRecord.threshold) ?? 0,
+                reason: asString(parsedRecord.reason) || '',
                 signal_type: rawSignalType || inferred.signal_type,
                 unit: normalizeMetricUnit(rawUnit || inferred.unit),
                 metric_family: metricFamily,
                 directionality,
                 comparable_group: comparableGroup,
+                meta_features: Object.keys(metaFeatures).length > 0 ? metaFeatures : undefined,
             };
             latestStrategyScans.set(strategy, scanState);
             latestStrategyScansByMarket.set(buildStrategyMarketKey(strategy, marketKey), scanState);
@@ -4610,14 +4643,38 @@ redisSubscriber.subscribe('arbitrage:scan', (message) => {
                 io.emit('data_integrity_alert', dataIntegrityAlert);
             }
             io.emit('feature_registry_update', featureRegistrySummary());
-            void refreshMetaController();
+            requestMetaControllerRefresh();
             touchRuntimeModule('SCAN_INGEST', 'ONLINE', `${strategy} ${scanState.passes_threshold ? 'PASS' : 'HOLD'} ${scanState.symbol}`);
             io.emit('intelligence_update', scanState);
         }
         io.emit('scanner_update', parsed);
     } catch (error) {
-        console.error('Error in scanner_update:', error);
+        const now = Date.now();
+        if (now - lastScannerParseErrorLogMs >= 30_000) {
+            lastScannerParseErrorLogMs = now;
+            const preview = typeof message === 'string' ? message.slice(0, 160) : String(message);
+            console.error('Error in scanner_update:', error, 'payload_preview=', preview);
+        }
     }
+});
+
+// Persist ML features to Redis keys so Rust scanners can read RSI/SMA for momentum filtering.
+redisSubscriber.subscribe('ml:features', (message) => {
+    try {
+        const parsed = JSON.parse(message);
+        const symbol = parsed?.symbol;
+        if (typeof symbol === 'string' && symbol.length > 0) {
+            const key = `ml:features:latest:${symbol}`;
+            void redisClient.set(key, JSON.stringify({
+                symbol,
+                rsi_14: parsed.rsi_14 ?? null,
+                sma_20: parsed.sma_20 ?? null,
+                price: parsed.price ?? null,
+                returns: parsed.returns ?? null,
+                timestamp: parsed.timestamp ?? Date.now(),
+            }), { EX: 120 }); // expire after 2 min if ML service stops
+        }
+    } catch { /* ignore */ }
 });
 
 redisSubscriber.subscribe('system:heartbeat', (msg) => {
@@ -4680,7 +4737,7 @@ redisSubscriber.subscribe('system:simulation_reset', (msg) => {
         io.emit('feature_registry_snapshot', featureRegistrySummary());
         io.emit('model_inference_snapshot', modelInferencePayload());
         io.emit('model_drift_update', modelDriftPayload());
-        void refreshMetaController();
+        requestMetaControllerRefresh();
         void refreshMlPipelineStatus();
         void runStrategyGovernanceCycle();
         void refreshLedgerHealth();
@@ -4801,6 +4858,35 @@ io.on('connection', async (socket) => {
         socket.emit('risk_config_update', await getRiskConfig());
     });
 
+    socket.on('request_vault', async () => {
+        const vault = parseFloat(await redisClient.get(VAULT_REDIS_KEY) || '0');
+        socket.emit('vault_update', { vault: Math.round(vault * 100) / 100, ceiling: VAULT_BANKROLL_CEILING });
+    });
+
+    socket.on('request_strategy_metrics', () => {
+        socket.emit('strategy_metrics_update', strategyMetrics);
+    });
+
+    socket.on('request_risk_guard', () => {
+        for (const id of RISK_GUARD_STRATEGIES) {
+            const state = riskGuardState[id];
+            if (state) {
+                socket.emit('risk_guard_update', { strategy: id, ...state });
+            }
+        }
+    });
+
+    socket.on('request_ledger', async () => {
+        const ledger = await getSimulationLedgerSnapshot();
+        socket.emit('sim_ledger_update', {
+            available_cash: ledger.cash,
+            reserved: ledger.reserved,
+            realized_pnl: ledger.realized_pnl,
+            equity: ledger.equity,
+            utilization_pct: ledger.utilization_pct,
+        });
+    });
+
     socket.on('request_trading_mode', async () => {
         socket.emit('trading_mode_update', {
             mode: await getTradingMode(),
@@ -4822,6 +4908,17 @@ io.on('connection', async (socket) => {
         if (mode === 'LIVE' && payload?.confirmation !== 'LIVE') {
             socket.emit('trading_mode_error', { message: 'LIVE mode requires explicit confirmation' });
             return;
+        }
+
+        if (mode === 'LIVE') {
+            const readiness = await isLiveReady();
+            if (!readiness.ready) {
+                socket.emit('trading_mode_error', {
+                    message: 'System not ready for LIVE mode',
+                    failures: readiness.failures,
+                });
+                return;
+            }
         }
 
         await setTradingMode(mode);
@@ -4864,6 +4961,7 @@ io.on('connection', async (socket) => {
         strategyStatus[payload.id] = payload.active;
 
         await redisClient.set(`strategy:enabled:${payload.id}`, payload.active ? '1' : '0');
+        await redisClient.expire(`strategy:enabled:${payload.id}`, 86400); // 24 hours
         await redisClient.publish('strategy:control', JSON.stringify({
             id: payload.id,
             active: payload.active,
@@ -5379,6 +5477,17 @@ app.post('/api/system/trading-mode', requireControlPlaneAuth, async (req, res) =
         return;
     }
 
+    if (mode === 'LIVE') {
+        const readiness = await isLiveReady();
+        if (!readiness.ready) {
+            res.status(412).json({
+                error: 'Live mode preconditions not met',
+                failures: readiness.failures,
+            });
+            return;
+        }
+    }
+
     await setTradingMode(mode);
     res.json({
         ok: true,
@@ -5459,43 +5568,65 @@ async function runStrategyGovernanceCycle(): Promise<void> {
     }
 }
 
-// Run Agentic Decision Loop
-setInterval(async () => {
-    try {
-        const symbol = 'BTC-USD';
-
-        if (agentManager.getActiveAgents().length === 0) {
+function scheduleNonOverlappingTask(taskName: string, intervalMs: number, task: () => Promise<void>): void {
+    let inFlight = false;
+    setInterval(() => {
+        if (inFlight) {
             return;
         }
+        inFlight = true;
+        void task()
+            .catch((error) => {
+                console.error(`[${taskName}] interval error:`, error);
+            })
+            .finally(() => {
+                inFlight = false;
+            });
+    }, intervalMs);
+}
 
-        const { decisions, context } = await agentManager.runAnalysis(symbol);
-        io.emit('agent_decisions', decisions);
+// Agentic Decision Loop — DISABLED by default. Set LEGACY_BRAIN_LOOP_ENABLED=true to re-enable.
+if (LEGACY_BRAIN_LOOP_ENABLED) {
+    console.warn('[Brain] LEGACY_BRAIN_LOOP_ENABLED=true — running deprecated agentic decision loop.');
+    scheduleNonOverlappingTask('Brain', 30_000, async () => {
+        try {
+            const symbol = 'BTC-USD';
 
-        const validDecision = decisionGate.evaluate(decisions);
-        if (!validDecision) {
-            return;
+            if (agentManager.getActiveAgents().length === 0) {
+                return;
+            }
+
+            const { decisions, context } = await agentManager.runAnalysis(symbol);
+            io.emit('agent_decisions', decisions);
+
+            const validDecision = decisionGate.evaluate(decisions);
+            if (!validDecision) {
+                return;
+            }
+
+            if (!riskGuard.validate(validDecision, context)) {
+                return;
+            }
+
+            const tradingMode = await getTradingMode();
+            const orderId = await executor.executeOrder(validDecision, symbol, tradingMode);
+
+            io.emit('trade_execution', {
+                ...validDecision,
+                orderId,
+                tradingMode,
+                timestamp: Date.now(),
+            });
+        } catch (error) {
+            console.error('[Brain] Error in decision loop:', error);
         }
-
-        if (!riskGuard.validate(validDecision, context)) {
-            return;
-        }
-
-        const tradingMode = await getTradingMode();
-        const orderId = await executor.executeOrder(validDecision, symbol, tradingMode);
-
-        io.emit('trade_execution', {
-            ...validDecision,
-            orderId,
-            tradingMode,
-            timestamp: Date.now(),
-        });
-    } catch (error) {
-        console.error('[Brain] Error in decision loop:', error);
-    }
-}, 30_000);
+    });
+} else {
+    console.info('[Brain] Legacy decision loop disabled (default). Set LEGACY_BRAIN_LOOP_ENABLED=true to re-enable.');
+}
 
 // System Health Heartbeat (Every 2s)
-setInterval(async () => {
+scheduleNonOverlappingTask('SystemHealth', 2000, async () => {
     const start = Date.now();
     let redisLatency = 0;
     try {
@@ -5538,9 +5669,9 @@ setInterval(async () => {
 
     io.emit('system_health_update', metrics);
     io.emit('runtime_status_update', runtimeStatusPayload());
-}, 2000);
+});
 
-setInterval(async () => {
+scheduleNonOverlappingTask('Settlement', settlementService.getPollIntervalMs(), async () => {
     try {
         const events = await settlementService.runCycle(await getTradingMode(), isLiveOrderPostingEnabled());
         touchRuntimeModule('SETTLEMENT_ENGINE', 'ONLINE', `cycle complete (${events.length} new event${events.length === 1 ? '' : 's'})`);
@@ -5551,37 +5682,31 @@ setInterval(async () => {
     } catch (error) {
         console.error('[Settlement] cycle error:', error);
     }
-}, settlementService.getPollIntervalMs());
+});
 
-setInterval(async () => {
+scheduleNonOverlappingTask('Governance', STRATEGY_GOVERNANCE_INTERVAL_MS, async () => {
     try {
         await runStrategyGovernanceCycle();
     } catch (error) {
         console.error('[Governance] cycle error:', error);
         touchRuntimeModule('FEATURE_REGISTRY', 'DEGRADED', `governance error: ${String(error)}`);
     }
-}, STRATEGY_GOVERNANCE_INTERVAL_MS);
+});
 
-setInterval(async () => {
+scheduleNonOverlappingTask('LedgerHealth', 5_000, async () => {
     try {
         await refreshLedgerHealth();
     } catch (error) {
         console.error('[LedgerHealth] refresh error:', error);
         touchRuntimeModule('PNL_LEDGER', 'DEGRADED', `ledger health error: ${String(error)}`);
     }
-}, 5_000);
+});
 
-setInterval(async () => {
-    try {
-        await refreshMetaController();
-    } catch (error) {
-        console.error('[MetaController] refresh error:', error);
-        touchRuntimeModule('REGIME_ENGINE', 'DEGRADED', `meta controller error: ${String(error)}`);
-        touchRuntimeModule('ENSEMBLE_ROUTER', 'DEGRADED', `meta controller error: ${String(error)}`);
-    }
-}, 3_000);
+scheduleNonOverlappingTask('MetaController', 3_000, async () => {
+    requestMetaControllerRefresh();
+});
 
-setInterval(async () => {
+scheduleNonOverlappingTask('MLPipeline', 10_000, async () => {
     try {
         await refreshMlPipelineStatus();
     } catch (error) {
@@ -5590,16 +5715,16 @@ setInterval(async () => {
         touchRuntimeModule('MODEL_INFERENCE', 'DEGRADED', `ml pipeline error: ${String(error)}`);
         touchRuntimeModule('DRIFT_MONITOR', 'DEGRADED', `ml pipeline error: ${String(error)}`);
     }
-}, 10_000);
+});
 
-setInterval(async () => {
+scheduleNonOverlappingTask('MLTrainer', MODEL_TRAINER_INTERVAL_MS, async () => {
     try {
         await runInProcessModelTraining(false);
     } catch (error) {
         console.error('[MLTrainer] in-process training cycle error:', error);
         touchRuntimeModule('ML_TRAINER', 'DEGRADED', `trainer cycle error: ${String(error)}`);
     }
-}, MODEL_TRAINER_INTERVAL_MS);
+});
 
 // Start Services
 async function bootstrap() {
@@ -5630,12 +5755,35 @@ async function bootstrap() {
     touchRuntimeModule('TRADING_MODE_GUARD', 'ONLINE', `boot mode ${(await getTradingMode())}`);
     await applyDefaultStrategyStates(false);
     await bootstrapStrategyMultipliers();
+    await loadRiskGuardStates();
     await runStrategyGovernanceCycle();
     await refreshLedgerHealth();
     await refreshMetaController();
     await refreshMlPipelineStatus();
     refreshModelDriftRuntime();
     await runInProcessModelTraining(false);
+
+    // ── Periodic state broadcast: keep all dashboards live ──
+    scheduleNonOverlappingTask('StateBroadcast', 5000, async () => {
+        try {
+            const ledger = await getSimulationLedgerSnapshot();
+            const vault = parseFloat(await redisClient.get(VAULT_REDIS_KEY) || '0');
+            io.emit('strategy_metrics_update', strategyMetrics);
+            io.emit('strategy_status_update', strategyStatus);
+            io.emit('vault_update', { vault: Math.round(vault * 100) / 100, ceiling: VAULT_BANKROLL_CEILING });
+            io.emit('sim_ledger_update', {
+                available_cash: ledger.cash,
+                reserved: ledger.reserved,
+                realized_pnl: ledger.realized_pnl,
+                equity: ledger.equity,
+                utilization_pct: ledger.utilization_pct,
+            });
+            for (const id of RISK_GUARD_STRATEGIES) {
+                const state = riskGuardState[id];
+                if (state) io.emit('risk_guard_update', { strategy: id, ...state });
+            }
+        } catch { /* non-critical broadcast */ }
+    });
 
     const PORT = Number(process.env.PORT) || 5114;
     httpServer.listen(PORT, () => {
@@ -5647,3 +5795,28 @@ bootstrap().catch((error) => {
     console.error('Failed to bootstrap backend:', error);
     process.exit(1);
 });
+
+let shutdownInProgress = false;
+
+const shutdown = async (signal: string) => {
+    if (shutdownInProgress) {
+        return;
+    }
+    shutdownInProgress = true;
+    console.info(`[System] ${signal} received, shutting down gracefully...`);
+
+    await new Promise<void>((resolve) => {
+        httpServer.close(() => resolve());
+    });
+
+    if (redisSubscriber.isOpen) {
+        await redisSubscriber.quit().catch(() => undefined);
+    }
+    if (redisClient.isOpen) {
+        await redisClient.quit().catch(() => undefined);
+    }
+
+    process.exit(0);
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

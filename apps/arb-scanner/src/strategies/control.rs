@@ -12,8 +12,10 @@ const SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX: &str = "sim_ledger:reserved:family:"
 const STRATEGY_RISK_MULTIPLIER_PREFIX: &str = "strategy:risk_multiplier:";
 const DEFAULT_STRATEGY_CONCENTRATION_CAP_PCT: f64 = 0.35;
 const DEFAULT_FAMILY_CONCENTRATION_CAP_PCT: f64 = 0.60;
+const DEFAULT_UNDERLYING_CONCENTRATION_CAP_PCT: f64 = 0.70;
 const DEFAULT_GLOBAL_UTILIZATION_CAP_PCT: f64 = 0.90;
 const DEFAULT_NUMERIC_EPSILON: f64 = 1e-9;
+const SIM_LEDGER_RESERVED_BY_UNDERLYING_PREFIX: &str = "sim_ledger:reserved:underlying:";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiskConfig {
@@ -36,12 +38,12 @@ pub enum TradingMode {
     Live,
 }
 
-pub async fn read_risk_config(conn: &mut redis::aio::Connection) -> RiskConfig {
+pub async fn read_risk_config(conn: &mut redis::aio::MultiplexedConnection) -> RiskConfig {
     let raw: String = conn.get("system:risk_config").await.unwrap_or_else(|_| "{}".to_string());
     serde_json::from_str::<RiskConfig>(&raw).unwrap_or_default()
 }
 
-async fn ensure_sim_ledger(conn: &mut redis::aio::Connection) {
+async fn ensure_sim_ledger(conn: &mut redis::aio::MultiplexedConnection) {
     let fallback_equity = conn
         .get::<_, f64>(SIM_BANKROLL_KEY)
         .await
@@ -105,37 +107,70 @@ pub fn strategy_family(strategy_id: &str) -> &'static str {
         "SYNDICATE" => "FLOW_PRESSURE",
         "CONVERGENCE_CARRY" => "CARRY_PARITY",
         "MAKER_MM" => "MARKET_MAKING",
+        "AS_MARKET_MAKER" => "MARKET_MAKING",
+        "LONGSHOT_BIAS" => "BIAS_EXPLOITATION",
         _ => "GENERIC",
     }
 }
 
-pub async fn read_strategy_reserved_notional(conn: &mut redis::aio::Connection, strategy_id: &str) -> f64 {
+pub fn strategy_underlying(strategy_id: &str) -> &'static str {
+    match strategy_id.trim().to_uppercase().as_str() {
+        "BTC_5M" | "BTC_15M" => "BTC",
+        "ETH_15M" => "ETH",
+        "SOL_15M" => "SOL",
+        "CEX_SNIPER" | "OBI_SCALPER" | "SYNDICATE" => "BTC",
+        "ATOMIC_ARB" | "GRAPH_ARB" | "CONVERGENCE_CARRY" | "MAKER_MM"
+            | "AS_MARKET_MAKER" | "LONGSHOT_BIAS" => "POLY_EVENT",
+        _ => "UNKNOWN",
+    }
+}
+
+fn underlying_reserved_key(underlying: &str) -> String {
+    format!("{}{}", SIM_LEDGER_RESERVED_BY_UNDERLYING_PREFIX, underlying.trim().to_uppercase())
+}
+
+fn underlying_concentration_cap_pct() -> f64 {
+    read_env_cap_pct(
+        "SIM_UNDERLYING_CONCENTRATION_CAP_PCT",
+        DEFAULT_UNDERLYING_CONCENTRATION_CAP_PCT,
+        0.10,
+        1.0,
+    )
+}
+
+pub async fn read_underlying_reserved_notional(conn: &mut redis::aio::MultiplexedConnection, underlying: &str) -> f64 {
+    ensure_sim_ledger(conn).await;
+    let key = underlying_reserved_key(underlying);
+    conn.get::<_, f64>(key).await.unwrap_or(0.0)
+}
+
+pub async fn read_strategy_reserved_notional(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> f64 {
     ensure_sim_ledger(conn).await;
     let key = strategy_reserved_key(strategy_id);
     conn.get::<_, f64>(key).await.unwrap_or(0.0)
 }
 
-pub async fn read_family_reserved_notional(conn: &mut redis::aio::Connection, family_id: &str) -> f64 {
+pub async fn read_family_reserved_notional(conn: &mut redis::aio::MultiplexedConnection, family_id: &str) -> f64 {
     ensure_sim_ledger(conn).await;
     let key = family_reserved_key(family_id);
     conn.get::<_, f64>(key).await.unwrap_or(0.0)
 }
 
-pub async fn read_sim_available_cash(conn: &mut redis::aio::Connection) -> f64 {
+pub async fn read_sim_available_cash(conn: &mut redis::aio::MultiplexedConnection) -> f64 {
     ensure_sim_ledger(conn).await;
     conn.get::<_, f64>(SIM_LEDGER_CASH_KEY)
         .await
         .unwrap_or(DEFAULT_SIM_BANKROLL)
 }
 
-pub async fn read_sim_reserved_notional(conn: &mut redis::aio::Connection) -> f64 {
+pub async fn read_sim_reserved_notional(conn: &mut redis::aio::MultiplexedConnection) -> f64 {
     ensure_sim_ledger(conn).await;
     conn.get::<_, f64>(SIM_LEDGER_RESERVED_KEY)
         .await
         .unwrap_or(0.0)
 }
 
-pub async fn read_sim_bankroll(conn: &mut redis::aio::Connection) -> f64 {
+pub async fn read_sim_bankroll(conn: &mut redis::aio::MultiplexedConnection) -> f64 {
     ensure_sim_ledger(conn).await;
     let cash = read_sim_available_cash(conn).await;
     let reserved = read_sim_reserved_notional(conn).await;
@@ -144,8 +179,62 @@ pub async fn read_sim_bankroll(conn: &mut redis::aio::Connection) -> f64 {
     equity
 }
 
+/// Validates that the ledger invariant holds: cash + reserved ≈ bankroll.
+/// Returns true if invariant holds, false if drift detected.
+pub async fn validate_ledger_invariant(conn: &mut redis::aio::MultiplexedConnection) -> bool {
+    let cash = read_sim_available_cash(conn).await;
+    let reserved = read_sim_reserved_notional(conn).await;
+    let bankroll: f64 = conn.get::<_, f64>("sim_bankroll").await.unwrap_or(0.0);
+    let computed = cash + reserved;
+    let diff = (computed - bankroll).abs();
+    if diff > 1.0 {
+        log::error!(
+            "LEDGER_INVARIANT_VIOLATION: cash={:.2} + reserved={:.2} = {:.2} != bankroll={:.2}, diff={:.4}",
+            cash, reserved, computed, bankroll, diff
+        );
+        let _: () = redis::cmd("PUBLISH")
+            .arg("system:alert")
+            .arg(format!(r#"{{"level":"CRITICAL","msg":"LEDGER_DRIFT","diff":{:.4}}}"#, diff))
+            .query_async(conn)
+            .await
+            .unwrap_or(());
+        return false;
+    }
+    true
+}
+
+const SIM_LEDGER_PEAK_EQUITY_KEY: &str = "sim_ledger:peak_equity";
+
+pub async fn read_sim_realized_pnl(conn: &mut redis::aio::MultiplexedConnection) -> f64 {
+    ensure_sim_ledger(conn).await;
+    conn.get::<_, f64>(SIM_LEDGER_REALIZED_PNL_KEY)
+        .await
+        .unwrap_or(0.0)
+}
+
+/// Returns true if the portfolio drawdown from peak equity exceeds the limit.
+/// `max_dd_pct` should be negative (e.g., -5.0 means -5% drawdown triggers).
+pub async fn check_drawdown_breached(conn: &mut redis::aio::MultiplexedConnection, max_dd_pct: f64) -> bool {
+    if max_dd_pct >= 0.0 {
+        return false; // No drawdown limit configured
+    }
+    let equity = read_sim_bankroll(conn).await;
+    if equity <= 0.0 {
+        return true; // Zero equity is a breach
+    }
+    let peak: f64 = conn.get::<_, f64>(SIM_LEDGER_PEAK_EQUITY_KEY).await.unwrap_or(equity);
+    let peak = if equity > peak || peak <= 0.0 {
+        let _: () = conn.set(SIM_LEDGER_PEAK_EQUITY_KEY, equity).await.unwrap_or_default();
+        equity
+    } else {
+        peak
+    };
+    let dd_pct = ((equity - peak) / peak) * 100.0;
+    dd_pct <= max_dd_pct
+}
+
 pub async fn reserve_sim_notional_for_strategy(
-    conn: &mut redis::aio::Connection,
+    conn: &mut redis::aio::MultiplexedConnection,
     strategy_id: &str,
     notional: f64,
 ) -> bool {
@@ -155,10 +244,13 @@ pub async fn reserve_sim_notional_for_strategy(
 
     ensure_sim_ledger(conn).await;
     let family_id = strategy_family(strategy_id);
+    let underlying_id = strategy_underlying(strategy_id);
     let strategy_key = strategy_reserved_key(strategy_id);
     let family_key = family_reserved_key(family_id);
+    let underlying_key = underlying_reserved_key(underlying_id);
     let strategy_cap = strategy_concentration_cap_pct();
     let family_cap = family_concentration_cap_pct();
+    let underlying_cap = underlying_concentration_cap_pct();
     let utilization_cap = global_utilization_cap_pct();
 
     let reserve_script = r#"
@@ -167,10 +259,12 @@ pub async fn reserve_sim_notional_for_strategy(
         local amount = tonumber(ARGV[1]) or 0
         local strategy_reserved = tonumber(redis.call("GET", KEYS[4]) or "0")
         local family_reserved = tonumber(redis.call("GET", KEYS[5]) or "0")
+        local underlying_reserved = tonumber(redis.call("GET", KEYS[6]) or "0")
         local strategy_cap = tonumber(ARGV[2]) or 1
         local family_cap = tonumber(ARGV[3]) or 1
         local utilization_cap = tonumber(ARGV[4]) or 1
         local epsilon = tonumber(ARGV[5]) or 1e-9
+        local underlying_cap = tonumber(ARGV[6]) or 1
         local equity = cash + reserved
         if amount <= 0 then
             redis.call("SET", KEYS[3], equity)
@@ -196,37 +290,51 @@ pub async fn reserve_sim_notional_for_strategy(
             redis.call("SET", KEYS[3], equity)
             return {0, cash, reserved, equity, 4}
         end
+        if underlying_cap > 0 and (underlying_reserved + amount) > ((equity * underlying_cap) + epsilon) then
+            redis.call("SET", KEYS[3], equity)
+            return {0, cash, reserved, equity, 6}
+        end
         cash = cash - amount
         reserved = reserved + amount
         strategy_reserved = strategy_reserved + amount
         family_reserved = family_reserved + amount
+        underlying_reserved = underlying_reserved + amount
         equity = cash + reserved
         redis.call("SET", KEYS[1], cash)
         redis.call("SET", KEYS[2], reserved)
         redis.call("SET", KEYS[3], equity)
         redis.call("SET", KEYS[4], strategy_reserved)
         redis.call("SET", KEYS[5], family_reserved)
+        redis.call("SET", KEYS[6], underlying_reserved)
         return {1, cash, reserved, equity, 0}
     "#;
 
     let eval_result = redis::cmd("EVAL")
         .arg(reserve_script)
-        .arg(5)
+        .arg(6)
         .arg(SIM_LEDGER_CASH_KEY)
         .arg(SIM_LEDGER_RESERVED_KEY)
         .arg(SIM_BANKROLL_KEY)
         .arg(&strategy_key)
         .arg(&family_key)
+        .arg(&underlying_key)
         .arg(notional)
         .arg(strategy_cap)
         .arg(family_cap)
         .arg(utilization_cap)
         .arg(DEFAULT_NUMERIC_EPSILON)
-        .query_async::<_, (i32, f64, f64, f64, i32)>(conn)
+        .arg(underlying_cap)
+        .query_async::<(i32, f64, f64, f64, i32)>(conn)
         .await;
 
     match eval_result {
-        Ok((ok, _cash, _reserved, _equity, _reason_code)) => ok == 1,
+        Ok((ok, _cash, _reserved, _equity, _reason_code)) => {
+            let reserved_ok = ok == 1;
+            if reserved_ok {
+                let _ = validate_ledger_invariant(conn).await;
+            }
+            reserved_ok
+        }
         Err(_) => {
             let cash = read_sim_available_cash(conn).await;
             if cash + 1e-9 < notional {
@@ -239,57 +347,70 @@ pub async fn reserve_sim_notional_for_strategy(
             let current_reserved = read_sim_reserved_notional(conn).await;
             let strategy_reserved = read_strategy_reserved_notional(conn, strategy_id).await;
             let family_reserved = read_family_reserved_notional(conn, family_id).await;
+            let und_reserved = read_underlying_reserved_notional(conn, underlying_id).await;
             if strategy_reserved + notional > (equity * strategy_cap + DEFAULT_NUMERIC_EPSILON) {
                 return false;
             }
             if family_reserved + notional > (equity * family_cap + DEFAULT_NUMERIC_EPSILON) {
                 return false;
             }
+            if und_reserved + notional > (equity * underlying_cap + DEFAULT_NUMERIC_EPSILON) {
+                return false;
+            }
             if current_reserved + notional > (equity * utilization_cap + DEFAULT_NUMERIC_EPSILON) {
                 return false;
             }
-            let _: f64 = redis::cmd("INCRBYFLOAT")
+            let write_result = redis::pipe()
+                .atomic()
+                .cmd("INCRBYFLOAT")
                 .arg(SIM_LEDGER_CASH_KEY)
                 .arg(-notional)
-                .query_async(conn)
-                .await
-                .unwrap_or(cash - notional);
-            let reserved_before = read_sim_reserved_notional(conn).await;
-            let _: f64 = redis::cmd("INCRBYFLOAT")
+                .ignore()
+                .cmd("INCRBYFLOAT")
                 .arg(SIM_LEDGER_RESERVED_KEY)
                 .arg(notional)
-                .query_async(conn)
-                .await
-                .unwrap_or(reserved_before + notional);
-            let _: f64 = redis::cmd("INCRBYFLOAT")
+                .ignore()
+                .cmd("INCRBYFLOAT")
                 .arg(&strategy_key)
                 .arg(notional)
-                .query_async(conn)
-                .await
-                .unwrap_or(strategy_reserved + notional);
-            let _: f64 = redis::cmd("INCRBYFLOAT")
+                .ignore()
+                .cmd("INCRBYFLOAT")
                 .arg(&family_key)
                 .arg(notional)
-                .query_async(conn)
-                .await
-                .unwrap_or(family_reserved + notional);
-            let equity = read_sim_bankroll(conn).await;
-            let _: () = conn.set(SIM_BANKROLL_KEY, equity).await.unwrap_or_default();
+                .ignore()
+                .cmd("INCRBYFLOAT")
+                .arg(&underlying_key)
+                .arg(notional)
+                .ignore()
+                .cmd("SET")
+                .arg(SIM_BANKROLL_KEY)
+                .arg(equity)
+                .ignore()
+                .query_async::<()>(conn)
+                .await;
+
+            if let Err(e) = write_result {
+                log::error!("REDIS_WRITE_FAIL reserve fallback MULTI/EXEC: {}", e);
+                return false;
+            }
+            let _ = validate_ledger_invariant(conn).await;
             true
         }
     }
 }
 
 pub async fn settle_sim_position_for_strategy(
-    conn: &mut redis::aio::Connection,
+    conn: &mut redis::aio::MultiplexedConnection,
     strategy_id: &str,
     reserved_notional: f64,
     pnl: f64,
 ) -> f64 {
     ensure_sim_ledger(conn).await;
     let family_id = strategy_family(strategy_id);
+    let underlying_id = strategy_underlying(strategy_id);
     let strategy_key = strategy_reserved_key(strategy_id);
     let family_key = family_reserved_key(family_id);
+    let underlying_key = underlying_reserved_key(underlying_id);
     let release_notional = if reserved_notional.is_finite() {
         reserved_notional.max(0.0)
     } else {
@@ -302,6 +423,7 @@ pub async fn settle_sim_position_for_strategy(
         local reserved = tonumber(redis.call("GET", KEYS[2]) or "0")
         local strategy_reserved = tonumber(redis.call("GET", KEYS[5]) or "0")
         local family_reserved = tonumber(redis.call("GET", KEYS[6]) or "0")
+        local underlying_reserved = tonumber(redis.call("GET", KEYS[7]) or "0")
         local release_notional = tonumber(ARGV[1]) or 0
         local pnl = tonumber(ARGV[2]) or 0
         if release_notional < 0 then
@@ -311,7 +433,11 @@ pub async fn settle_sim_position_for_strategy(
         reserved = reserved - release
         strategy_reserved = math.max(0, strategy_reserved - release)
         family_reserved = math.max(0, family_reserved - release)
+        underlying_reserved = math.max(0, underlying_reserved - release)
         cash = cash + release + pnl
+        if cash < 0 then
+            cash = 0
+        end
         local equity = cash + reserved
         redis.call("SET", KEYS[1], cash)
         redis.call("SET", KEYS[2], reserved)
@@ -319,83 +445,94 @@ pub async fn settle_sim_position_for_strategy(
         redis.call("INCRBYFLOAT", KEYS[4], pnl)
         redis.call("SET", KEYS[5], strategy_reserved)
         redis.call("SET", KEYS[6], family_reserved)
+        redis.call("SET", KEYS[7], underlying_reserved)
         return {cash, reserved, equity}
     "#;
 
     let eval_result = redis::cmd("EVAL")
         .arg(settle_script)
-        .arg(6)
+        .arg(7)
         .arg(SIM_LEDGER_CASH_KEY)
         .arg(SIM_LEDGER_RESERVED_KEY)
         .arg(SIM_BANKROLL_KEY)
         .arg(SIM_LEDGER_REALIZED_PNL_KEY)
         .arg(&strategy_key)
         .arg(&family_key)
+        .arg(&underlying_key)
         .arg(release_notional)
         .arg(pnl_value)
-        .query_async::<_, (f64, f64, f64)>(conn)
+        .query_async::<(f64, f64, f64)>(conn)
         .await;
 
     match eval_result {
-        Ok((_cash, _reserved, equity)) => equity,
+        Ok((_cash, _reserved, equity)) => {
+            let _ = validate_ledger_invariant(conn).await;
+            equity
+        }
         Err(_) => {
             let reserved_before = read_sim_reserved_notional(conn).await;
             let release = release_notional.min(reserved_before).max(0.0);
-            let _: f64 = redis::cmd("INCRBYFLOAT")
-                .arg(SIM_LEDGER_RESERVED_KEY)
-                .arg(-release)
-                .query_async(conn)
-                .await
-                .unwrap_or((reserved_before - release).max(0.0));
             let strategy_reserved_before = read_strategy_reserved_notional(conn, strategy_id).await;
             let strategy_release = release.min(strategy_reserved_before);
-            let _: f64 = redis::cmd("INCRBYFLOAT")
-                .arg(&strategy_key)
-                .arg(-strategy_release)
-                .query_async(conn)
-                .await
-                .unwrap_or((strategy_reserved_before - strategy_release).max(0.0));
             let family_reserved_before = read_family_reserved_notional(conn, family_id).await;
             let family_release = release.min(family_reserved_before);
-            let _: f64 = redis::cmd("INCRBYFLOAT")
+            let und_reserved_before = read_underlying_reserved_notional(conn, underlying_id).await;
+            let und_release = release.min(und_reserved_before);
+            let write_result = redis::pipe()
+                .atomic()
+                .cmd("INCRBYFLOAT")
+                .arg(SIM_LEDGER_RESERVED_KEY)
+                .arg(-release)
+                .ignore()
+                .cmd("INCRBYFLOAT")
+                .arg(&strategy_key)
+                .arg(-strategy_release)
+                .ignore()
+                .cmd("INCRBYFLOAT")
                 .arg(&family_key)
                 .arg(-family_release)
-                .query_async(conn)
-                .await
-                .unwrap_or((family_reserved_before - family_release).max(0.0));
-            let cash_before = read_sim_available_cash(conn).await;
-            let _: f64 = redis::cmd("INCRBYFLOAT")
+                .ignore()
+                .cmd("INCRBYFLOAT")
+                .arg(&underlying_key)
+                .arg(-und_release)
+                .ignore()
+                .cmd("INCRBYFLOAT")
                 .arg(SIM_LEDGER_CASH_KEY)
                 .arg(release + pnl_value)
-                .query_async(conn)
-                .await
-                .unwrap_or(cash_before + release + pnl_value);
-            let _: f64 = redis::cmd("INCRBYFLOAT")
+                .ignore()
+                .cmd("INCRBYFLOAT")
                 .arg(SIM_LEDGER_REALIZED_PNL_KEY)
                 .arg(pnl_value)
-                .query_async(conn)
-                .await
-                .unwrap_or(pnl_value);
-            read_sim_bankroll(conn).await
+                .ignore()
+                .query_async::<()>(conn)
+                .await;
+
+            if let Err(e) = write_result {
+                log::error!("REDIS_WRITE_FAIL settle fallback MULTI/EXEC: {}", e);
+                return 0.0;
+            }
+            let equity = read_sim_bankroll(conn).await;
+            let _ = validate_ledger_invariant(conn).await;
+            equity
         }
     }
 }
 
 pub async fn release_sim_notional_for_strategy(
-    conn: &mut redis::aio::Connection,
+    conn: &mut redis::aio::MultiplexedConnection,
     strategy_id: &str,
     reserved_notional: f64,
 ) -> f64 {
     settle_sim_position_for_strategy(conn, strategy_id, reserved_notional, 0.0).await
 }
 
-pub async fn read_simulation_reset_ts(conn: &mut redis::aio::Connection) -> i64 {
+pub async fn read_simulation_reset_ts(conn: &mut redis::aio::MultiplexedConnection) -> i64 {
     conn.get::<_, i64>("system:simulation_reset_ts")
         .await
         .unwrap_or(0)
 }
 
-pub async fn read_trading_mode(conn: &mut redis::aio::Connection) -> TradingMode {
+pub async fn read_trading_mode(conn: &mut redis::aio::MultiplexedConnection) -> TradingMode {
     let raw: String = conn.get("system:trading_mode").await.unwrap_or_else(|_| "PAPER".to_string());
     if raw.trim().eq_ignore_ascii_case("LIVE") {
         TradingMode::Live
@@ -445,7 +582,7 @@ pub fn compute_bet_size(bankroll: f64, cfg: &RiskConfig, min_size: f64, max_frac
     size
 }
 
-pub async fn read_strategy_risk_multiplier(conn: &mut redis::aio::Connection, strategy_id: &str) -> f64 {
+pub async fn read_strategy_risk_multiplier(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> f64 {
     if strategy_id.trim().is_empty() {
         return 1.0;
     }
@@ -462,8 +599,22 @@ pub async fn read_strategy_risk_multiplier(conn: &mut redis::aio::Connection, st
     1.0
 }
 
+/// Read anti-martingale size factor from Redis (set by backend risk guard).
+pub async fn read_risk_guard_size_factor(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> f64 {
+    let key = format!("risk_guard:size_factor:{}", strategy_id);
+    let val: Option<f64> = conn.get(&key).await.ok();
+    val.unwrap_or(1.0).clamp(0.1, 1.0)
+}
+
+/// Read post-loss cooldown deadline from Redis (epoch ms). Returns 0 if not set.
+pub async fn read_risk_guard_cooldown(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> i64 {
+    let key = format!("risk_guard:cooldown:{}", strategy_id);
+    let val: Option<i64> = conn.get(&key).await.ok();
+    val.unwrap_or(0)
+}
+
 pub async fn compute_strategy_bet_size(
-    conn: &mut redis::aio::Connection,
+    conn: &mut redis::aio::MultiplexedConnection,
     strategy_id: &str,
     bankroll: f64,
     cfg: &RiskConfig,
@@ -484,6 +635,22 @@ pub async fn compute_strategy_bet_size(
         return 0.0;
     }
 
+    // Apply anti-martingale size reduction (from backend risk guard).
+    let size_factor = read_risk_guard_size_factor(conn, strategy_id).await;
+    if size_factor < 1.0 {
+        sized *= size_factor;
+    }
+
+    // Per-strategy hard notional cap (env: {STRATEGY_ID}_NOTIONAL_CAP).
+    let cap_key = format!("{}_NOTIONAL_CAP", strategy_id);
+    let notional_cap: f64 = std::env::var(&cap_key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(f64::MAX);
+    if notional_cap > 0.0 && sized > notional_cap {
+        sized = notional_cap;
+    }
+
     let hard_max = bankroll * max_fraction;
     if hard_max <= 0.0 || !hard_max.is_finite() {
         return 0.0;
@@ -497,13 +664,16 @@ pub async fn compute_strategy_bet_size(
         return 0.0;
     }
     let family_id = strategy_family(strategy_id);
+    let underlying_id = strategy_underlying(strategy_id);
     let reserved_total = read_sim_reserved_notional(conn).await;
     let reserved_strategy = read_strategy_reserved_notional(conn, strategy_id).await;
     let reserved_family = read_family_reserved_notional(conn, family_id).await;
+    let reserved_underlying = read_underlying_reserved_notional(conn, underlying_id).await;
     let remaining_strategy = (equity * strategy_concentration_cap_pct()) - reserved_strategy;
     let remaining_family = (equity * family_concentration_cap_pct()) - reserved_family;
+    let remaining_underlying = (equity * underlying_concentration_cap_pct()) - reserved_underlying;
     let remaining_utilization = (equity * global_utilization_cap_pct()) - reserved_total;
-    let cap_remaining = remaining_strategy.min(remaining_family).min(remaining_utilization);
+    let cap_remaining = remaining_strategy.min(remaining_family).min(remaining_underlying).min(remaining_utilization);
     if !cap_remaining.is_finite() || cap_remaining <= DEFAULT_NUMERIC_EPSILON {
         return 0.0;
     }
@@ -519,7 +689,7 @@ pub async fn compute_strategy_bet_size(
 
 #[cfg(test)]
 mod tests {
-    use super::strategy_family;
+    use super::{strategy_family, strategy_underlying};
 
     #[test]
     fn strategy_family_maps_known_ids() {
@@ -530,18 +700,33 @@ mod tests {
         assert_eq!(strategy_family("MAKER_MM"), "MARKET_MAKING");
         assert_eq!(strategy_family("unknown"), "GENERIC");
     }
+
+    #[test]
+    fn strategy_underlying_maps_known_ids() {
+        assert_eq!(strategy_underlying("BTC_5M"), "BTC");
+        assert_eq!(strategy_underlying("BTC_15M"), "BTC");
+        assert_eq!(strategy_underlying("ETH_15M"), "ETH");
+        assert_eq!(strategy_underlying("SOL_15M"), "SOL");
+        assert_eq!(strategy_underlying("CEX_SNIPER"), "BTC");
+        assert_eq!(strategy_underlying("MAKER_MM"), "POLY_EVENT");
+        assert_eq!(strategy_underlying("AS_MARKET_MAKER"), "POLY_EVENT");
+        assert_eq!(strategy_underlying("LONGSHOT_BIAS"), "POLY_EVENT");
+        assert_eq!(strategy_underlying("unknown"), "UNKNOWN");
+    }
 }
 
-pub async fn is_strategy_enabled(conn: &mut redis::aio::Connection, strategy_id: &str) -> bool {
+pub async fn is_strategy_enabled(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> bool {
     let key = format!("strategy:enabled:{}", strategy_id);
     let raw: String = conn.get(key).await.unwrap_or_else(|_| "1".to_string());
     raw != "0"
 }
 
-pub async fn publish_heartbeat(conn: &mut redis::aio::Connection, id: &str) {
+pub async fn publish_heartbeat(conn: &mut redis::aio::MultiplexedConnection, id: &str) {
+    let realized_pnl = read_sim_realized_pnl(conn).await;
     let heartbeat = serde_json::json!({
         "id": id,
         "timestamp": Utc::now().timestamp_millis(),
+        "sim_realized_pnl": realized_pnl,
     });
 
     let _: () = conn

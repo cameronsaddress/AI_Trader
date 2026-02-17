@@ -122,18 +122,20 @@ export class HyperliquidClient extends EventEmitter {
     private handleMessage(msg: any) {
         if (msg.channel === 'l2Book') {
             const { coin, time, levels } = msg.data;
-            if (levels && levels[0] && levels[0].length > 0) {
-                // Best Bid/Ask
-                const bestBid = parseFloat(levels[0][0].px);
-                const bestAsk = parseFloat(levels[1][0].px);
-                const midPrice = (bestBid + bestAsk) / 2;
-
-                this.emit('ticker', {
-                    product_id: toCoinbaseSymbol(coin),
-                    price: midPrice,
-                    timestamp: new Date(time).toISOString()
-                });
+            const bestBidRaw = levels?.[0]?.[0]?.px;
+            const bestAskRaw = levels?.[1]?.[0]?.px;
+            const bestBid = Number(bestBidRaw);
+            const bestAsk = Number(bestAskRaw);
+            if (!Number.isFinite(bestBid) || !Number.isFinite(bestAsk) || bestBid <= 0 || bestAsk <= 0) {
+                return;
             }
+
+            const midPrice = (bestBid + bestAsk) / 2;
+            this.emit('ticker', {
+                product_id: toCoinbaseSymbol(coin),
+                price: midPrice,
+                timestamp: new Date(time).toISOString()
+            });
         } else if (msg.channel === 'trades') {
             // Optional: emit trade events
         } else if (msg.channel === 'candle') {

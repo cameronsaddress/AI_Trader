@@ -15,6 +15,7 @@ use crate::strategies::control::{
     is_strategy_enabled,
     publish_heartbeat,
     read_risk_config,
+    read_risk_guard_cooldown,
     read_sim_available_cash,
     read_simulation_reset_ts,
     strategy_variant,
@@ -25,20 +26,35 @@ use crate::strategies::control::{
     TradingMode,
 };
 use crate::strategies::market_data::{update_book_from_market_ws, BinaryBook};
-use crate::strategies::simulation::{pair_net_edge_after_cost, SimCostModel};
+use crate::strategies::simulation::{pair_net_edge_after_cost, polymarket_taker_fee, SimCostModel};
 use crate::strategies::Strategy;
 
-const MIN_NET_EDGE: f64 = 0.0035; // 35 bps after fees/slippage
-const MIN_BUFFER_FLOOR: f64 = 0.0060; // conservative lower bound buffer (60 bps)
+fn min_net_edge() -> f64 {
+    std::env::var("ATOMIC_ARB_MIN_NET_EDGE")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(0.0010) // 10 bps default (was 35)
+}
+fn min_buffer_floor() -> f64 {
+    std::env::var("ATOMIC_ARB_MIN_BUFFER_FLOOR")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(0.0020) // 20 bps default (was 60)
+}
+fn fee_curve_rate() -> f64 {
+    std::env::var("POLYMARKET_FEE_CURVE_RATE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 0.10)
+        .unwrap_or(0.022)
+}
 const FIRE_COOLDOWN_MS: i64 = 2_000;
 const BOOK_STALE_MS: i64 = 1_500;
 const ENTRY_EXPIRY_CUTOFF_SECS: i64 = 20;
 const MIN_LEG_PRICE: f64 = 0.01;
 const MAX_LEG_PRICE: f64 = 0.99;
+const MAX_HOLD_MS: i64 = 120_000;
 
 #[derive(Debug, Clone)]
 struct PendingPaperTrade {
     execution_id: String,
+    market_id: String,
     entry_ts_ms: i64,
     notional_usd: f64,
     ask_sum: f64,
@@ -69,7 +85,7 @@ impl Strategy for AtomicArbStrategy {
     async fn run(&self, redis_client: redis::Client) {
         info!("Starting Atomic Arb [YES ask + NO ask < 1.0]...");
 
-        let mut conn = match redis_client.get_async_connection().await {
+        let mut conn = match redis_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
             Err(e) => {
                 error!("Redis Connect Fail: {}", e);
@@ -127,13 +143,14 @@ impl Strategy for AtomicArbStrategy {
             let _ = poly_ws.send(Message::Text(sub_msg.to_string())).await;
 
             let mut interval = tokio::time::interval(Duration::from_millis(75));
-            let market_expiry = target_market
-                .slug
-                .split("-15m-")
-                .nth(1)
-                .and_then(|s| s.parse::<i64>().ok())
-                .map(|s| s + 900)
-                .unwrap_or(Utc::now().timestamp() + 900);
+            let market_expiry = target_market.expiry_ts.unwrap_or_else(|| {
+                // Fallback: parse expiry from slug pattern "...-15m-{timestamp}"
+                target_market.slug.split("-15m-")
+                    .nth(1)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .map(|s| s + 900)
+                    .unwrap_or(Utc::now().timestamp() + 900)
+            });
 
             let mut book = BinaryBook::default();
             let mut last_fire_ms = 0_i64;
@@ -179,6 +196,13 @@ impl Strategy for AtomicArbStrategy {
                             continue;
                         }
 
+                        // Risk guard cooldown — skip entry if backend set a post-loss cooldown.
+                        let cooldown_until = read_risk_guard_cooldown(&mut conn, "ATOMIC_ARB").await;
+                        if cooldown_until > 0 && now_ms < cooldown_until {
+                            publish_heartbeat(&mut conn, "atomic_arb").await;
+                            continue;
+                        }
+
                         if !book.yes.is_valid() || !book.no.is_valid() || now_ms - book.last_update_ms > BOOK_STALE_MS {
                             publish_heartbeat(&mut conn, "atomic_arb").await;
                             continue;
@@ -188,7 +212,25 @@ impl Strategy for AtomicArbStrategy {
                         if reset_ts > last_seen_reset_ts {
                             last_seen_reset_ts = reset_ts;
                             last_fire_ms = 0;
+                            let release_notional = pending_settlements.iter().map(|p| p.notional_usd).sum::<f64>();
                             pending_settlements.clear();
+                            if release_notional > 0.0 {
+                                let _ = release_sim_notional_for_strategy(&mut conn, "ATOMIC_ARB", release_notional).await;
+                            }
+                        }
+
+                        // Force-close stale pending trades to free capital
+                        {
+                            let mut keep: Vec<PendingPaperTrade> = Vec::new();
+                            for pending in pending_settlements.drain(..) {
+                                let hold_ms = now_ms - pending.entry_ts_ms;
+                                if hold_ms >= MAX_HOLD_MS {
+                                    let _ = settle_sim_position_for_strategy(&mut conn, "ATOMIC_ARB", pending.notional_usd, 0.0).await;
+                                } else {
+                                    keep.push(pending);
+                                }
+                            }
+                            pending_settlements = keep;
                         }
 
                         if book.yes.best_ask < MIN_LEG_PRICE
@@ -202,22 +244,29 @@ impl Strategy for AtomicArbStrategy {
 
                         let ask_sum = book.yes.best_ask + book.no.best_ask;
                         let gross_edge = Self::gross_pair_edge(ask_sum);
-                        let modeled_edge = pair_net_edge_after_cost(gross_edge, cost_model);
-                        let net_edge = modeled_edge.min(gross_edge - MIN_BUFFER_FLOOR);
-                        let passes_threshold = net_edge >= MIN_NET_EDGE;
+                        let static_net_edge = pair_net_edge_after_cost(gross_edge, cost_model);
+                        let yes_fee = polymarket_taker_fee(book.yes.best_ask, fee_curve_rate());
+                        let no_fee = polymarket_taker_fee(book.no.best_ask, fee_curve_rate());
+                        let slippage_rate = cost_model.slippage_bps_per_side / 10_000.0;
+                        let total_dynamic_cost = yes_fee + no_fee + 2.0 * slippage_rate;
+                        let modeled_edge = gross_edge - total_dynamic_cost;
+                        let net_edge = modeled_edge
+                            .min(static_net_edge)
+                            .min(gross_edge - min_buffer_floor());
+                        let passes_threshold = net_edge >= min_net_edge();
                         let seconds_to_expiry = (market_expiry - Utc::now().timestamp()).max(0);
                         let reason = if passes_threshold {
                             format!(
                                 "Net edge {:.2}% cleared entry threshold {:.2}% after {:.2}% modeled+floor cost buffer",
                                 net_edge * 100.0,
-                                MIN_NET_EDGE * 100.0,
+                                min_net_edge() * 100.0,
                                 (gross_edge - net_edge) * 100.0
                             )
                         } else {
                             format!(
                                 "Net edge {:.2}% below required {:.2}% after {:.2}% modeled+floor cost buffer",
                                 net_edge * 100.0,
-                                MIN_NET_EDGE * 100.0,
+                                min_net_edge() * 100.0,
                                 (gross_edge - net_edge) * 100.0
                             )
                         };
@@ -232,7 +281,7 @@ impl Strategy for AtomicArbStrategy {
                             ask_sum,
                             "YES_NO_ASK_SUM",
                             net_edge,
-                            MIN_NET_EDGE,
+                            min_net_edge(),
                             passes_threshold,
                             reason,
                             now_ms,
@@ -240,9 +289,10 @@ impl Strategy for AtomicArbStrategy {
                                 "yes_ask": book.yes.best_ask,
                                 "no_ask": book.no.best_ask,
                                 "gross_edge": gross_edge,
+                                "static_net_edge": static_net_edge,
                                 "modeled_edge": modeled_edge,
                                 "buffer_used": gross_edge - net_edge,
-                                "per_side_cost_rate": cost_model.per_side_cost_rate(),
+                                "dynamic_cost_rate": total_dynamic_cost,
                                 "seconds_to_expiry": seconds_to_expiry,
                             }),
                         );
@@ -296,7 +346,7 @@ impl Strategy for AtomicArbStrategy {
                                             "no_ask": book.no.best_ask,
                                             "gross_edge": gross_edge,
                                             "net_edge": net_edge,
-                                            "threshold": MIN_NET_EDGE,
+                                            "threshold": min_net_edge(),
                                             "shares": shares,
                                             "yes_notional": yes_notional,
                                             "no_notional": no_notional,
@@ -333,9 +383,12 @@ impl Strategy for AtomicArbStrategy {
                             continue;
                         }
 
-                        if net_edge > MIN_NET_EDGE
+                        // Skip if already positioned in this market
+                        let already_in = pending_settlements.iter().any(|p| p.market_id == target_market.market_id);
+                        if net_edge >= min_net_edge()
                             && (now_ms - last_fire_ms) >= FIRE_COOLDOWN_MS
                             && seconds_to_expiry > ENTRY_EXPIRY_CUTOFF_SECS
+                            && !already_in
                         {
                             let available_cash = read_sim_available_cash(&mut conn).await;
                             let risk_cfg = read_risk_config(&mut conn).await;
@@ -363,6 +416,7 @@ impl Strategy for AtomicArbStrategy {
 
                             pending_settlements.push(PendingPaperTrade {
                                 execution_id: execution_id.clone(),
+                                market_id: target_market.market_id.clone(),
                                 entry_ts_ms: now_ms,
                                 notional_usd: investment_usd,
                                 ask_sum,

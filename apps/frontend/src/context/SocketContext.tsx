@@ -10,6 +10,8 @@ interface SocketContextType {
 }
 
 const STORAGE_KEY = 'ai_trader_control_plane_token';
+const TOKEN_SET_AT_KEY = 'ai_trader_token_set_at';
+const TOKEN_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 const SocketContext = createContext<SocketContextType>({
     socket: null,
@@ -32,6 +34,14 @@ export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
         const sessionToken = window.sessionStorage.getItem(STORAGE_KEY)?.trim();
         if (sessionToken) {
+            // Check token age — clear if older than 24h
+            const setAtRaw = window.sessionStorage.getItem(TOKEN_SET_AT_KEY);
+            const setAt = setAtRaw ? Number(setAtRaw) : 0;
+            if (setAt > 0 && Date.now() - setAt > TOKEN_MAX_AGE_MS) {
+                window.sessionStorage.removeItem(STORAGE_KEY);
+                window.sessionStorage.removeItem(TOKEN_SET_AT_KEY);
+                return null;
+            }
             return sessionToken;
         }
         return null;
@@ -42,8 +52,10 @@ export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         if (typeof window !== 'undefined') {
             if (next) {
                 window.sessionStorage.setItem(STORAGE_KEY, next);
+                window.sessionStorage.setItem(TOKEN_SET_AT_KEY, String(Date.now()));
             } else {
                 window.sessionStorage.removeItem(STORAGE_KEY);
+                window.sessionStorage.removeItem(TOKEN_SET_AT_KEY);
             }
         }
         setControlPlaneTokenState(next || null);
@@ -78,6 +90,12 @@ export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         newSocket.on('connect_error', (err) => {
             console.error('[Socket] Connection Error:', err.message);
             setIsConnected(false);
+            // Clear stale token on auth-related errors
+            const msg = (err.message || '').toLowerCase();
+            if (msg.includes('unauthorized') || msg.includes('auth') || msg.includes('403') || msg.includes('401')) {
+                console.warn('[Socket] Auth error detected, clearing stale token');
+                setControlPlaneToken(null);
+            }
         });
 
         setSocket(newSocket);

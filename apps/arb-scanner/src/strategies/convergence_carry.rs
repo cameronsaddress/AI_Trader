@@ -16,6 +16,7 @@ use crate::strategies::control::{
     is_strategy_enabled,
     publish_heartbeat,
     read_risk_config,
+    read_risk_guard_cooldown,
     read_sim_available_cash,
     read_simulation_reset_ts,
     read_trading_mode,
@@ -26,7 +27,8 @@ use crate::strategies::control::{
     TradingMode,
 };
 use crate::strategies::market_data::{update_books_from_market_ws, BinaryBook, TokenBinding};
-use crate::strategies::simulation::{realized_pnl, SimCostModel};
+use crate::strategies::simulation::{polymarket_taker_fee, realized_pnl, SimCostModel};
+use crate::strategies::vol_regime::{detect_regime, regime_exit_multipliers};
 use crate::strategies::Strategy;
 
 const BOOK_STALE_MS: i64 = 2_000;
@@ -36,8 +38,21 @@ const LIVE_PREVIEW_COOLDOWN_MS: i64 = 2_000;
 const MAX_UNIVERSE_MARKETS: usize = 32;
 const MIN_TIME_TO_EXPIRY_SECS: i64 = 90;
 const MAX_TIME_TO_EXPIRY_SECS: i64 = 6 * 60 * 60;
-const MIN_PARITY_EDGE: f64 = 0.020; // 2.0c
-const EXIT_PARITY_EDGE: f64 = 0.004; // 0.4c
+fn min_parity_edge() -> f64 {
+    std::env::var("CONVERGENCE_CARRY_MIN_PARITY_EDGE")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(0.008) // 0.8c default (was 2.0c)
+}
+fn exit_parity_edge() -> f64 {
+    std::env::var("CONVERGENCE_CARRY_EXIT_PARITY_EDGE")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(0.002) // 0.2c default (was 0.4c)
+}
+fn fee_curve_rate() -> f64 {
+    std::env::var("POLYMARKET_FEE_CURVE_RATE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 0.10)
+        .unwrap_or(0.022)
+}
 const MAX_ENTRY_SPREAD: f64 = 0.08; // 8c
 const MIN_ENTRY_PRICE: f64 = 0.06;
 const MAX_ENTRY_PRICE: f64 = 0.94;
@@ -155,7 +170,7 @@ impl Strategy for ConvergenceCarryStrategy {
     async fn run(&self, redis_client: redis::Client) {
         info!("Starting Convergence Carry [multi-market parity reversion]");
 
-        let mut conn = match redis_client.get_async_connection().await {
+        let mut conn = match redis_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
             Err(e) => {
                 error!("Redis connect failed: {}", e);
@@ -287,6 +302,13 @@ impl Strategy for ConvergenceCarryStrategy {
                             continue;
                         }
 
+                        // Risk guard cooldown — skip entry if backend set a post-loss cooldown.
+                        let cooldown_until = read_risk_guard_cooldown(&mut conn, "CONVERGENCE_CARRY").await;
+                        if cooldown_until > 0 && now_ms < cooldown_until {
+                            publish_heartbeat(&mut conn, "convergence_carry").await;
+                            continue;
+                        }
+
                         let enabled = is_strategy_enabled(&mut conn, "CONVERGENCE_CARRY").await;
                         if !enabled {
                             if !open_positions.is_empty() {
@@ -315,21 +337,47 @@ impl Strategy for ConvergenceCarryStrategy {
                         // Exit management first.
                         let mut keep_positions: Vec<Position> = Vec::new();
                         for pos in open_positions.drain(..) {
-                            let Some(book) = books.get(&pos.market_id) else {
-                                keep_positions.push(pos);
-                                continue;
-                            };
-                            if now_ms - book.last_update_ms > BOOK_STALE_MS || !book.yes.is_valid() || !book.no.is_valid() {
-                                keep_positions.push(pos);
+                            let hold_ms = now_ms - pos.timestamp_ms;
+
+                            // Force-close positions whose book is missing or stale
+                            // (e.g. market fell out of universe). Check time exit BEFORE
+                            // staleness guard so orphaned positions don't lock capital forever.
+                            let book_opt = books.get(&pos.market_id);
+                            let book_fresh = book_opt
+                                .map(|b| now_ms - b.last_update_ms <= BOOK_STALE_MS && b.yes.is_valid() && b.no.is_valid())
+                                .unwrap_or(false);
+
+                            if !book_fresh {
+                                if hold_ms >= MAX_HOLD_MS {
+                                    // Force-close at entry price (zero PnL) to free capital
+                                    let _ = settle_sim_position_for_strategy(&mut conn, "CONVERGENCE_CARRY", pos.size, 0.0).await;
+                                    let pnl_msg = serde_json::json!({
+                                        "execution_id": pos.execution_id,
+                                        "strategy": "CONVERGENCE_CARRY",
+                                        "variant": variant.as_str(),
+                                        "pnl": 0.0, "notional": pos.size, "timestamp": now_ms,
+                                        "mode": "PAPER",
+                                        "details": {
+                                            "action": "CLOSE_POSITION", "reason": "STALE_TIMEOUT",
+                                            "market_id": pos.market_id, "question": pos.question,
+                                            "side": Self::side_label(pos.side),
+                                            "entry": pos.entry_price, "hold_ms": hold_ms,
+                                        }
+                                    });
+                                    let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                                } else {
+                                    keep_positions.push(pos);
+                                }
                                 continue;
                             }
+
+                            let book = book_opt.unwrap();
                             let mark = Self::mark_price(book, pos.side);
                             if mark <= 0.0 || pos.entry_price <= 0.0 {
                                 keep_positions.push(pos);
                                 continue;
                             }
 
-                            let hold_ms = now_ms - pos.timestamp_ms;
                             let gross_return = (mark - pos.entry_price) / pos.entry_price;
                             let (yes_edge, no_edge) = Self::parity_edges(book);
                             let active_edge = match pos.side {
@@ -337,13 +385,26 @@ impl Strategy for ConvergenceCarryStrategy {
                                 Side::No => no_edge,
                             };
 
-                            let close_reason = if gross_return >= TAKE_PROFIT_PCT {
+                            // Adaptive exit via vol-regime detection
+                            let price_history_slice: Vec<(i64, f64)> = vec![
+                                (pos.timestamp_ms, pos.entry_price),
+                                (now_ms, mark),
+                            ];
+                            let (tp_mult, sl_mult) = if let Some(regime) = detect_regime(&price_history_slice) {
+                                regime_exit_multipliers(&regime)
+                            } else {
+                                (1.0, 1.0)
+                            };
+                            let adjusted_tp = TAKE_PROFIT_PCT * tp_mult;
+                            let adjusted_sl = STOP_LOSS_PCT * sl_mult;
+
+                            let close_reason = if gross_return >= adjusted_tp {
                                 Some("TAKE_PROFIT")
-                            } else if gross_return <= STOP_LOSS_PCT {
+                            } else if gross_return <= adjusted_sl {
                                 Some("STOP_LOSS")
                             } else if hold_ms >= MAX_HOLD_MS {
                                 Some("TIME_EXIT")
-                            } else if active_edge <= EXIT_PARITY_EDGE {
+                            } else if active_edge <= exit_parity_edge() {
                                 Some("EDGE_DECAY")
                             } else {
                                 None
@@ -404,14 +465,17 @@ impl Strategy for ConvergenceCarryStrategy {
 
                             let entry_price = Self::entry_price(book, side);
                             let spread = Self::entry_spread(book, side);
-                            if entry_price < MIN_ENTRY_PRICE
-                                || entry_price > MAX_ENTRY_PRICE
+                            if !(MIN_ENTRY_PRICE..=MAX_ENTRY_PRICE).contains(&entry_price)
                                 || spread > MAX_ENTRY_SPREAD
                             {
                                 continue;
                             }
 
-                            let threshold = MIN_PARITY_EDGE + cost_model.round_trip_cost_rate();
+                            let slippage_rate = cost_model.slippage_bps_per_side / 10_000.0;
+                            let entry_fee = polymarket_taker_fee(entry_price, fee_curve_rate());
+                            let exit_fee = polymarket_taker_fee(entry_price, fee_curve_rate()); // approximate exit ≈ entry
+                            let dynamic_round_trip_cost = entry_fee + exit_fee + 2.0 * slippage_rate;
+                            let threshold = min_parity_edge() + dynamic_round_trip_cost;
                             if !edge.is_finite() {
                                 continue;
                             }
@@ -480,9 +544,11 @@ impl Strategy for ConvergenceCarryStrategy {
                         );
                         let _: () = conn.publish("arbitrage:scan", scan_msg.to_string()).await.unwrap_or_default();
 
+                        let already_in_market = open_positions.iter().any(|p| p.market_id == market.market_id);
                         if open_positions.len() >= MAX_OPEN_POSITIONS
                             || now_ms - last_entry_ms < ENTRY_COOLDOWN_MS
                             || !passes_threshold
+                            || already_in_market
                         {
                             publish_heartbeat(&mut conn, "convergence_carry").await;
                             continue;

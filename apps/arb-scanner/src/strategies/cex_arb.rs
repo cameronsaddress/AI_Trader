@@ -19,6 +19,7 @@ use crate::strategies::control::{
     is_strategy_enabled,
     publish_heartbeat,
     read_risk_config,
+    read_risk_guard_cooldown,
     read_sim_available_cash,
     read_simulation_reset_ts,
     strategy_variant,
@@ -30,6 +31,9 @@ use crate::strategies::control::{
 };
 use crate::strategies::market_data::{update_book_from_market_ws, BinaryBook};
 use crate::strategies::simulation::{realized_pnl, SimCostModel};
+use crate::strategies::vol_regime::{
+    detect_regime, regime_edge_adjustment_bps, regime_exit_multipliers, regime_sizing_multiplier,
+};
 use crate::strategies::Strategy;
 
 const COINBASE_ADVANCED_WS_URL: &str = "wss://advanced-trade-ws.coinbase.com";
@@ -194,7 +198,7 @@ impl Strategy for CexArbStrategy {
     async fn run(&self, redis_client: redis::Client) {
         info!("Starting CEX Latency Sniper [Coinbase Momentum vs Polymarket Quotes]...");
 
-        let mut conn = match redis_client.get_async_connection().await {
+        let mut conn = match redis_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
             Err(e) => {
                 error!("Redis Connect Fail: {}", e);
@@ -375,6 +379,13 @@ impl Strategy for CexArbStrategy {
                             continue;
                         }
 
+                        // Risk guard cooldown — skip entry if backend set a post-loss cooldown.
+                        let cooldown_until = read_risk_guard_cooldown(&mut conn, "CEX_SNIPER").await;
+                        if cooldown_until > 0 && now_ms < cooldown_until {
+                            publish_heartbeat(&mut conn, "cex_arb").await;
+                            continue;
+                        }
+
                         let (cb_price, cb_ts_ms) = *latest_cb_price.read().await;
                         if cb_price <= 0.0
                             || now_ms - cb_ts_ms > COINBASE_STALE_MS
@@ -421,24 +432,59 @@ impl Strategy for CexArbStrategy {
                         }
 
                         let momentum_sigma = rolling_std(&momentum_history);
+                        let cb_price_vec: Vec<(i64, f64)> = cb_history.iter().copied().collect();
+                        let regime_snapshot = detect_regime(&cb_price_vec);
+                        let regime_label = regime_snapshot
+                            .as_ref()
+                            .map(|regime| match regime.regime {
+                                crate::strategies::vol_regime::Regime::Trending => "TRENDING",
+                                crate::strategies::vol_regime::Regime::MeanReverting => "MEAN_REVERTING",
+                                crate::strategies::vol_regime::Regime::Choppy => "CHOPPY",
+                            })
+                            .unwrap_or("UNKNOWN");
+                        let regime_hurst = regime_snapshot
+                            .as_ref()
+                            .map(|regime| regime.hurst_exponent)
+                            .unwrap_or(0.5);
+                        let regime_parkinson_vol = regime_snapshot
+                            .as_ref()
+                            .map(|regime| regime.parkinson_vol)
+                            .unwrap_or(0.0);
+                        let regime_edge_adjustment = regime_snapshot
+                            .as_ref()
+                            .map(regime_edge_adjustment_bps)
+                            .unwrap_or(0.0);
+                        let regime_size_multiplier = regime_snapshot
+                            .as_ref()
+                            .map(regime_sizing_multiplier)
+                            .unwrap_or(1.0);
+                        let (tp_mult, sl_mult) = regime_snapshot
+                            .as_ref()
+                            .map(regime_exit_multipliers)
+                            .unwrap_or((1.0, 1.0));
                         let adaptive_threshold = (MOMENTUM_ENTRY_THRESHOLD
                             .max(momentum_sigma * MOMENTUM_STD_MULTIPLIER))
                             .min(MOMENTUM_MAX_THRESHOLD);
-                        let required_momentum = adaptive_threshold + cost_model.round_trip_cost_rate();
+                        let required_momentum = (adaptive_threshold
+                            + cost_model.round_trip_cost_rate()
+                            + regime_edge_adjustment)
+                            .max(cost_model.round_trip_cost_rate() * 0.5);
                         let passes_threshold = momentum.abs() >= required_momentum;
                         let direction = if momentum >= 0.0 { "YES" } else { "NO" };
                         let reason = if passes_threshold {
                             format!(
-                                "Momentum {:.2}% exceeds adaptive+cost {:.2}% threshold ({})",
+                                "Momentum {:.2}% exceeds adaptive+cost+regime {:.2}% threshold ({}) [{}]",
                                 momentum * 100.0,
                                 required_momentum * 100.0,
-                                direction
+                                direction,
+                                regime_label
                             )
                         } else {
                             format!(
-                                "Momentum {:.2}% below adaptive+cost {:.2}% threshold",
+                                "Momentum {:.2}% below adaptive+cost+regime {:.2}% threshold [{}]",
                                 momentum * 100.0,
-                                required_momentum * 100.0
+                                required_momentum * 100.0,
+                                regime_label
                             )
                         };
 
@@ -462,6 +508,13 @@ impl Strategy for CexArbStrategy {
                                     "yes_mid": book.yes.mid(),
                                     "no_mid": book.no.mid(),
                                     "momentum_sigma": momentum_sigma,
+                                    "regime": regime_label,
+                                    "regime_hurst": regime_hurst,
+                                    "regime_parkinson_vol": regime_parkinson_vol,
+                                    "regime_edge_adjustment_bps": regime_edge_adjustment * 10_000.0,
+                                    "regime_size_multiplier": regime_size_multiplier,
+                                    "tp_multiplier": tp_mult,
+                                    "sl_multiplier": sl_mult,
                                     "required_momentum": required_momentum,
                                     "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
                                 }),
@@ -488,7 +541,7 @@ impl Strategy for CexArbStrategy {
                             {
                                 let risk_cfg = read_risk_config(&mut conn).await;
                                 let available_cash = read_sim_available_cash(&mut conn).await;
-                                let preview_size = compute_strategy_bet_size(
+                                let raw_preview_size = compute_strategy_bet_size(
                                     &mut conn,
                                     "CEX_SNIPER",
                                     available_cash,
@@ -496,6 +549,9 @@ impl Strategy for CexArbStrategy {
                                     10.0,
                                     0.20,
                                 ).await;
+                                let preview_size = (raw_preview_size * regime_size_multiplier)
+                                    .min(available_cash)
+                                    .max(0.0);
                                 if preview_size > 0.0 {
                                     let preview_price = if eligible_long { book.yes.best_ask } else { book.no.best_ask };
                                     if preview_price > 0.0 {
@@ -513,6 +569,10 @@ impl Strategy for CexArbStrategy {
                                                 "momentum": momentum,
                                                 "adaptive_threshold": adaptive_threshold,
                                                 "required_momentum": required_momentum,
+                                                "regime": regime_label,
+                                                "regime_hurst": regime_hurst,
+                                                "regime_parkinson_vol": regime_parkinson_vol,
+                                                "regime_size_multiplier": regime_size_multiplier,
                                                 "coinbase_price": cb_price,
                                                 "time_to_expiry_ms": time_to_expiry_ms,
                                                 "yes_spread": yes_spread,
@@ -588,10 +648,14 @@ impl Strategy for CexArbStrategy {
                                 let gross_return = (exit_price - pos.entry_poly) / pos.entry_poly;
                                 let hold_ms = now_ms - pos.timestamp_ms;
 
-                                if gross_return >= TAKE_PROFIT_PCT || gross_return <= STOP_LOSS_PCT || hold_ms >= MAX_HOLD_MS {
-                                    let reason = if gross_return >= TAKE_PROFIT_PCT {
+                                // Adaptive exit multipliers from the current regime snapshot.
+                                let adjusted_tp = TAKE_PROFIT_PCT * tp_mult;
+                                let adjusted_sl = STOP_LOSS_PCT * sl_mult;
+
+                                if gross_return >= adjusted_tp || gross_return <= adjusted_sl || hold_ms >= MAX_HOLD_MS {
+                                    let reason = if gross_return >= adjusted_tp {
                                         "TAKE_PROFIT"
-                                    } else if gross_return <= STOP_LOSS_PCT {
+                                    } else if gross_return <= adjusted_sl {
                                         "STOP_LOSS"
                                     } else {
                                         "TIME_EXIT"
@@ -609,12 +673,16 @@ impl Strategy for CexArbStrategy {
                                 let time_to_expiry_ms = market_expiry.saturating_mul(1000) - now_ms;
                                 let yes_spread = (book.yes.best_ask - book.yes.best_bid).max(0.0);
                                 let no_spread = (book.no.best_ask - book.no.best_bid).max(0.0);
+                                // Skip if already positioned on the same side (duplicate market guard)
+                                let has_yes = positions.iter().any(|p| matches!(p.side, Side::Yes));
+                                let has_no = positions.iter().any(|p| matches!(p.side, Side::No));
                                 if time_to_expiry_ms < ENTRY_EXPIRY_CUTOFF_MS {
                                     // Skip new entries close to settlement to avoid execution and resolution risk.
                                 } else if momentum >= required_momentum
                                     && book.yes.best_ask >= 0.03
                                     && book.yes.best_ask <= 0.97
                                     && yes_spread <= MAX_ENTRY_SPREAD
+                                    && !has_yes
                                 {
                                     let pos = Position {
                                         id: Uuid::new_v4().to_string(),
@@ -629,6 +697,7 @@ impl Strategy for CexArbStrategy {
                                     && book.no.best_ask >= 0.03
                                     && book.no.best_ask <= 0.97
                                     && no_spread <= MAX_ENTRY_SPREAD
+                                    && !has_no
                                 {
                                     let pos = Position {
                                         id: Uuid::new_v4().to_string(),
@@ -657,12 +726,13 @@ impl Strategy for CexArbStrategy {
                                 "timestamp": now_ms,
                                 "bankroll": new_bankroll,
                                 "mode": "PAPER",
-                                "details": {
-                                    "action": "CLOSE_SNIPE",
-                                    "reason": reason,
-                                    "side": match pos.side { Side::Yes => "YES", Side::No => "NO" },
-                                    "entry": pos.entry_poly,
-                                    "exit": exit_price,
+                                    "details": {
+                                        "action": "CLOSE_SNIPE",
+                                        "reason": reason,
+                                        "regime": regime_label,
+                                        "side": match pos.side { Side::Yes => "YES", Side::No => "NO" },
+                                        "entry": pos.entry_poly,
+                                        "exit": exit_price,
                                     "entry_cb": pos.entry_cb,
                                     "exit_cb": cb_price,
                                     "hold_ms": hold_ms,
@@ -695,7 +765,7 @@ impl Strategy for CexArbStrategy {
                         if let Some(mut pos) = new_entry {
                             let risk_cfg = read_risk_config(&mut conn).await;
                             let available_cash = read_sim_available_cash(&mut conn).await;
-                            pos.size = compute_strategy_bet_size(
+                            let base_size = compute_strategy_bet_size(
                                 &mut conn,
                                 "CEX_SNIPER",
                                 available_cash,
@@ -703,6 +773,9 @@ impl Strategy for CexArbStrategy {
                                 10.0,
                                 0.20,
                             ).await;
+                            pos.size = (base_size * regime_size_multiplier)
+                                .min(available_cash)
+                                .max(0.0);
                             if pos.size <= 0.0 {
                                 publish_heartbeat(&mut conn, "cex_arb").await;
                                 continue;
@@ -738,6 +811,9 @@ impl Strategy for CexArbStrategy {
                                     "direction": direction,
                                     "momentum": momentum,
                                     "adaptive_threshold": adaptive_threshold,
+                                    "required_momentum": required_momentum,
+                                    "regime": regime_label,
+                                    "regime_size_multiplier": regime_size_multiplier,
                                     "position_id": pos.id,
                                 }
                             });

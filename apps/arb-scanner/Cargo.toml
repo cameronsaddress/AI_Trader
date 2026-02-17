@@ -7,7 +7,7 @@ edition = "2021"
 tokio = { version = "1.36", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-redis = { version = "0.24", features = ["tokio-comp"] }
+redis = { version = "0.32.7", features = ["tokio-comp"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures = "0.3"
 env_logger = "0.11"
@@ -28,4 +28,3 @@ rand = "=0.8.5"
 regex = "1.10"
 statrs = "0.16"
 uuid = { version = "1.7", features = ["v4"] }
-

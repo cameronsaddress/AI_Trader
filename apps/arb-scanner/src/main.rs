@@ -1,5 +1,9 @@
+#![recursion_limit = "256"]
+
 use tokio::time::{sleep, Duration};
+use tokio::signal;
 use log::{error, info, warn};
+use redis::AsyncCommands;
 use std::env;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +21,8 @@ use crate::strategies::graph_arb::GraphArbStrategy;
 use crate::strategies::convergence_carry::ConvergenceCarryStrategy;
 use crate::strategies::maker_mm::MakerMmStrategy;
 use crate::strategies::btc_5m_lag::Btc5mLagStrategy;
+use crate::strategies::as_market_maker::AsMarketMakerStrategy;
+use crate::strategies::longshot_bias::LongshotBiasStrategy;
 
 const STRATEGY_LOCK_TTL_MS: i64 = 30_000;
 const STRATEGY_LOCK_REFRESH_MS: u64 = 10_000;
@@ -34,6 +40,8 @@ fn canonical_strategy_id(input: &str) -> &'static str {
         "GRAPH_ARB" => "GRAPH_ARB",
         "CONVERGENCE_CARRY" => "CONVERGENCE_CARRY",
         "MAKER_MM" => "MAKER_MM",
+        "AS_MARKET_MAKER" => "AS_MARKET_MAKER",
+        "LONGSHOT_BIAS" => "LONGSHOT_BIAS",
         _ => "BTC_15M",
     }
 }
@@ -52,7 +60,7 @@ async fn acquire_strategy_lock(
     strategy_id: &str,
     owner: &str,
 ) -> Result<bool, redis::RedisError> {
-    let mut conn = client.get_async_connection().await?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
     let lock_key = format!("strategy:process_lock:{}", strategy_id);
     let result: Option<String> = redis::cmd("SET")
         .arg(&lock_key)
@@ -70,7 +78,7 @@ async fn release_strategy_lock(
     strategy_id: &str,
     owner: &str,
 ) -> Result<(), redis::RedisError> {
-    let mut conn = client.get_async_connection().await?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
     let lock_key = format!("strategy:process_lock:{}", strategy_id);
     let release_script = r#"
         if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -92,7 +100,7 @@ fn spawn_strategy_lock_lease(client: redis::Client, strategy_id: String, owner: 
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_millis(STRATEGY_LOCK_REFRESH_MS)).await;
-            let mut conn = match client.get_async_connection().await {
+            let mut conn = match client.get_multiplexed_async_connection().await {
                 Ok(c) => c,
                 Err(error) => {
                     error!("Strategy lock lease reconnect failed for {}: {}", strategy_id, error);
@@ -115,16 +123,43 @@ fn spawn_strategy_lock_lease(client: redis::Client, strategy_id: String, owner: 
                 .arg(&lock_key)
                 .arg(&owner)
                 .arg(STRATEGY_LOCK_TTL_MS)
-                .query_async::<_, i32>(&mut conn)
+                .query_async::<i32>(&mut conn)
                 .await
                 .unwrap_or(0);
 
             if renewed != 1 {
-                error!(
-                    "Strategy process lock lost for {}. Exiting to prevent duplicate execution.",
-                    strategy_id
-                );
-                process::exit(1);
+                warn!("Strategy lock renewal failed for {}, retrying...", strategy_id);
+                let mut recovered = false;
+                for retry in 1..=3 {
+                    sleep(Duration::from_secs(10)).await;
+                    if let Ok(mut retry_conn) = client.get_multiplexed_async_connection().await {
+                        let r: i32 = redis::cmd("EVAL")
+                            .arg(renew_script)
+                            .arg(1)
+                            .arg(&lock_key)
+                            .arg(&owner)
+                            .arg(STRATEGY_LOCK_TTL_MS)
+                            .query_async(&mut retry_conn)
+                            .await
+                            .unwrap_or(0);
+                        if r == 1 {
+                            info!("Strategy lock recovered for {} on retry {}", strategy_id, retry);
+                            recovered = true;
+                            break;
+                        }
+                    }
+                    warn!("Lock retry {}/3 failed for {}", retry, strategy_id);
+                }
+                if !recovered {
+                    error!("Strategy lock permanently lost for {}. Exiting.", strategy_id);
+                    if let Ok(mut alert_conn) = client.get_multiplexed_async_connection().await {
+                        let _: () = alert_conn.publish::<_, _, ()>(
+                            "system:alert",
+                            format!(r#"{{"level":"CRITICAL","strategy":"{}","msg":"LOCK_LOST_EXIT"}}"#, strategy_id),
+                        ).await.unwrap_or(());
+                    }
+                    process::exit(1);
+                }
             }
         }
     });
@@ -175,14 +210,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "GRAPH_ARB" => Box::new(GraphArbStrategy::new()),
         "CONVERGENCE_CARRY" => Box::new(ConvergenceCarryStrategy::new()),
         "MAKER_MM" => Box::new(MakerMmStrategy::new()),
+        "AS_MARKET_MAKER" => Box::new(AsMarketMakerStrategy::new()),
+        "LONGSHOT_BIAS" => Box::new(LongshotBiasStrategy::new()),
         _ => {
             error!("Unknown Strategy Type. Defaulting to BTC_15M");
             Box::new(MarketNeutralStrategy::new("BTC".to_string()))
         }
     };
 
-    strategy.run(client.clone()).await;
+    // Graceful shutdown: listen for SIGTERM/SIGINT and stop strategy cleanly.
+    let shutdown_strategy_id = strategy_id.clone();
+    let shutdown = async move {
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to register SIGTERM handler");
+        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+            .expect("Failed to register SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => info!("[{}] SIGTERM received", shutdown_strategy_id),
+            _ = sigint.recv() => info!("[{}] SIGINT received", shutdown_strategy_id),
+        }
+    };
+
+    tokio::select! {
+        _ = strategy.run(client.clone()) => {
+            info!("[{}] Strategy run completed", strategy_id);
+        },
+        _ = shutdown => {
+            info!("[{}] Shutdown signal received, cleaning up...", strategy_id);
+        },
+    }
+
     let _ = release_strategy_lock(&client, &strategy_id, &owner).await;
+    info!("[{}] Lock released, exiting cleanly.", strategy_id);
 
     Ok(())
 }

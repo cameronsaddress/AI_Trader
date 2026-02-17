@@ -7,9 +7,12 @@ pub mod graph_arb;
 pub mod convergence_carry;
 pub mod maker_mm;
 pub mod btc_5m_lag;
+pub mod as_market_maker;
+pub mod longshot_bias;
 pub mod control;
 pub mod market_data;
 pub mod simulation;
+pub mod vol_regime;
 
 use async_trait::async_trait;
 

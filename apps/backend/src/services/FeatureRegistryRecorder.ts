@@ -152,11 +152,15 @@ function parseEvent(payload: unknown): FeatureRegistryEvent | null {
     return null;
 }
 
+const MAX_FILE_SIZE_BYTES = Number(process.env.FEATURE_REGISTRY_MAX_SIZE_MB || '100') * 1024 * 1024;
+const ROTATION_CHECK_INTERVAL = 500; // check every N writes
+
 export class FeatureRegistryRecorder {
     private readonly filePath: string;
     private initialized = false;
     private writeQueue: Promise<void> = Promise.resolve();
     private rowCount = 0;
+    private writesSinceRotationCheck = 0;
 
     constructor(filePath?: string) {
         this.filePath = resolveRecorderPath(filePath);
@@ -173,17 +177,36 @@ export class FeatureRegistryRecorder {
             await fs.writeFile(this.filePath, '', { encoding: 'utf8' });
         }
         try {
-            const content = await fs.readFile(this.filePath, 'utf8');
-            this.rowCount = content.split('\n').filter((line) => line.trim().length > 0).length;
+            const stat = await fs.stat(this.filePath);
+            // Estimate row count from file size (~200 bytes per row avg)
+            this.rowCount = Math.round(stat.size / 200);
+            // If file exceeds max size, rotate immediately on boot
+            if (stat.size > MAX_FILE_SIZE_BYTES) {
+                await this.rotateFile();
+            }
         } catch {
             this.rowCount = 0;
         }
         this.initialized = true;
-        logger.info(`[FeatureRegistryRecorder] writing feature events to ${this.filePath}`);
+        logger.info(`[FeatureRegistryRecorder] writing feature events to ${this.filePath} (max ${MAX_FILE_SIZE_BYTES / 1024 / 1024}MB)`);
     }
 
     public getPath(): string {
         return this.filePath;
+    }
+
+    private async rotateFile(): Promise<void> {
+        const oldPath = this.filePath + '.old';
+        try {
+            await fs.unlink(oldPath);
+        } catch { /* may not exist */ }
+        try {
+            await fs.rename(this.filePath, oldPath);
+        } catch { /* may not exist */ }
+        await fs.writeFile(this.filePath, '', { encoding: 'utf8' });
+        this.rowCount = 0;
+        this.writesSinceRotationCheck = 0;
+        logger.info(`[FeatureRegistryRecorder] rotated log file (old preserved at ${oldPath})`);
     }
 
     public record(payload: unknown): void {
@@ -197,6 +220,17 @@ export class FeatureRegistryRecorder {
             }
             await fs.appendFile(this.filePath, `${JSON.stringify(parsed)}\n`, { encoding: 'utf8' });
             this.rowCount += 1;
+            this.writesSinceRotationCheck += 1;
+            // Periodic size check for rotation
+            if (this.writesSinceRotationCheck >= ROTATION_CHECK_INTERVAL) {
+                this.writesSinceRotationCheck = 0;
+                try {
+                    const stat = await fs.stat(this.filePath);
+                    if (stat.size > MAX_FILE_SIZE_BYTES) {
+                        await this.rotateFile();
+                    }
+                } catch { /* best-effort */ }
+            }
         }).catch((error) => {
             logger.error(`[FeatureRegistryRecorder] failed to persist event: ${String(error)}`);
         });
