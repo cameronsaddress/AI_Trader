@@ -40,6 +40,10 @@ import {
     restoreExecutionHistory,
     type StrategyExecutionHistoryStoreConfig,
 } from './modules/execution/strategyExecutionHistoryStore';
+import {
+    classifyEntryFreshnessViolation,
+    type EntryFreshnessViolationCategory,
+} from './modules/execution/entryFreshnessSlo';
 import { scheduleNonOverlappingTask } from './modules/runtime/scheduler';
 import {
     buildModelGateCalibrationSamples,
@@ -432,7 +436,6 @@ const strategyTradeSamples: Record<string, StrategyTradeSample[]> = Object.fromE
 );
 const REJECTED_SIGNAL_RETENTION = 2_000;
 const rejectedSignalHistory: RejectedSignalRecord[] = [];
-type EntryFreshnessViolationCategory = 'MISSING_TELEMETRY' | 'STALE_SOURCE' | 'STALE_GATE' | 'OTHER';
 type EntryFreshnessSloStrategy = {
     strategy: string;
     total: number;
@@ -2245,25 +2248,6 @@ function pushTradeSample(sample: StrategyTradeSample): void {
     if (bucket.length > STRATEGY_SAMPLE_RETENTION) {
         bucket.splice(0, bucket.length - STRATEGY_SAMPLE_RETENTION);
     }
-}
-
-function classifyEntryFreshnessViolation(reason: string): EntryFreshnessViolationCategory {
-    const normalized = reason.toLowerCase();
-    if (normalized.includes('missing entry freshness telemetry')) {
-        return 'MISSING_TELEMETRY';
-    }
-    if (
-        normalized.includes('freshness gate rejected entry')
-        || normalized.includes('stale scan')
-        || normalized.includes('missing scan')
-        || normalized.includes('scan not found')
-    ) {
-        return 'STALE_GATE';
-    }
-    if (normalized.includes('source age') || normalized.includes('exceeds')) {
-        return 'STALE_SOURCE';
-    }
-    return 'OTHER';
 }
 
 function ensureEntryFreshnessSloStrategy(strategy: string): EntryFreshnessSloStrategy {
