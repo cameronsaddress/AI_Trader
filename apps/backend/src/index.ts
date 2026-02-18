@@ -34,6 +34,12 @@ import {
     processArbitrageExecutionWorker,
     type RejectedSignalRecord,
 } from './modules/execution/arbExecutionPipeline';
+import {
+    clearExecutionHistory as clearExecutionHistoryStore,
+    persistExecutionHistoryEntry,
+    restoreExecutionHistory,
+    type StrategyExecutionHistoryStoreConfig,
+} from './modules/execution/strategyExecutionHistoryStore';
 import { scheduleNonOverlappingTask } from './modules/runtime/scheduler';
 import {
     buildModelGateCalibrationSamples,
@@ -183,6 +189,11 @@ const STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX = (
     process.env.STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX
     || 'system:strategy_execution_history:v1:'
 ).trim() || 'system:strategy_execution_history:v1:';
+const STRATEGY_EXECUTION_HISTORY_STORE_CONFIG: StrategyExecutionHistoryStoreConfig = {
+    redisPrefix: STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX,
+    limit: STRATEGY_EXECUTION_HISTORY_LIMIT,
+    strategyIds: STRATEGY_IDS,
+};
 
 const strategyStatus: Record<string, boolean> = Object.fromEntries(STRATEGY_IDS.map((id) => [id, true]));
 
@@ -421,6 +432,52 @@ const strategyTradeSamples: Record<string, StrategyTradeSample[]> = Object.fromE
 );
 const REJECTED_SIGNAL_RETENTION = 2_000;
 const rejectedSignalHistory: RejectedSignalRecord[] = [];
+type EntryFreshnessViolationCategory = 'MISSING_TELEMETRY' | 'STALE_SOURCE' | 'STALE_GATE' | 'OTHER';
+type EntryFreshnessSloStrategy = {
+    strategy: string;
+    total: number;
+    missing_telemetry: number;
+    stale_source: number;
+    stale_gate: number;
+    other: number;
+    last_violation_at: number;
+    last_reason: string;
+};
+type EntryFreshnessSloSnapshot = {
+    totals: {
+        total: number;
+        missing_telemetry: number;
+        stale_source: number;
+        stale_gate: number;
+        other: number;
+    };
+    strategies: Record<string, EntryFreshnessSloStrategy>;
+    recent_alerts: Array<{
+        execution_id: string;
+        strategy: string;
+        market_key: string | null;
+        category: EntryFreshnessViolationCategory;
+        reason: string;
+        timestamp: number;
+    }>;
+    updated_at: number;
+};
+const ENTRY_FRESHNESS_ALERT_RING_LIMIT = Math.max(
+    10,
+    Number(process.env.ENTRY_FRESHNESS_ALERT_RING_LIMIT || '150'),
+);
+const entryFreshnessSloState: EntryFreshnessSloSnapshot = {
+    totals: {
+        total: 0,
+        missing_telemetry: 0,
+        stale_source: 0,
+        stale_gate: 0,
+        other: 0,
+    },
+    strategies: {},
+    recent_alerts: [],
+    updated_at: 0,
+};
 const strategyGovernanceLastActionMs: Record<string, number> = Object.fromEntries(
     STRATEGY_IDS.map((id) => [id, 0]),
 );
@@ -1245,89 +1302,30 @@ function ensureExecutionId(payload: unknown): string {
     return id;
 }
 
-function strategyExecutionHistoryRedisKey(strategyId: string): string {
-    return `${STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX}${strategyId.trim().toUpperCase()}`;
-}
-
-function strategyIdFromExecutionHistoryRedisKey(key: string): string | null {
-    if (!key.startsWith(STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX)) {
-        return null;
-    }
-    const suffix = key.slice(STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX.length).trim().toUpperCase();
-    return suffix.length > 0 ? suffix : null;
-}
-
 async function persistStrategyExecutionHistoryEntry(
     strategyId: string,
     payload: Record<string, unknown>,
 ): Promise<void> {
-    if (!redisClient.isOpen) {
-        return;
-    }
-    const key = strategyExecutionHistoryRedisKey(strategyId);
-    const serialized = JSON.stringify(payload);
-    await redisClient
-        .multi()
-        .rPush(key, serialized)
-        .lTrim(key, -STRATEGY_EXECUTION_HISTORY_LIMIT, -1)
-        .exec();
+    await persistExecutionHistoryEntry(
+        redisClient,
+        STRATEGY_EXECUTION_HISTORY_STORE_CONFIG,
+        strategyId,
+        payload,
+    );
 }
 
 async function loadStrategyExecutionHistoryFromRedis(): Promise<void> {
-    if (!redisClient.isOpen) {
-        return;
-    }
-    const keys = new Set<string>(STRATEGY_IDS.map((strategyId) => strategyExecutionHistoryRedisKey(strategyId)));
-    try {
-        const pattern = `${STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX}*`;
-        for await (const redisKey of redisClient.scanIterator({ MATCH: pattern, COUNT: 200 })) {
-            if (typeof redisKey === 'string' && redisKey.startsWith(STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX)) {
-                keys.add(redisKey);
-            }
-        }
-    } catch (error) {
-        recordSilentCatch('StrategyExecutionHistory.RestoreScan', error, {
-            prefix: STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX,
-        });
-    }
-
-    for (const redisKey of keys) {
-        try {
-            const strategy = strategyIdFromExecutionHistoryRedisKey(redisKey);
-            if (!strategy) {
-                continue;
-            }
-            const rows = await redisClient.lRange(redisKey, -STRATEGY_EXECUTION_HISTORY_LIMIT, -1);
-            if (!rows.length) {
-                continue;
-            }
-            const normalizedRows: Record<string, unknown>[] = [];
-            for (const row of rows) {
-                try {
-                    const parsed = JSON.parse(row);
-                    const record = asRecord(parsed);
-                    if (!record) {
-                        continue;
-                    }
-                    normalizedRows.push({
-                        ...record,
-                        strategy,
-                        timestamp: asNumber(record.timestamp) ?? Date.now(),
-                    });
-                } catch (error) {
-                    recordSilentCatch('StrategyExecutionHistory.RestoreParse', error, {
-                        strategy,
-                        preview: row.slice(0, 180),
-                    });
-                }
-            }
-            if (normalizedRows.length > 0) {
-                strategyExecutionHistory.set(strategy, normalizedRows);
-            }
-        } catch (error) {
-            recordSilentCatch('StrategyExecutionHistory.RestoreLoad', error, {
-                key: redisKey,
-            });
+    const restored = await restoreExecutionHistory(
+        redisClient,
+        STRATEGY_EXECUTION_HISTORY_STORE_CONFIG,
+        (scope, error, context) => {
+            recordSilentCatch(scope, error, context);
+        },
+    );
+    strategyExecutionHistory.clear();
+    for (const [strategy, rows] of restored.entries()) {
+        if (rows.length > 0) {
+            strategyExecutionHistory.set(strategy, rows);
         }
     }
 }
@@ -1357,32 +1355,13 @@ function pushStrategyExecutionHistory(strategyId: string, payload: Record<string
 
 async function clearStrategyExecutionHistory(): Promise<void> {
     strategyExecutionHistory.clear();
-    if (!redisClient.isOpen) {
-        return;
-    }
-    const keys = new Set<string>(STRATEGY_IDS.map((strategyId) => strategyExecutionHistoryRedisKey(strategyId)));
-    try {
-        const pattern = `${STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX}*`;
-        for await (const redisKey of redisClient.scanIterator({ MATCH: pattern, COUNT: 200 })) {
-            if (typeof redisKey === 'string' && redisKey.startsWith(STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX)) {
-                keys.add(redisKey);
-            }
-        }
-    } catch (error) {
-        recordSilentCatch('StrategyExecutionHistory.ClearScan', error, {
-            prefix: STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX,
-        });
-    }
-    if (keys.size === 0) {
-        return;
-    }
-    try {
-        await redisClient.del(Array.from(keys));
-    } catch (error) {
-        recordSilentCatch('StrategyExecutionHistory.ClearDelete', error, {
-            keys: keys.size,
-        });
-    }
+    await clearExecutionHistoryStore(
+        redisClient,
+        STRATEGY_EXECUTION_HISTORY_STORE_CONFIG,
+        (scope, error, context) => {
+            recordSilentCatch(scope, error, context);
+        },
+    );
 }
 
 function pruneExecutionTraces(now = Date.now()): void {
@@ -2268,10 +2247,125 @@ function pushTradeSample(sample: StrategyTradeSample): void {
     }
 }
 
+function classifyEntryFreshnessViolation(reason: string): EntryFreshnessViolationCategory {
+    const normalized = reason.toLowerCase();
+    if (normalized.includes('missing entry freshness telemetry')) {
+        return 'MISSING_TELEMETRY';
+    }
+    if (normalized.includes('source age') || normalized.includes('exceeds')) {
+        return 'STALE_SOURCE';
+    }
+    if (normalized.includes('freshness gate rejected entry')) {
+        return 'STALE_GATE';
+    }
+    return 'OTHER';
+}
+
+function ensureEntryFreshnessSloStrategy(strategy: string): EntryFreshnessSloStrategy {
+    const key = strategy.trim().toUpperCase() || 'UNKNOWN';
+    const existing = entryFreshnessSloState.strategies[key];
+    if (existing) {
+        return existing;
+    }
+    const created: EntryFreshnessSloStrategy = {
+        strategy: key,
+        total: 0,
+        missing_telemetry: 0,
+        stale_source: 0,
+        stale_gate: 0,
+        other: 0,
+        last_violation_at: 0,
+        last_reason: '',
+    };
+    entryFreshnessSloState.strategies[key] = created;
+    return created;
+}
+
+function clearEntryFreshnessSloState(): void {
+    entryFreshnessSloState.totals = {
+        total: 0,
+        missing_telemetry: 0,
+        stale_source: 0,
+        stale_gate: 0,
+        other: 0,
+    };
+    entryFreshnessSloState.strategies = {};
+    entryFreshnessSloState.recent_alerts = [];
+    entryFreshnessSloState.updated_at = Date.now();
+}
+
+function entryFreshnessSloPayload(): EntryFreshnessSloSnapshot {
+    return {
+        totals: { ...entryFreshnessSloState.totals },
+        strategies: Object.fromEntries(
+            Object.entries(entryFreshnessSloState.strategies).map(([strategy, value]) => [strategy, { ...value }]),
+        ),
+        recent_alerts: entryFreshnessSloState.recent_alerts.slice(),
+        updated_at: entryFreshnessSloState.updated_at,
+    };
+}
+
+function recordEntryFreshnessViolation(record: RejectedSignalRecord): void {
+    const strategy = normalizedStrategyFilter(record.strategy) || 'UNKNOWN';
+    const category = classifyEntryFreshnessViolation(record.reason);
+    const entry = ensureEntryFreshnessSloStrategy(strategy);
+    const now = Date.now();
+    entry.total += 1;
+    entry.last_violation_at = now;
+    entry.last_reason = record.reason;
+    entryFreshnessSloState.totals.total += 1;
+
+    if (category === 'MISSING_TELEMETRY') {
+        entry.missing_telemetry += 1;
+        entryFreshnessSloState.totals.missing_telemetry += 1;
+    } else if (category === 'STALE_SOURCE') {
+        entry.stale_source += 1;
+        entryFreshnessSloState.totals.stale_source += 1;
+    } else if (category === 'STALE_GATE') {
+        entry.stale_gate += 1;
+        entryFreshnessSloState.totals.stale_gate += 1;
+    } else {
+        entry.other += 1;
+        entryFreshnessSloState.totals.other += 1;
+    }
+
+    entryFreshnessSloState.recent_alerts.push({
+        execution_id: record.execution_id,
+        strategy,
+        market_key: record.market_key,
+        category,
+        reason: record.reason,
+        timestamp: now,
+    });
+    if (entryFreshnessSloState.recent_alerts.length > ENTRY_FRESHNESS_ALERT_RING_LIMIT) {
+        entryFreshnessSloState.recent_alerts.splice(
+            0,
+            entryFreshnessSloState.recent_alerts.length - ENTRY_FRESHNESS_ALERT_RING_LIMIT,
+        );
+    }
+    entryFreshnessSloState.updated_at = now;
+    io.emit('entry_freshness_alert', {
+        execution_id: record.execution_id,
+        strategy,
+        market_key: record.market_key,
+        category,
+        reason: record.reason,
+        timestamp: now,
+    });
+    io.emit('entry_freshness_slo_update', entryFreshnessSloPayload());
+}
+
 function recordRejectedSignal(record: RejectedSignalRecord): void {
     rejectedSignalHistory.push(record);
     if (rejectedSignalHistory.length > REJECTED_SIGNAL_RETENTION) {
         rejectedSignalHistory.splice(0, rejectedSignalHistory.length - REJECTED_SIGNAL_RETENTION);
+    }
+    if (
+        record.stage === 'INTELLIGENCE_GATE'
+        && typeof record.reason === 'string'
+        && record.reason.includes('[ENTRY_INVARIANT]')
+    ) {
+        recordEntryFreshnessViolation(record);
     }
     rejectedSignalRecorder.record(record);
     io.emit('rejected_signal', record);
@@ -4537,6 +4631,7 @@ async function resetSimulationState(
     clearStrategyCostDiagnostics();
     clearStrategyTradeSamples();
     await clearStrategyExecutionHistory();
+    clearEntryFreshnessSloState();
     clearDataIntegrityState();
     clearGovernanceState();
     clearFeatureRegistry();
@@ -4554,6 +4649,7 @@ async function resetSimulationState(
     io.emit('feature_registry_snapshot', featureRegistrySummary());
     io.emit('model_inference_snapshot', modelInferencePayload());
     io.emit('model_drift_update', modelDriftPayload());
+    io.emit('entry_freshness_slo_update', entryFreshnessSloPayload());
     await bootstrapStrategyMultipliers(true);
     await runStrategyGovernanceCycle();
     await persistStrategyMetrics();
@@ -4942,6 +5038,10 @@ redisSubscriber.subscribe('system:simulation_reset', (msg) => {
         clearStrategyMetrics();
         clearStrategyCostDiagnostics();
         clearStrategyTradeSamples();
+        fireAndForget('StrategyExecutionHistory.Clear', clearStrategyExecutionHistory(), {
+            source: 'system:simulation_reset',
+        });
+        clearEntryFreshnessSloState();
         clearDataIntegrityState();
         clearGovernanceState();
         clearFeatureRegistry();
@@ -4960,6 +5060,7 @@ redisSubscriber.subscribe('system:simulation_reset', (msg) => {
         io.emit('feature_registry_snapshot', featureRegistrySummary());
         io.emit('model_inference_snapshot', modelInferencePayload());
         io.emit('model_drift_update', modelDriftPayload());
+        io.emit('entry_freshness_slo_update', entryFreshnessSloPayload());
         requestMetaControllerRefresh();
         fireAndForget('MLPipeline.Refresh', refreshMlPipelineStatus(), { source: 'system:simulation_reset' });
         fireAndForget('Governance.Cycle', runStrategyGovernanceCycle(), { source: 'system:simulation_reset' });
@@ -5046,6 +5147,7 @@ io.on('connection', async (socket) => {
     socket.emit('model_drift_update', modelDriftPayload());
     socket.emit('model_gate_calibration_update', modelGateCalibrationPayload());
     socket.emit('rejected_signal_snapshot', rejectedSignalSnapshot());
+    socket.emit('entry_freshness_slo_update', entryFreshnessSloPayload());
 
     socket.on('disconnect', () => {
         logger.info(`[Socket] client disconnected id=${socket.id}`);
@@ -5355,6 +5457,7 @@ app.get('/api/arb/stats', async (_req, res) => {
         ),
         strategy_cost_diagnostics: strategyCostDiagnosticsPayload(),
         data_integrity: dataIntegrityPayload(),
+        entry_freshness_slo: entryFreshnessSloPayload(),
         strategy_governance: governancePayload(),
         feature_registry: featureRegistrySummary(),
     });
@@ -5392,6 +5495,10 @@ app.get('/api/arb/rejected-signals', async (req, res) => {
         count: entries.length,
         entries,
     });
+});
+
+app.get('/api/arb/entry-freshness-slo', (_req, res) => {
+    res.json(entryFreshnessSloPayload());
 });
 
 app.get('/api/arb/model-gate-calibration', (_req, res) => {
