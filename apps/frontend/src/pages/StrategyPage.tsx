@@ -282,7 +282,10 @@ export const StrategyPage: React.FC<StrategyPageProps> = ({ title, description, 
 
                 const executionRequests = strategyIds.map(async (strategyId) => {
                     const normalized = strategyId.toUpperCase();
-                    const response = await fetch(apiUrl(`/api/arb/strategy-executions?strategy=${encodeURIComponent(normalized)}&limit=100`));
+                    const response = await fetch(
+                        apiUrl(`/api/arb/strategy-executions?strategy=${encodeURIComponent(normalized)}&limit=100`),
+                        { signal: controller.signal },
+                    );
                     if (!response.ok) {
                         return [] as StrategyExecutionRow[];
                     }
@@ -290,7 +293,10 @@ export const StrategyPage: React.FC<StrategyPageProps> = ({ title, description, 
                 });
                 const tradeRequests = strategyIds.map(async (strategyId) => {
                     const normalized = strategyId.toUpperCase();
-                    const response = await fetch(apiUrl(`/api/arb/strategy-trades?strategy=${encodeURIComponent(normalized)}&limit=100`));
+                    const response = await fetch(
+                        apiUrl(`/api/arb/strategy-trades?strategy=${encodeURIComponent(normalized)}&limit=100`),
+                        { signal: controller.signal },
+                    );
                     if (!response.ok) {
                         return [] as StrategyTradeRow[];
                     }

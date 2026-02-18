@@ -1098,9 +1098,13 @@ export const Btc5mEnginePage: React.FC = () => {
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
     const loadTradeHistory = async () => {
       try {
-        const res = await fetch(apiUrl(`/api/arb/strategy-trades?strategy=${encodeURIComponent(STRATEGY_ID)}&limit=600`));
+        const res = await fetch(
+          apiUrl(`/api/arb/strategy-trades?strategy=${encodeURIComponent(STRATEGY_ID)}&limit=600`),
+          { signal: controller.signal },
+        );
         if (!res.ok) return;
         const payload = await res.json() as { trades?: unknown[] };
         const rows = Array.isArray(payload?.trades) ? payload.trades : [];
@@ -1131,7 +1135,10 @@ export const Btc5mEnginePage: React.FC = () => {
           });
           return next;
         });
-      } catch {
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          return;
+        }
         // ignore
       }
     };
@@ -1139,6 +1146,7 @@ export const Btc5mEnginePage: React.FC = () => {
     void loadTradeHistory();
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, []);
 
