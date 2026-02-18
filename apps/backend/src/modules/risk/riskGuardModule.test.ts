@@ -141,6 +141,35 @@ describe('riskGuardModule', () => {
         expect(harness.errors).toEqual([]);
     });
 
+    it('cancels auto-resume when pause is cleared manually', async () => {
+        jest.useFakeTimers();
+        const harness = createHarness({
+            consecutiveLossLimit: 1,
+            consecutiveLossCooldownMs: 100,
+            postLossCooldownMs: 0,
+        });
+
+        await harness.module.processRiskGuard('TEST_STRAT', -10, { side: 'BUY' });
+        expect(harness.strategyStatus.TEST_STRAT).toBe(false);
+        expect(harness.redis.store.get('strategy:enabled:TEST_STRAT')).toBe('0');
+        expect(harness.redis.store.has('risk_guard:paused_until:TEST_STRAT')).toBe(true);
+
+        await harness.module.clearStrategyPause('TEST_STRAT');
+
+        const state = harness.module.getRiskGuardState('TEST_STRAT');
+        expect(state?.pausedUntil).toBe(0);
+        expect(harness.redis.store.has('risk_guard:paused_until:TEST_STRAT')).toBe(false);
+        expect(harness.redis.store.has('risk_guard:cooldown:TEST_STRAT')).toBe(false);
+
+        jest.advanceTimersByTime(150);
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(harness.strategyStatus.TEST_STRAT).toBe(false);
+        expect(harness.redis.store.get('strategy:enabled:TEST_STRAT')).toBe('0');
+        expect(harness.errors).toEqual([]);
+    });
+
     it('persists and emits guard state updates while strategy is already paused', async () => {
         const harness = createHarness({
             consecutiveLossLimit: 1,

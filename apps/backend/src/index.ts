@@ -331,6 +331,7 @@ const {
     sweepProfitsToVault,
     loadRiskGuardStates,
     resetRiskGuardStates,
+    clearStrategyPause,
     getRiskGuardState,
 } = createRiskGuardModule({
     redis: redisClient,
@@ -2590,6 +2591,7 @@ async function maybeApplyGovernanceDecision(
         const promotedMultiplier = Math.min(STRATEGY_WEIGHT_CAP, Math.max(perf.multiplier, 1.1 + (decision.confidence * 0.2)));
         perf.multiplier = promotedMultiplier;
         perf.updated_at = now;
+        await clearStrategyPause(decision.strategy);
         strategyStatus[decision.strategy] = true;
         await publishStrategyMultiplier(decision.strategy, promotedMultiplier);
         await redisClient.set(`strategy:enabled:${decision.strategy}`, '1');
@@ -2623,6 +2625,7 @@ async function maybeApplyGovernanceDecision(
     if (decision.action === 'DEMOTE_DISABLE') {
         perf.multiplier = 0;
         perf.updated_at = now;
+        await clearStrategyPause(decision.strategy);
         strategyStatus[decision.strategy] = false;
         await publishStrategyMultiplier(decision.strategy, 0);
         await redisClient.set(`strategy:enabled:${decision.strategy}`, '0');
@@ -5336,6 +5339,7 @@ io.on('connection', async (socket) => {
             return;
         }
 
+        await clearStrategyPause(payload.id);
         strategyStatus[payload.id] = payload.active;
 
         await redisClient.set(`strategy:enabled:${payload.id}`, payload.active ? '1' : '0');

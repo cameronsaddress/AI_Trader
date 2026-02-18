@@ -61,6 +61,8 @@ function asRecord(input: unknown): ParsedRecord | null {
 export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
     const riskGuardState: Record<string, RiskGuardState> = {};
     const resumeTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+    const stateKey = (strategyId: string): string => `risk_guard:state:${strategyId}`;
+    const cooldownKey = (strategyId: string): string => `risk_guard:cooldown:${strategyId}`;
     const pausedUntilKey = (strategyId: string): string => `risk_guard:paused_until:${strategyId}`;
 
     function clearResumeTimer(strategyId: string): void {
@@ -72,8 +74,22 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
     }
 
     async function persistRiskGuardState(strategyId: string, state: RiskGuardState): Promise<void> {
-        await deps.redis.set(`risk_guard:state:${strategyId}`, JSON.stringify(state));
-        await deps.redis.expire(`risk_guard:state:${strategyId}`, 72 * 60 * 60);
+        await deps.redis.set(stateKey(strategyId), JSON.stringify(state));
+        await deps.redis.expire(stateKey(strategyId), 72 * 60 * 60);
+    }
+
+    async function clearStrategyPause(strategyId: string): Promise<void> {
+        clearResumeTimer(strategyId);
+
+        const state = riskGuardState[strategyId];
+        if (state && state.pausedUntil !== 0) {
+            state.pausedUntil = 0;
+            deps.emitRiskGuardUpdate({ strategy: strategyId, ...state });
+            await persistRiskGuardState(strategyId, state);
+        }
+
+        await deps.redis.del(pausedUntilKey(strategyId));
+        await deps.redis.del(cooldownKey(strategyId));
     }
 
     function computeDayStartMs(): number {
@@ -179,9 +195,9 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
 
         if (isLoss && deps.config.postLossCooldownMs > 0) {
             const cooldownUntil = now + deps.config.postLossCooldownMs;
-            await deps.redis.set(`risk_guard:cooldown:${strategyId}`, String(cooldownUntil));
+            await deps.redis.set(cooldownKey(strategyId), String(cooldownUntil));
             await deps.redis.expire(
-                `risk_guard:cooldown:${strategyId}`,
+                cooldownKey(strategyId),
                 Math.ceil(deps.config.postLossCooldownMs / 1000) + 60,
             );
         }
@@ -328,8 +344,8 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
             try {
                 clearResumeTimer(id);
                 delete riskGuardState[id];
-                await deps.redis.del(`risk_guard:state:${id}`);
-                await deps.redis.del(`risk_guard:cooldown:${id}`);
+                await deps.redis.del(stateKey(id));
+                await deps.redis.del(cooldownKey(id));
                 await deps.redis.del(`risk_guard:size_factor:${id}`);
                 await deps.redis.del(pausedUntilKey(id));
             } catch (error) {
@@ -349,6 +365,7 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
         sweepProfitsToVault,
         loadRiskGuardStates,
         resetRiskGuardStates,
+        clearStrategyPause,
         getRiskGuardState,
     };
 }
