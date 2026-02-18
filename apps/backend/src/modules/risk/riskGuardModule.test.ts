@@ -97,11 +97,13 @@ describe('riskGuardModule', () => {
     it('clears in-memory and redis risk-guard keys for managed strategies', async () => {
         const harness = createHarness();
         await harness.module.processRiskGuard('TEST_STRAT', -10, { side: 'BUY' });
+        harness.redis.store.set('risk_guard:paused_until:TEST_STRAT', String(Date.now() + 60_000));
 
         expect(harness.module.getRiskGuardState('TEST_STRAT')).not.toBeNull();
         expect(harness.redis.store.has('risk_guard:state:TEST_STRAT')).toBe(true);
         expect(harness.redis.store.has('risk_guard:cooldown:TEST_STRAT')).toBe(true);
         expect(harness.redis.store.has('risk_guard:size_factor:TEST_STRAT')).toBe(true);
+        expect(harness.redis.store.has('risk_guard:paused_until:TEST_STRAT')).toBe(true);
 
         await harness.module.resetRiskGuardStates();
 
@@ -109,6 +111,7 @@ describe('riskGuardModule', () => {
         expect(harness.redis.store.has('risk_guard:state:TEST_STRAT')).toBe(false);
         expect(harness.redis.store.has('risk_guard:cooldown:TEST_STRAT')).toBe(false);
         expect(harness.redis.store.has('risk_guard:size_factor:TEST_STRAT')).toBe(false);
+        expect(harness.redis.store.has('risk_guard:paused_until:TEST_STRAT')).toBe(false);
     });
 
     it('does not auto-resume from a stale timer after reset', async () => {
@@ -122,9 +125,11 @@ describe('riskGuardModule', () => {
         await harness.module.processRiskGuard('TEST_STRAT', -10, { side: 'BUY' });
         expect(harness.strategyStatus.TEST_STRAT).toBe(false);
         expect(harness.redis.store.get('strategy:enabled:TEST_STRAT')).toBe('0');
+        expect(harness.redis.store.has('risk_guard:paused_until:TEST_STRAT')).toBe(true);
 
         await harness.module.resetRiskGuardStates();
         expect(harness.module.getRiskGuardState('TEST_STRAT')).toBeNull();
+        expect(harness.redis.store.has('risk_guard:paused_until:TEST_STRAT')).toBe(false);
 
         jest.advanceTimersByTime(150);
         await Promise.resolve();

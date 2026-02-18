@@ -652,6 +652,7 @@ let metaControllerRefreshTimer: NodeJS.Timeout | null = null;
 let metaControllerRefreshScheduled = false;
 let metaControllerRefreshInFlight = false;
 const heartbeats: Record<string, number> = {};
+const riskGuardBootResumeTimers = new Map<string, NodeJS.Timeout>();
 const latestStrategyScans = new Map<string, StrategyScanState>();
 const latestStrategyScansByMarket = new Map<string, StrategyScanState>();
 const runtimeModules: Record<string, RuntimeModuleState> = Object.fromEntries(
@@ -681,6 +682,15 @@ const settlementService = new PolymarketSettlementService(redisClient);
 const strategyTradeRecorder = new StrategyTradeRecorder();
 const featureRegistryRecorder = new FeatureRegistryRecorder();
 const rejectedSignalRecorder = new RejectedSignalRecorder();
+
+function clearRiskGuardBootResumeTimer(strategyId: string): void {
+    const timer = riskGuardBootResumeTimers.get(strategyId);
+    if (!timer) {
+        return;
+    }
+    clearTimeout(timer);
+    riskGuardBootResumeTimers.delete(strategyId);
+}
 
 function isControlPlaneTokenConfigured(): boolean {
     return CONTROL_PLANE_TOKEN.length > 0;
@@ -4449,30 +4459,61 @@ async function publishStrategyMultiplier(strategyId: string, multiplier: number)
 async function applyDefaultStrategyStates(force = false): Promise<void> {
     for (const strategyId of STRATEGY_IDS) {
         const enabledKey = `strategy:enabled:${strategyId}`;
+        const pauseUntilKey = `risk_guard:paused_until:${strategyId}`;
+        const cooldownKey = `risk_guard:cooldown:${strategyId}`;
         const enabledByDefault = !DEFAULT_DISABLED_STRATEGIES.has(strategyId);
+        clearRiskGuardBootResumeTimer(strategyId);
         if (force) {
             await redisClient.set(enabledKey, enabledByDefault ? '1' : '0');
+            if (enabledByDefault) {
+                await redisClient.del(pauseUntilKey);
+            }
         } else {
             await redisClient.setNX(enabledKey, enabledByDefault ? '1' : '0');
 
             // Re-enable strategies whose Risk Guard cooldown expired during a restart.
-            // The setTimeout-based auto-resume is lost when the backend restarts, so
-            // strategies can get stuck disabled forever. Check the cooldown key and
-            // re-enable if expired or absent (for non-default-disabled strategies).
+            // The in-memory setTimeout-based auto-resume is lost when the backend restarts,
+            // so strategies can get stuck disabled forever. Only attempt auto-resume for
+            // strategies carrying a Risk Guard pause marker (or legacy cooldown key).
             const currentVal = await redisClient.get(enabledKey);
             if (currentVal === '0' && enabledByDefault) {
-                const cooldownUntil = await redisClient.get(`risk_guard:cooldown:${strategyId}`);
                 const now = Date.now();
-                if (!cooldownUntil || Number(cooldownUntil) <= now) {
+                const pauseUntilRaw = await redisClient.get(pauseUntilKey);
+                const pauseUntil = asNumber(pauseUntilRaw);
+                const legacyCooldownUntil = asNumber(await redisClient.get(cooldownKey));
+                const effectivePauseUntil = pauseUntil ?? legacyCooldownUntil;
+                const hasPauseMarker = pauseUntil !== null || legacyCooldownUntil !== null;
+
+                // Preserve explicit operator disables when no guard marker is present.
+                if (!hasPauseMarker) {
+                    logger.info(`[Boot] preserving manual disable for ${strategyId}`);
+                } else if (!effectivePauseUntil || effectivePauseUntil <= now) {
                     await redisClient.set(enabledKey, '1');
-                    logger.info(`[Boot] re-enabled ${strategyId}: Risk Guard cooldown expired or absent`);
+                    await redisClient.del(pauseUntilKey);
+                    logger.info(`[Boot] re-enabled ${strategyId}: Risk Guard pause marker expired`);
                 } else {
-                    // Cooldown still active — reschedule the resume timer
-                    const remaining = Number(cooldownUntil) - now;
-                    setTimeout(async () => {
+                    // Pause still active — reschedule the resume timer.
+                    const remaining = Math.max(1, effectivePauseUntil - now);
+                    const expectedPauseUntil = effectivePauseUntil;
+                    const timer = setTimeout(async () => {
+                        riskGuardBootResumeTimers.delete(strategyId);
                         try {
+                            const latestEnabled = await redisClient.get(enabledKey);
+                            if (latestEnabled !== '0') {
+                                return;
+                            }
+                            const latestPause = asNumber(await redisClient.get(pauseUntilKey));
+                            const latestLegacyCooldown = asNumber(await redisClient.get(cooldownKey));
+                            const latestPauseUntil = latestPause ?? latestLegacyCooldown;
+                            if (latestPauseUntil && latestPauseUntil > Date.now()) {
+                                return;
+                            }
+                            if (latestPauseUntil && latestPauseUntil !== expectedPauseUntil) {
+                                return;
+                            }
                             await redisClient.set(enabledKey, '1');
                             await redisClient.expire(enabledKey, 86400);
+                            await redisClient.del(pauseUntilKey);
                             strategyStatus[strategyId] = true;
                             io.emit('strategy_status_update', strategyStatus);
                             logger.info(`[RiskGuard] resumed ${strategyId} after boot-rescheduled cooldown`);
@@ -4483,6 +4524,7 @@ async function applyDefaultStrategyStates(force = false): Promise<void> {
                             });
                         }
                     }, remaining);
+                    riskGuardBootResumeTimers.set(strategyId, timer);
                     logger.info(`[Boot] ${strategyId} still in Risk Guard cooldown, resume in ${Math.ceil(remaining / 1000)}s`);
                 }
             }
@@ -6274,6 +6316,9 @@ const shutdown = async (signal: string) => {
     }
     shutdownInProgress = true;
     logger.info(`[System] ${signal} received, shutting down gracefully...`);
+    for (const strategyId of [...riskGuardBootResumeTimers.keys()]) {
+        clearRiskGuardBootResumeTimer(strategyId);
+    }
 
     await new Promise<void>((resolve) => {
         httpServer.close(() => resolve());

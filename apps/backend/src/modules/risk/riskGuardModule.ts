@@ -61,6 +61,7 @@ function asRecord(input: unknown): ParsedRecord | null {
 export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
     const riskGuardState: Record<string, RiskGuardState> = {};
     const resumeTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+    const pausedUntilKey = (strategyId: string): string => `risk_guard:paused_until:${strategyId}`;
 
     function clearResumeTimer(strategyId: string): void {
         const timer = resumeTimers[strategyId];
@@ -226,6 +227,11 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
             state.pausedUntil = now + pauseDurationMs;
             await deps.redis.set(`strategy:enabled:${strategyId}`, '0');
             await deps.redis.expire(`strategy:enabled:${strategyId}`, 86400);
+            await deps.redis.set(pausedUntilKey(strategyId), String(state.pausedUntil));
+            await deps.redis.expire(
+                pausedUntilKey(strategyId),
+                Math.max(300, Math.ceil(pauseDurationMs / 1000) + 3600),
+            );
             deps.strategyStatus[strategyId] = false;
             deps.emitStrategyStatusUpdate(deps.strategyStatus);
             logger.info(`[RiskGuard] paused ${strategyId}: ${pauseReason} | resume at ${new Date(state.pausedUntil).toISOString()}`);
@@ -246,6 +252,7 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
                         if (current.pausedUntil <= Date.now()) {
                             await deps.redis.set(`strategy:enabled:${strategyId}`, '1');
                             await deps.redis.expire(`strategy:enabled:${strategyId}`, 86400);
+                            await deps.redis.del(pausedUntilKey(strategyId));
                             deps.strategyStatus[strategyId] = true;
                             deps.emitStrategyStatusUpdate(deps.strategyStatus);
                             logger.info(`[RiskGuard] resumed ${strategyId} after cooldown`);
@@ -324,6 +331,7 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
                 await deps.redis.del(`risk_guard:state:${id}`);
                 await deps.redis.del(`risk_guard:cooldown:${id}`);
                 await deps.redis.del(`risk_guard:size_factor:${id}`);
+                await deps.redis.del(pausedUntilKey(id));
             } catch (error) {
                 deps.recordError('RiskGuard.ResetState', error, { strategy: id });
             }
