@@ -656,6 +656,7 @@ let metaControllerRefreshInFlight = false;
 const heartbeats: Record<string, number> = {};
 const riskGuardBootResumeTimers = new Map<string, NodeJS.Timeout>();
 const scheduledTaskStops: Array<() => void> = [];
+let bootstrapComplete = false;
 const latestStrategyScans = new Map<string, StrategyScanState>();
 const latestStrategyScansByMarket = new Map<string, StrategyScanState>();
 const runtimeModules: Record<string, RuntimeModuleState> = Object.fromEntries(
@@ -696,7 +697,12 @@ function clearRiskGuardBootResumeTimer(strategyId: string): void {
 }
 
 function registerScheduledTask(taskName: string, intervalMs: number, task: () => Promise<void>): void {
-    const stop = scheduleNonOverlappingTask(taskName, intervalMs, task);
+    const stop = scheduleNonOverlappingTask(taskName, intervalMs, async () => {
+        if (!bootstrapComplete) {
+            return;
+        }
+        await task();
+    });
     scheduledTaskStops.push(stop);
 }
 
@@ -6291,6 +6297,7 @@ async function bootstrap() {
     await loadModelGateCalibrationState();
     await runModelProbabilityGateCalibration();
     await runInProcessModelTraining(false);
+    bootstrapComplete = true;
 
     // ── Periodic state broadcast: keep all dashboards live ──
     registerScheduledTask('StateBroadcast', 5000, async () => {
@@ -6335,6 +6342,7 @@ const shutdown = async (signal: string) => {
     }
     shutdownInProgress = true;
     logger.info(`[System] ${signal} received, shutting down gracefully...`);
+    bootstrapComplete = false;
     stopAllScheduledTasks();
     for (const strategyId of [...riskGuardBootResumeTimers.keys()]) {
         clearRiskGuardBootResumeTimer(strategyId);
