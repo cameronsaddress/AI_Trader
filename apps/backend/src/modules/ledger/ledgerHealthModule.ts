@@ -74,6 +74,20 @@ function asNumber(input: unknown): number | null {
     return Number.isFinite(parsed) ? parsed : null;
 }
 
+function errorMessage(error: unknown): string {
+    if (error instanceof Error) {
+        return `${error.name}: ${error.message}`;
+    }
+    if (typeof error === 'string') {
+        return error;
+    }
+    try {
+        return JSON.stringify(error);
+    } catch {
+        return String(error);
+    }
+}
+
 function rankConcentration(entries: Record<string, number>, equity: number, limit = 8): LedgerConcentrationEntry[] {
     const denominator = equity > 0 ? equity : 1;
     return Object.entries(entries)
@@ -326,16 +340,29 @@ export function createLedgerHealthModule(deps: LedgerHealthModuleDeps) {
     }
 
     async function refreshLedgerHealth(): Promise<void> {
-        ledgerHealthState = await evaluateLedgerHealth();
-        deps.emitLedgerHealthUpdate(ledgerHealthState);
-        deps.touchLedgerRuntime(
-            ledgerHealthState.status === 'CRITICAL'
-                ? 'DEGRADED'
-                : 'ONLINE',
-            ledgerHealthState.status === 'HEALTHY'
-                ? 'ledger healthy'
-                : `ledger ${ledgerHealthState.status.toLowerCase()}: ${ledgerHealthState.issues[0] || 'issue detected'}`,
-        );
+        try {
+            ledgerHealthState = await evaluateLedgerHealth();
+            deps.emitLedgerHealthUpdate(ledgerHealthState);
+            deps.touchLedgerRuntime(
+                ledgerHealthState.status === 'CRITICAL'
+                    ? 'DEGRADED'
+                    : 'ONLINE',
+                ledgerHealthState.status === 'HEALTHY'
+                    ? 'ledger healthy'
+                    : `ledger ${ledgerHealthState.status.toLowerCase()}: ${ledgerHealthState.issues[0] || 'issue detected'}`,
+            );
+        } catch (error) {
+            const detail = `ledger refresh failed: ${errorMessage(error)}`;
+            deps.recordError('Ledger.Refresh', error, { detail });
+            ledgerHealthState = {
+                ...ledgerHealthState,
+                status: 'CRITICAL',
+                issues: [detail],
+                checked_at: Date.now(),
+            };
+            deps.emitLedgerHealthUpdate(ledgerHealthState);
+            deps.touchLedgerRuntime('DEGRADED', detail);
+        }
     }
 
     function getLedgerHealthState(): LedgerHealthState {
