@@ -243,6 +243,8 @@ export const StrategyPage: React.FC<StrategyPageProps> = ({ title, description, 
 
     React.useEffect(() => {
         let active = true;
+        let inFlight = false;
+        let rerunRequested = false;
 
         const load = async () => {
             try {
@@ -327,13 +329,34 @@ export const StrategyPage: React.FC<StrategyPageProps> = ({ title, description, 
             }
         };
 
-        void load();
+        const runLoad = async () => {
+            if (!active) {
+                return;
+            }
+            if (inFlight) {
+                rerunRequested = true;
+                return;
+            }
+            inFlight = true;
+            try {
+                await load();
+            } finally {
+                inFlight = false;
+                if (active && rerunRequested) {
+                    rerunRequested = false;
+                    void runLoad();
+                }
+            }
+        };
+
+        void runLoad();
         const intervalId = window.setInterval(() => {
-            void load();
+            void runLoad();
         }, REFRESH_MS);
 
         return () => {
             active = false;
+            rerunRequested = false;
             window.clearInterval(intervalId);
         };
     }, [strategyIds]);
@@ -445,4 +468,3 @@ export const StrategyPage: React.FC<StrategyPageProps> = ({ title, description, 
         </DashboardLayout>
     );
 };
-
