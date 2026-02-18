@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useSocket } from '../context/SocketContext';
 import { ExecutionLayout } from '../components/layout/ExecutionLayout';
 import { apiUrl } from '../lib/api';
+import { SequencedAbortController } from '../lib/SequencedAbortController';
 import type {
   TradingModeEvent,
   StrategyMetricsEvent,
@@ -541,8 +542,7 @@ export const Btc5mEnginePage: React.FC = () => {
   const [executionTrace, setExecutionTrace] = useState<ExecutionTrace | null>(null);
   const [executionTraceError, setExecutionTraceError] = useState<string | null>(null);
   const [executionTraceLoading, setExecutionTraceLoading] = useState(false);
-  const traceAbortRef = useRef<AbortController | null>(null);
-  const traceRequestSeqRef = useRef(0);
+  const traceRequestControllerRef = useRef(new SequencedAbortController());
 
   // Engine Tuning panel state
   const [tuningOpen, setTuningOpen] = useState(false);
@@ -573,9 +573,7 @@ export const Btc5mEnginePage: React.FC = () => {
   const [strategyQualityTotalScans, setStrategyQualityTotalScans] = useState(0);
 
   const closeTrace = React.useCallback(() => {
-    traceRequestSeqRef.current += 1;
-    traceAbortRef.current?.abort();
-    traceAbortRef.current = null;
+    traceRequestControllerRef.current.cancelAll();
     setTraceExecutionId(null);
     setExecutionTrace(null);
     setExecutionTraceError(null);
@@ -584,11 +582,7 @@ export const Btc5mEnginePage: React.FC = () => {
 
   const openTrace = React.useCallback(async (executionId: string) => {
     if (!executionId) return;
-    const requestSeq = traceRequestSeqRef.current + 1;
-    traceRequestSeqRef.current = requestSeq;
-    traceAbortRef.current?.abort();
-    const controller = new AbortController();
-    traceAbortRef.current = controller;
+    const request = traceRequestControllerRef.current.begin();
     setTraceExecutionId(executionId);
     setExecutionTrace(null);
     setExecutionTraceError(null);
@@ -596,18 +590,18 @@ export const Btc5mEnginePage: React.FC = () => {
     try {
       const response = await fetch(
         apiUrl(`/api/arb/execution-trace/${encodeURIComponent(executionId)}`),
-        { signal: controller.signal },
+        { signal: request.signal },
       );
       if (!response.ok) {
         const payload = await response.json().catch(() => null) as { error?: string } | null;
-        if (requestSeq !== traceRequestSeqRef.current) {
+        if (!traceRequestControllerRef.current.isCurrent(request.seq)) {
           return;
         }
         setExecutionTraceError(payload?.error || `Trace lookup failed (${response.status})`);
         return;
       }
       const data = await response.json() as ExecutionTrace;
-      if (requestSeq !== traceRequestSeqRef.current) {
+      if (!traceRequestControllerRef.current.isCurrent(request.seq)) {
         return;
       }
       setExecutionTrace(data);
@@ -615,22 +609,19 @@ export const Btc5mEnginePage: React.FC = () => {
       if (error instanceof DOMException && error.name === 'AbortError') {
         return;
       }
-      if (requestSeq !== traceRequestSeqRef.current) {
+      if (!traceRequestControllerRef.current.isCurrent(request.seq)) {
         return;
       }
       setExecutionTraceError(error instanceof Error ? error.message : String(error));
     } finally {
-      if (requestSeq === traceRequestSeqRef.current) {
-        traceAbortRef.current = null;
+      if (traceRequestControllerRef.current.complete(request.seq)) {
         setExecutionTraceLoading(false);
       }
     }
   }, []);
 
   useEffect(() => () => {
-    traceRequestSeqRef.current += 1;
-    traceAbortRef.current?.abort();
-    traceAbortRef.current = null;
+    traceRequestControllerRef.current.cancelAll();
   }, []);
 
   useEffect(() => {

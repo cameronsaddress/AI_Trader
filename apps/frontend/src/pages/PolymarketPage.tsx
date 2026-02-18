@@ -5,6 +5,7 @@ import { ArbitrageScannerWidget } from '../components/widgets/ArbitrageScannerWi
 import { StrategyControlWidget } from '../components/widgets/StrategyControlWidget';
 import { useSocket } from '../context/SocketContext';
 import { apiUrl } from '../lib/api';
+import { SequencedAbortController } from '../lib/SequencedAbortController';
 
 type TradingMode = 'PAPER' | 'LIVE';
 
@@ -1732,8 +1733,7 @@ export const PolymarketPage: React.FC = () => {
     const [executionTrace, setExecutionTrace] = React.useState<ExecutionTrace | null>(null);
     const [executionTraceError, setExecutionTraceError] = React.useState<string | null>(null);
     const [executionTraceLoading, setExecutionTraceLoading] = React.useState(false);
-    const traceAbortRef = React.useRef<AbortController | null>(null);
-    const traceRequestSeqRef = React.useRef(0);
+    const traceRequestControllerRef = React.useRef(new SequencedAbortController());
     const [strategySignals, setStrategySignals] = React.useState<StrategySignalState[]>([]);
     const [comparableGroups, setComparableGroups] = React.useState<ComparableGroupState[]>([]);
     const [strategyAllocator, setStrategyAllocator] = React.useState<Record<string, StrategyAllocatorEntry>>({});
@@ -2786,9 +2786,7 @@ export const PolymarketPage: React.FC = () => {
     };
 
     const closeExecutionTrace = React.useCallback(() => {
-        traceRequestSeqRef.current += 1;
-        traceAbortRef.current?.abort();
-        traceAbortRef.current = null;
+        traceRequestControllerRef.current.cancelAll();
         setTraceExecutionId(null);
         setExecutionTrace(null);
         setExecutionTraceError(null);
@@ -2799,11 +2797,7 @@ export const PolymarketPage: React.FC = () => {
         if (!executionId) {
             return;
         }
-        const requestSeq = traceRequestSeqRef.current + 1;
-        traceRequestSeqRef.current = requestSeq;
-        traceAbortRef.current?.abort();
-        const controller = new AbortController();
-        traceAbortRef.current = controller;
+        const request = traceRequestControllerRef.current.begin();
         setTraceExecutionId(executionId);
         setExecutionTrace(null);
         setExecutionTraceError(null);
@@ -2811,18 +2805,18 @@ export const PolymarketPage: React.FC = () => {
         try {
             const response = await fetch(
                 apiUrl(`/api/arb/execution-trace/${encodeURIComponent(executionId)}`),
-                { signal: controller.signal },
+                { signal: request.signal },
             );
             if (!response.ok) {
                 const payload = await response.json().catch(() => null) as { error?: string } | null;
-                if (requestSeq !== traceRequestSeqRef.current) {
+                if (!traceRequestControllerRef.current.isCurrent(request.seq)) {
                     return;
                 }
                 setExecutionTraceError(payload?.error || `Trace lookup failed (${response.status})`);
                 return;
             }
             const data = await response.json() as ExecutionTrace;
-            if (requestSeq !== traceRequestSeqRef.current) {
+            if (!traceRequestControllerRef.current.isCurrent(request.seq)) {
                 return;
             }
             setExecutionTrace(data);
@@ -2830,22 +2824,19 @@ export const PolymarketPage: React.FC = () => {
             if (error instanceof DOMException && error.name === 'AbortError') {
                 return;
             }
-            if (requestSeq !== traceRequestSeqRef.current) {
+            if (!traceRequestControllerRef.current.isCurrent(request.seq)) {
                 return;
             }
             setExecutionTraceError(error instanceof Error ? error.message : String(error));
         } finally {
-            if (requestSeq === traceRequestSeqRef.current) {
-                traceAbortRef.current = null;
+            if (traceRequestControllerRef.current.complete(request.seq)) {
                 setExecutionTraceLoading(false);
             }
         }
     }, []);
 
     React.useEffect(() => () => {
-        traceRequestSeqRef.current += 1;
-        traceAbortRef.current?.abort();
-        traceAbortRef.current = null;
+        traceRequestControllerRef.current.cancelAll();
     }, []);
 
     return (
