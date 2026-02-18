@@ -13,6 +13,7 @@
         "build": "npm run build --workspaces",
         "lint": "eslint . --ext .ts,.tsx",
         "test": "jest",
+        "soak:paper": "node scripts/paper_soak_report.js",
         "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules"
     },
     "devDependencies": {

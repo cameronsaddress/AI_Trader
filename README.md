@@ -133,6 +133,27 @@ cp .env.example .env
 
 The system starts in paper trading mode by default. All trades execute against real market data with simulated fills.
 
+## Live Canary Prep
+
+Use the conservative baseline profile before enabling any live posting:
+
+```bash
+# Review and copy values into your runtime .env
+cat config/live_canary_baseline.env
+```
+
+Run a paper soak report before canary promotion:
+
+```bash
+scripts/run_paper_soak_report.sh
+```
+
+Outputs:
+
+1. `reports/paper_soak_report.json`
+2. `reports/paper_soak_report.md`
+3. `reports/paper_soak_stats.jsonl`
+
 ## Security Model
 
 - Three independent safety latches prevent live trading (env flag, wallet key, Redis mode)
