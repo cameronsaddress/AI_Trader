@@ -7,7 +7,7 @@ import helmet from 'helmet';
 import dotenv from 'dotenv';
 import fs from 'fs/promises';
 import path from 'path';
-import { randomUUID } from 'crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import { Side } from '@polymarket/clob-client';
 
 import { MarketDataService, type MarketTickerMessage } from './services/MarketDataService';
@@ -137,6 +137,7 @@ import type {
 import {
     STRATEGY_IDS, SCANNER_HEARTBEAT_IDS,
     EXECUTION_TRACE_TTL_MS, EXECUTION_TRACE_MAX_EVENTS,
+    EXECUTION_EVENT_HMAC_SECRET, EXECUTION_EVENT_REQUIRE_SIGNATURE,
     DEFAULT_SIM_BANKROLL, STRATEGY_METRICS_KEY,
     SIM_BANKROLL_KEY, SIM_LEDGER_CASH_KEY, SIM_LEDGER_RESERVED_KEY,
     SIM_LEDGER_REALIZED_PNL_KEY, SIM_LEDGER_RESERVED_BY_STRATEGY_PREFIX,
@@ -169,6 +170,10 @@ import {
     STRATEGY_GOVERNANCE_MIN_TEST_TRADES,
     FEATURE_REGISTRY_MAX_ROWS, FEATURE_REGISTRY_LABEL_LOOKBACK_MS,
     META_CONTROLLER_ENABLED, META_CONTROLLER_ADVISORY_ONLY, META_CONTROLLER_REFRESH_DEBOUNCE_MS,
+    CROSS_HORIZON_ROUTER_ENABLED, CROSS_HORIZON_ROUTER_INTERVAL_MS,
+    CROSS_HORIZON_ROUTER_MIN_MARGIN, CROSS_HORIZON_ROUTER_STRONG_MARGIN,
+    CROSS_HORIZON_ROUTER_CONFLICT_MULT, CROSS_HORIZON_ROUTER_CONFIRM_MULT,
+    CROSS_HORIZON_ROUTER_MAX_BOOST, CROSS_HORIZON_OVERLAY_KEY_PREFIX,
     MODEL_PROBABILITY_GATE_ENABLED, MODEL_PROBABILITY_GATE_ENFORCE_PAPER,
     MODEL_PROBABILITY_GATE_ENFORCE_LIVE, LEGACY_BRAIN_LOOP_ENABLED, LEGACY_BRAIN_LOOP_UNSAFE_OK,
     MODEL_PROBABILITY_GATE_MIN_PROB, MODEL_PROBABILITY_GATE_MAX_STALENESS_MS,
@@ -628,8 +633,20 @@ type ModelGateCalibrationState = {
     loss_avoided_signals: number;
     updated_at: number;
     reason: string;
+    strategy_active_gates: Record<string, number>;
+    strategy_recommended_gates: Record<string, number>;
+    strategy_sample_counts: Record<string, number>;
+    market_active_gates: Record<string, number>;
+    market_recommended_gates: Record<string, number>;
+    market_sample_counts: Record<string, number>;
 };
 const MODEL_GATE_CALIBRATION_KEY = 'model_gate:calibration_state';
+const MODEL_GATE_STRATEGY_MIN_SAMPLES = Math.max(25, Math.floor(MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES * 0.35));
+const MODEL_GATE_MARKET_MIN_SAMPLES = Math.max(15, Math.floor(MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES * 0.20));
+const MODEL_GATE_MARKET_MAX_KEYS = Math.max(
+    20,
+    Math.min(400, Number(process.env.MODEL_GATE_MARKET_MAX_KEYS || '120')),
+);
 let modelGateCalibrationState: ModelGateCalibrationState = {
     enabled: MODEL_PROBABILITY_GATE_TUNER_ENABLED,
     advisory_only: MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY,
@@ -650,6 +667,12 @@ let modelGateCalibrationState: ModelGateCalibrationState = {
     loss_avoided_signals: 0,
     updated_at: 0,
     reason: 'not yet calibrated',
+    strategy_active_gates: {},
+    strategy_recommended_gates: {},
+    strategy_sample_counts: {},
+    market_active_gates: {},
+    market_recommended_gates: {},
+    market_sample_counts: {},
 };
 const modelPredictionByRowId = new Map<string, ModelPredictionTrace>();
 let modelTrainerInFlight = false;
@@ -659,12 +682,97 @@ let lastScannerParseErrorLogMs = 0;
 let metaControllerRefreshTimer: NodeJS.Timeout | null = null;
 let metaControllerRefreshScheduled = false;
 let metaControllerRefreshInFlight = false;
+let crossHorizonRefreshTimer: NodeJS.Timeout | null = null;
+let crossHorizonRefreshScheduled = false;
+let crossHorizonRefreshInFlight = false;
+const CROSS_HORIZON_REFRESH_DEBOUNCE_MS = Math.max(
+    150,
+    Math.min(1_500, Math.floor(CROSS_HORIZON_ROUTER_INTERVAL_MS / 2)),
+);
 const heartbeats: Record<string, number> = {};
 const riskGuardBootResumeTimers = new Map<string, NodeJS.Timeout>();
 const scheduledTaskStops: Array<() => void> = [];
 let bootstrapComplete = false;
 const latestStrategyScans = new Map<string, StrategyScanState>();
 const latestStrategyScansByMarket = new Map<string, StrategyScanState>();
+type CrossHorizonPairAction = 'NEUTRAL' | 'CONFLICT_TAPER' | 'CONSENSUS_BOOST' | 'ASYMMETRIC' | 'NO_DATA';
+type CrossHorizonPairState = {
+    asset: string;
+    fast_strategy: string;
+    slow_strategy: string;
+    fast_margin: number | null;
+    slow_margin: number | null;
+    fast_direction: number;
+    slow_direction: number;
+    fast_overlay: number;
+    slow_overlay: number;
+    action: CrossHorizonPairAction;
+    reason: string;
+    updated_at: number;
+};
+type CrossHorizonRouterState = {
+    enabled: boolean;
+    interval_ms: number;
+    overlays: Record<string, number>;
+    pairs: Record<string, CrossHorizonPairState>;
+    updated_at: number;
+    reason: string;
+};
+const DEFAULT_CROSS_HORIZON_STRATEGY_PAIRS: Array<{ asset: string; fast: string; slow: string }> = [
+    { asset: 'BTC', fast: 'BTC_5M', slow: 'BTC_15M' },
+];
+function parseCrossHorizonStrategyPairs(raw: string | null | undefined): Array<{ asset: string; fast: string; slow: string }> {
+    const fallback = DEFAULT_CROSS_HORIZON_STRATEGY_PAIRS.filter((pair) => (
+        STRATEGY_IDS.includes(pair.fast) && STRATEGY_IDS.includes(pair.slow) && pair.fast !== pair.slow
+    ));
+    const normalized = typeof raw === 'string' ? raw.trim() : '';
+    if (!normalized) {
+        return fallback;
+    }
+    const parsed = normalized
+        .split(',')
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0)
+        .map((entry) => {
+            const [assetRaw, fastRaw, slowRaw] = entry.split(':').map((part) => part.trim());
+            if (!assetRaw || !fastRaw || !slowRaw) {
+                return null;
+            }
+            const asset = assetRaw.toUpperCase();
+            const fast = fastRaw.toUpperCase();
+            const slow = slowRaw.toUpperCase();
+            if (!STRATEGY_IDS.includes(fast) || !STRATEGY_IDS.includes(slow) || fast === slow) {
+                return null;
+            }
+            return { asset, fast, slow };
+        })
+        .filter((pair): pair is { asset: string; fast: string; slow: string } => pair !== null);
+    if (parsed.length === 0) {
+        return fallback;
+    }
+    const deduped = new Map<string, { asset: string; fast: string; slow: string }>();
+    for (const pair of parsed) {
+        deduped.set(`${pair.asset}:${pair.fast}:${pair.slow}`, pair);
+    }
+    return [...deduped.values()];
+}
+const CROSS_HORIZON_STRATEGY_PAIRS = parseCrossHorizonStrategyPairs(process.env.CROSS_HORIZON_ROUTER_PAIRS);
+const crossHorizonManagedStrategies = Array.from(
+    new Set(
+        CROSS_HORIZON_STRATEGY_PAIRS
+            .flatMap((pair) => [pair.fast, pair.slow])
+            .filter((strategyId) => STRATEGY_IDS.includes(strategyId)),
+    ),
+);
+const crossHorizonOverlayCache: Record<string, number> = {};
+let crossHorizonRouterState: CrossHorizonRouterState = {
+    enabled: CROSS_HORIZON_ROUTER_ENABLED,
+    interval_ms: CROSS_HORIZON_ROUTER_INTERVAL_MS,
+    overlays: Object.fromEntries(STRATEGY_IDS.map((strategyId) => [strategyId, 1])),
+    pairs: {},
+    updated_at: 0,
+    reason: 'cross-horizon router not initialized',
+};
 const runtimeModules: Record<string, RuntimeModuleState> = Object.fromEntries(
     RUNTIME_MODULE_CATALOG.map((module) => [module.id, {
         ...module,
@@ -903,7 +1011,7 @@ function inferScanDescriptor(strategyRaw: string, signalTypeRaw: string | null, 
             signal_type: signalType,
             unit: unit === 'RAW' ? 'RATIO' : unit,
             metric_family: 'MOMENTUM',
-            directionality: 'ABSOLUTE',
+            directionality: 'SIGNED',
             comparable_group: 'CEX_SNIPER_MOMENTUM',
         };
     }
@@ -913,7 +1021,7 @@ function inferScanDescriptor(strategyRaw: string, signalTypeRaw: string | null, 
             signal_type: signalType,
             unit: unit === 'RAW' ? 'RATIO' : unit,
             metric_family: 'ORDER_FLOW',
-            directionality: 'ABSOLUTE',
+            directionality: 'SIGNED',
             comparable_group: 'OBI_SCALPER_IMBALANCE',
         };
     }
@@ -923,7 +1031,7 @@ function inferScanDescriptor(strategyRaw: string, signalTypeRaw: string | null, 
             signal_type: signalType,
             unit: unit === 'RAW' ? 'RATIO' : unit,
             metric_family: 'MARKET_MAKING',
-            directionality: 'ABSOLUTE',
+            directionality: 'SIGNED',
             comparable_group: 'MAKER_MM_EXPECTANCY',
         };
     }
@@ -1093,6 +1201,100 @@ function asNumber(input: unknown): number | null {
     }
     const parsed = Number(input);
     return Number.isFinite(parsed) ? parsed : null;
+}
+
+function constantTimeHexEqual(left: string, right: string): boolean {
+    const leftBuffer = Buffer.from(left, 'hex');
+    const rightBuffer = Buffer.from(right, 'hex');
+    if (leftBuffer.length === 0 || rightBuffer.length === 0 || leftBuffer.length !== rightBuffer.length) {
+        return false;
+    }
+    return timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function computeExecutionEventHmac(payload: unknown): string | null {
+    if (!EXECUTION_EVENT_HMAC_SECRET) {
+        return null;
+    }
+    try {
+        const serialized = JSON.stringify(payload);
+        return createHmac('sha256', EXECUTION_EVENT_HMAC_SECRET).update(serialized).digest('hex');
+    } catch {
+        return null;
+    }
+}
+
+type ExecutionIngressValidation =
+    | {
+        ok: true;
+        payload: unknown;
+        signed: boolean;
+    }
+    | {
+        ok: false;
+        reason: string;
+        payload: unknown;
+    };
+
+function validateExecutionIngressPayload(raw: unknown): ExecutionIngressValidation {
+    const envelope = asRecord(raw);
+    const hasPayloadField = envelope && Object.prototype.hasOwnProperty.call(envelope, 'payload');
+    const payload = hasPayloadField ? envelope?.payload : raw;
+
+    if (!hasPayloadField) {
+        if (EXECUTION_EVENT_REQUIRE_SIGNATURE) {
+            return {
+                ok: false,
+                reason: 'missing execution signature envelope',
+                payload,
+            };
+        }
+        return { ok: true, payload, signed: false };
+    }
+
+    const signature = asString(envelope?._sig)?.toLowerCase() || null;
+    const algo = (asString(envelope?._sig_algo) || 'HMAC_SHA256').toUpperCase();
+    if (algo !== 'HMAC_SHA256') {
+        return {
+            ok: false,
+            reason: `unsupported execution signature algorithm ${algo}`,
+            payload,
+        };
+    }
+
+    if (!signature) {
+        if (EXECUTION_EVENT_REQUIRE_SIGNATURE) {
+            return {
+                ok: false,
+                reason: 'missing execution signature',
+                payload,
+            };
+        }
+        return { ok: true, payload, signed: false };
+    }
+
+    const expected = computeExecutionEventHmac(payload);
+    if (!expected) {
+        return {
+            ok: false,
+            reason: 'execution signature configured but backend secret is unavailable',
+            payload,
+        };
+    }
+
+    if (!constantTimeHexEqual(signature, expected)) {
+        return {
+            ok: false,
+            reason: 'execution signature mismatch',
+            payload,
+        };
+    }
+
+    return {
+        ok: true,
+        payload,
+        signed: true,
+    };
 }
 
 function normalizeTimestampMs(input: unknown): number {
@@ -1486,16 +1688,29 @@ function computeNormalizedMargin(scan: StrategyScanState): number {
     return scan.passes_threshold ? Math.abs(raw) : -Math.abs(raw);
 }
 
-function collectPeerSignals(strategy: string, marketKey: string | null, now: number): {
+function scanDirectionSign(scan: StrategyScanState): number {
+    if (scan.directionality !== 'SIGNED') {
+        return 0;
+    }
+    const sign = Math.sign(scan.score);
+    if (!Number.isFinite(sign) || sign === 0) {
+        return 0;
+    }
+    return sign > 0 ? 1 : -1;
+}
+
+function collectPeerSignals(strategy: string, marketKey: string | null, now: number, candidateDirection: number): {
     count: number;
     peers: string[];
     consensus: number;
+    opposingCount: number;
 } {
     if (!marketKey) {
-        return { count: 0, peers: [], consensus: 0 };
+        return { count: 0, peers: [], consensus: 0, opposingCount: 0 };
     }
 
     const peers: string[] = [];
+    let opposingCount = 0;
     let consensus = 0;
 
     for (const scan of latestStrategyScansByMarket.values()) {
@@ -1509,13 +1724,23 @@ function collectPeerSignals(strategy: string, marketKey: string | null, now: num
             continue;
         }
 
+        const peerDirection = scanDirectionSign(scan);
+        if (candidateDirection !== 0) {
+            if (peerDirection === 0) {
+                continue;
+            }
+            if (peerDirection !== candidateDirection) {
+                opposingCount += 1;
+                consensus -= Math.max(0, computeNormalizedMargin(scan));
+                continue;
+            }
+        }
+
         peers.push(scan.strategy);
-        const directionalSign = Math.sign(scan.score);
-        const signedDirection = directionalSign === 0 ? 1 : directionalSign;
-        consensus += signedDirection * Math.max(0, computeNormalizedMargin(scan));
+        consensus += Math.max(0, computeNormalizedMargin(scan));
     }
 
-    return { count: peers.length, peers: Array.from(new Set(peers)), consensus };
+    return { count: peers.length, peers: Array.from(new Set(peers)), consensus, opposingCount };
 }
 
 function evaluateIntelligenceGate(payload: unknown, tradingMode: TradingMode): {
@@ -1594,23 +1819,56 @@ function evaluateIntelligenceGate(payload: unknown, tradingMode: TradingMode): {
         };
     }
 
-    const peerSignals = collectPeerSignals(strategy, marketKey, now);
+    const candidateDirection = scanDirectionSign(scan);
+    const peerSignals = collectPeerSignals(strategy, marketKey, now, candidateDirection);
     const needsPeerConfirmation = INTELLIGENCE_GATE_REQUIRE_PEER_CONFIRMATION
         && INTELLIGENCE_GATE_CONFIRMATION_STRATEGIES.has(strategy);
-    if (needsPeerConfirmation && peerSignals.count === 0 && normalizedMargin < INTELLIGENCE_GATE_STRONG_MARGIN) {
-        return {
-            ok: false,
-            strategy,
-            marketKey,
-            scan,
-            margin,
-            normalizedMargin,
-            ageMs,
-            peerSignals: peerSignals.count,
-            peerStrategies: peerSignals.peers,
-            peerConsensus: peerSignals.consensus,
-            reason: `No corroborating peer signal for ${strategy} on ${scan.market_key} (margin ${normalizedMargin.toFixed(3)} < strong ${INTELLIGENCE_GATE_STRONG_MARGIN.toFixed(3)})`,
-        };
+    if (needsPeerConfirmation && normalizedMargin < INTELLIGENCE_GATE_STRONG_MARGIN) {
+        if (candidateDirection === 0) {
+            return {
+                ok: false,
+                strategy,
+                marketKey,
+                scan,
+                margin,
+                normalizedMargin,
+                ageMs,
+                peerSignals: peerSignals.count,
+                peerStrategies: peerSignals.peers,
+                peerConsensus: peerSignals.consensus,
+                reason: `Directional peer confirmation unavailable for ${strategy}: scan is non-directional`,
+            };
+        }
+        if (peerSignals.count === 0) {
+            return {
+                ok: false,
+                strategy,
+                marketKey,
+                scan,
+                margin,
+                normalizedMargin,
+                ageMs,
+                peerSignals: peerSignals.count,
+                peerStrategies: peerSignals.peers,
+                peerConsensus: peerSignals.consensus,
+                reason: `No corroborating directional peer signal for ${strategy} on ${scan.market_key} (margin ${normalizedMargin.toFixed(3)} < strong ${INTELLIGENCE_GATE_STRONG_MARGIN.toFixed(3)})`,
+            };
+        }
+        if (peerSignals.consensus <= 0 || peerSignals.opposingCount >= peerSignals.count) {
+            return {
+                ok: false,
+                strategy,
+                marketKey,
+                scan,
+                margin,
+                normalizedMargin,
+                ageMs,
+                peerSignals: peerSignals.count,
+                peerStrategies: peerSignals.peers,
+                peerConsensus: peerSignals.consensus,
+                reason: `Peer consensus opposed ${strategy} direction on ${scan.market_key} (consensus ${peerSignals.consensus.toFixed(3)})`,
+            };
+        }
     }
 
     return {
@@ -2735,7 +2993,7 @@ async function maybeApplyGovernanceDecision(
         strategyStatus[decision.strategy] = true;
         await publishStrategyMultiplier(decision.strategy, promotedMultiplier);
         await redisClient.set(`strategy:enabled:${decision.strategy}`, '1');
-        await redisClient.expire(`strategy:enabled:${decision.strategy}`, 86400); // 24 hours
+        await redisClient.persist(`strategy:enabled:${decision.strategy}`);
         await redisClient.publish('strategy:control', JSON.stringify({
             id: decision.strategy,
             active: true,
@@ -2770,7 +3028,7 @@ async function maybeApplyGovernanceDecision(
         strategyStatus[decision.strategy] = false;
         await publishStrategyMultiplier(decision.strategy, 0);
         await redisClient.set(`strategy:enabled:${decision.strategy}`, '0');
-        await redisClient.expire(`strategy:enabled:${decision.strategy}`, 86400); // 24 hours
+        await redisClient.persist(`strategy:enabled:${decision.strategy}`);
         await redisClient.publish('strategy:control', JSON.stringify({
             id: decision.strategy,
             active: false,
@@ -3209,6 +3467,232 @@ function requestMetaControllerRefresh(): void {
     }, META_CONTROLLER_REFRESH_DEBOUNCE_MS);
 }
 
+const CROSS_HORIZON_STALE_MS = Math.max(
+    INTELLIGENCE_GATE_MAX_STALENESS_MS,
+    CROSS_HORIZON_ROUTER_INTERVAL_MS * 3,
+);
+
+function clampCrossHorizonOverlay(value: number): number {
+    if (!Number.isFinite(value)) {
+        return 1;
+    }
+    return Math.min(CROSS_HORIZON_ROUTER_MAX_BOOST, Math.max(0, value));
+}
+
+function mergeCrossHorizonOverlay(current: number, next: number): number {
+    const currentSafe = clampCrossHorizonOverlay(current);
+    const nextSafe = clampCrossHorizonOverlay(next);
+    if (nextSafe < 1) {
+        return Math.min(currentSafe, nextSafe);
+    }
+    if (nextSafe > 1) {
+        return Math.max(currentSafe, nextSafe);
+    }
+    return currentSafe;
+}
+
+async function persistCrossHorizonOverlay(strategyId: string, overlay: number): Promise<void> {
+    const sanitized = clampCrossHorizonOverlay(overlay);
+    const previous = crossHorizonOverlayCache[strategyId];
+    if (Number.isFinite(previous) && Math.abs(previous - sanitized) < 1e-4) {
+        return;
+    }
+    const key = `${CROSS_HORIZON_OVERLAY_KEY_PREFIX}${strategyId}`;
+    await redisClient.set(key, sanitized.toFixed(6));
+    crossHorizonOverlayCache[strategyId] = sanitized;
+}
+
+function evaluateCrossHorizonPair(pair: { asset: string; fast: string; slow: string }, now: number): CrossHorizonPairState {
+    const fastScan = latestStrategyScans.get(pair.fast);
+    const slowScan = latestStrategyScans.get(pair.slow);
+    const noDataState = (reason: string): CrossHorizonPairState => ({
+        asset: pair.asset,
+        fast_strategy: pair.fast,
+        slow_strategy: pair.slow,
+        fast_margin: fastScan ? computeNormalizedMargin(fastScan) : null,
+        slow_margin: slowScan ? computeNormalizedMargin(slowScan) : null,
+        fast_direction: fastScan ? scanDirectionSign(fastScan) : 0,
+        slow_direction: slowScan ? scanDirectionSign(slowScan) : 0,
+        fast_overlay: 1,
+        slow_overlay: 1,
+        action: 'NO_DATA',
+        reason,
+        updated_at: now,
+    });
+    if (!fastScan || !slowScan) {
+        return noDataState('missing fast/slow scan');
+    }
+    if ((now - fastScan.timestamp) > CROSS_HORIZON_STALE_MS || (now - slowScan.timestamp) > CROSS_HORIZON_STALE_MS) {
+        return noDataState('scan stale');
+    }
+
+    const fastMargin = computeNormalizedMargin(fastScan);
+    const slowMargin = computeNormalizedMargin(slowScan);
+    const fastDirection = scanDirectionSign(fastScan);
+    const slowDirection = scanDirectionSign(slowScan);
+
+    let fastOverlay = 1;
+    let slowOverlay = 1;
+    let action: CrossHorizonPairAction = 'NEUTRAL';
+    let reason = 'neutral';
+
+    if (!fastScan.passes_threshold || !slowScan.passes_threshold) {
+        reason = 'one or more legs below threshold';
+    } else if (Math.abs(fastMargin) < CROSS_HORIZON_ROUTER_MIN_MARGIN && Math.abs(slowMargin) < CROSS_HORIZON_ROUTER_MIN_MARGIN) {
+        reason = 'both legs below minimum margin';
+    } else if (fastDirection !== 0 && slowDirection !== 0 && fastDirection !== slowDirection) {
+        fastOverlay = CROSS_HORIZON_ROUTER_CONFLICT_MULT;
+        slowOverlay = CROSS_HORIZON_ROUTER_CONFLICT_MULT;
+        action = 'CONFLICT_TAPER';
+        reason = 'directional conflict between horizons';
+    } else if (fastMargin >= CROSS_HORIZON_ROUTER_STRONG_MARGIN && slowMargin >= CROSS_HORIZON_ROUTER_STRONG_MARGIN) {
+        const confidenceBoost = 1 + Math.min(0.25, Math.max(0, Math.min(fastMargin, slowMargin) - CROSS_HORIZON_ROUTER_STRONG_MARGIN));
+        const boost = clampCrossHorizonOverlay(CROSS_HORIZON_ROUTER_CONFIRM_MULT * confidenceBoost);
+        fastOverlay = boost;
+        slowOverlay = boost;
+        action = 'CONSENSUS_BOOST';
+        reason = 'strong multi-horizon consensus';
+    } else if (fastMargin >= CROSS_HORIZON_ROUTER_STRONG_MARGIN || slowMargin >= CROSS_HORIZON_ROUTER_STRONG_MARGIN) {
+        const leadFast = fastMargin >= slowMargin;
+        const boost = clampCrossHorizonOverlay(CROSS_HORIZON_ROUTER_CONFIRM_MULT);
+        if (leadFast) {
+            fastOverlay = boost;
+        } else {
+            slowOverlay = boost;
+        }
+        action = 'ASYMMETRIC';
+        reason = leadFast ? 'fast horizon stronger' : 'slow horizon stronger';
+    } else if (fastDirection !== 0 && slowDirection !== 0 && fastDirection === slowDirection) {
+        const mildBoost = clampCrossHorizonOverlay(1 + ((fastMargin + slowMargin) * 0.20));
+        if (mildBoost > 1) {
+            fastOverlay = mildBoost;
+            slowOverlay = mildBoost;
+            action = 'CONSENSUS_BOOST';
+            reason = 'mild directional consensus';
+        } else {
+            reason = 'consensus with insufficient margin';
+        }
+    } else {
+        reason = 'non-directional or weak alignment';
+    }
+
+    return {
+        asset: pair.asset,
+        fast_strategy: pair.fast,
+        slow_strategy: pair.slow,
+        fast_margin: fastMargin,
+        slow_margin: slowMargin,
+        fast_direction: fastDirection,
+        slow_direction: slowDirection,
+        fast_overlay: clampCrossHorizonOverlay(fastOverlay),
+        slow_overlay: clampCrossHorizonOverlay(slowOverlay),
+        action,
+        reason,
+        updated_at: now,
+    };
+}
+
+async function refreshCrossHorizonRouter(now = Date.now()): Promise<void> {
+    const overlays: Record<string, number> = Object.fromEntries(STRATEGY_IDS.map((strategyId) => [strategyId, 1]));
+    const pairStates: Record<string, CrossHorizonPairState> = {};
+    const pairCount = CROSS_HORIZON_STRATEGY_PAIRS.length;
+    const routerEnabled = CROSS_HORIZON_ROUTER_ENABLED && pairCount > 0 && crossHorizonManagedStrategies.length > 0;
+
+    if (!routerEnabled) {
+        const reason = !CROSS_HORIZON_ROUTER_ENABLED
+            ? 'disabled by config'
+            : 'no valid cross-horizon pairs configured';
+        for (const strategyId of STRATEGY_IDS) {
+            await persistCrossHorizonOverlay(strategyId, 1);
+        }
+        crossHorizonRouterState = {
+            enabled: CROSS_HORIZON_ROUTER_ENABLED,
+            interval_ms: CROSS_HORIZON_ROUTER_INTERVAL_MS,
+            overlays,
+            pairs: {},
+            updated_at: now,
+            reason,
+        };
+        io.emit('cross_horizon_router_update', crossHorizonRouterState);
+        touchRuntimeModule('CROSS_HORIZON_ROUTER', CROSS_HORIZON_ROUTER_ENABLED ? 'DEGRADED' : 'STANDBY', reason);
+        return;
+    }
+
+    for (const pair of CROSS_HORIZON_STRATEGY_PAIRS) {
+        const pairState = evaluateCrossHorizonPair(pair, now);
+        const pairKey = `${pair.asset}:${pair.fast}:${pair.slow}`;
+        pairStates[pairKey] = pairState;
+        overlays[pair.fast] = mergeCrossHorizonOverlay(overlays[pair.fast] ?? 1, pairState.fast_overlay);
+        overlays[pair.slow] = mergeCrossHorizonOverlay(overlays[pair.slow] ?? 1, pairState.slow_overlay);
+    }
+
+    for (const strategyId of STRATEGY_IDS) {
+        await persistCrossHorizonOverlay(strategyId, overlays[strategyId] ?? 1);
+    }
+
+    crossHorizonRouterState = {
+        enabled: true,
+        interval_ms: CROSS_HORIZON_ROUTER_INTERVAL_MS,
+        overlays: Object.fromEntries(
+            Object.entries(overlays).map(([strategy, value]) => [strategy, Math.round(value * 1000) / 1000]),
+        ),
+        pairs: Object.fromEntries(
+            Object.entries(pairStates).map(([pairKey, state]) => [pairKey, {
+                ...state,
+                fast_margin: state.fast_margin === null ? null : Math.round(state.fast_margin * 1000) / 1000,
+                slow_margin: state.slow_margin === null ? null : Math.round(state.slow_margin * 1000) / 1000,
+                fast_overlay: Math.round(state.fast_overlay * 1000) / 1000,
+                slow_overlay: Math.round(state.slow_overlay * 1000) / 1000,
+            }]),
+        ),
+        updated_at: now,
+        reason: `updated ${pairCount} pair${pairCount === 1 ? '' : 's'}`,
+    };
+    io.emit('cross_horizon_router_update', crossHorizonRouterState);
+    touchRuntimeModule(
+        'CROSS_HORIZON_ROUTER',
+        'ONLINE',
+        `${pairCount} pairs / ${crossHorizonManagedStrategies.length} managed strategies`,
+    );
+}
+
+async function runCrossHorizonRefreshSafely(): Promise<void> {
+    try {
+        await refreshCrossHorizonRouter();
+    } catch (error) {
+        recordSilentCatch('CrossHorizonRouter.Refresh', error);
+        touchRuntimeModule('CROSS_HORIZON_ROUTER', 'DEGRADED', `cross-horizon refresh error: ${String(error)}`);
+    }
+}
+
+function requestCrossHorizonRefresh(): void {
+    crossHorizonRefreshScheduled = true;
+    if (crossHorizonRefreshTimer) {
+        return;
+    }
+
+    crossHorizonRefreshTimer = setTimeout(() => {
+        crossHorizonRefreshTimer = null;
+        if (crossHorizonRefreshInFlight) {
+            return;
+        }
+        crossHorizonRefreshInFlight = true;
+        void (async () => {
+            try {
+                while (crossHorizonRefreshScheduled) {
+                    crossHorizonRefreshScheduled = false;
+                    await runCrossHorizonRefreshSafely();
+                }
+            } finally {
+                crossHorizonRefreshInFlight = false;
+                if (crossHorizonRefreshScheduled && !crossHorizonRefreshTimer) {
+                    requestCrossHorizonRefresh();
+                }
+            }
+        })();
+    }, CROSS_HORIZON_REFRESH_DEBOUNCE_MS);
+}
+
 async function readJsonFileSafe(filePath: string): Promise<Record<string, unknown> | null> {
     try {
         const raw = await fs.readFile(filePath, 'utf8');
@@ -3537,7 +4021,69 @@ function clampProbabilityGate(value: number): number {
     return Math.min(0.95, Math.max(0.50, value));
 }
 
-function activeModelProbabilityGate(): number {
+function modelGateMarketScopeKey(strategy: string, marketKey: string): string {
+    return `${strategy}::${marketKey}`;
+}
+
+function roundGateMap(input: Record<string, number>): Record<string, number> {
+    return Object.fromEntries(
+        Object.entries(input)
+            .map(([key, value]) => [key, Math.round(clampProbabilityGate(value) * 1000) / 1000]),
+    );
+}
+
+function roundCountMap(input: Record<string, number>): Record<string, number> {
+    return Object.fromEntries(
+        Object.entries(input)
+            .map(([key, value]) => [key, Math.max(0, Math.round(value))]),
+    );
+}
+
+function parseGateMap(raw: unknown, minGate: number, maxGate: number, maxEntries: number): Record<string, number> {
+    const parsed = asRecord(raw);
+    if (!parsed) {
+        return {};
+    }
+    const entries = Object.entries(parsed)
+        .map(([key, value]) => [key, asNumber(value)] as const)
+        .filter(([key, value]) => key.trim().length > 0 && value !== null && Number.isFinite(value))
+        .sort((a, b) => (b[1] as number) - (a[1] as number))
+        .slice(0, maxEntries)
+        .map(([key, value]) => [
+            key.trim(),
+            Math.min(maxGate, Math.max(minGate, clampProbabilityGate(value as number))),
+        ] as const);
+    return Object.fromEntries(entries);
+}
+
+function parseCountMap(raw: unknown, maxEntries: number): Record<string, number> {
+    const parsed = asRecord(raw);
+    if (!parsed) {
+        return {};
+    }
+    const entries = Object.entries(parsed)
+        .map(([key, value]) => [key, asNumber(value)] as const)
+        .filter(([key, value]) => key.trim().length > 0 && value !== null && Number.isFinite(value))
+        .sort((a, b) => (b[1] as number) - (a[1] as number))
+        .slice(0, maxEntries)
+        .map(([key, value]) => [key.trim(), Math.max(0, Math.round(value as number))] as const);
+    return Object.fromEntries(entries);
+}
+
+function activeModelProbabilityGate(strategy?: string | null, marketKey?: string | null): number {
+    if (strategy && marketKey) {
+        const scopedMarket = modelGateMarketScopeKey(strategy, marketKey);
+        const marketGate = asNumber(modelGateCalibrationState.market_active_gates[scopedMarket]);
+        if (marketGate !== null) {
+            return clampProbabilityGate(marketGate);
+        }
+    }
+    if (strategy) {
+        const strategyGate = asNumber(modelGateCalibrationState.strategy_active_gates[strategy]);
+        if (strategyGate !== null) {
+            return clampProbabilityGate(strategyGate);
+        }
+    }
     return clampProbabilityGate(modelGateCalibrationState.active_gate);
 }
 
@@ -3550,6 +4096,12 @@ function modelGateCalibrationPayload(): ModelGateCalibrationState {
         expected_pnl_baseline: Math.round(modelGateCalibrationState.expected_pnl_baseline * 100) / 100,
         expected_pnl_recommended: Math.round(modelGateCalibrationState.expected_pnl_recommended * 100) / 100,
         delta_expected_pnl: Math.round(modelGateCalibrationState.delta_expected_pnl * 100) / 100,
+        strategy_active_gates: roundGateMap(modelGateCalibrationState.strategy_active_gates),
+        strategy_recommended_gates: roundGateMap(modelGateCalibrationState.strategy_recommended_gates),
+        strategy_sample_counts: roundCountMap(modelGateCalibrationState.strategy_sample_counts),
+        market_active_gates: roundGateMap(modelGateCalibrationState.market_active_gates),
+        market_recommended_gates: roundGateMap(modelGateCalibrationState.market_recommended_gates),
+        market_sample_counts: roundCountMap(modelGateCalibrationState.market_sample_counts),
     };
 }
 
@@ -3596,6 +4148,56 @@ function scoreModelGate(samples: ModelGateCalibrationSample[], gate: number): nu
     return sum;
 }
 
+type GateOptimizationResult = {
+    baseline_score: number;
+    recommended_gate: number;
+    recommended_score: number;
+    active_gate: number;
+};
+
+function optimizeModelGate(
+    samples: ModelGateCalibrationSample[],
+    baselineGate: number,
+    minGate: number,
+    maxGate: number,
+    stepSize: number,
+    previousActive: number,
+    advisoryOnly: boolean,
+): GateOptimizationResult {
+    const baselineScore = scoreModelGate(samples, baselineGate);
+    let bestGate = baselineGate;
+    let bestScore = baselineScore;
+    const boundedPrevious = Math.min(maxGate, Math.max(minGate, clampProbabilityGate(previousActive)));
+    for (let gate = minGate; gate <= maxGate + 1e-9; gate += stepSize) {
+        const candidateGate = clampProbabilityGate(gate);
+        const candidateScore = scoreModelGate(samples, candidateGate);
+        const currentDelta = Math.abs(bestGate - boundedPrevious);
+        const candidateDelta = Math.abs(candidateGate - boundedPrevious);
+        if (candidateScore > bestScore + 1e-9 || (Math.abs(candidateScore - bestScore) <= 1e-9 && candidateDelta < currentDelta)) {
+            bestGate = candidateGate;
+            bestScore = candidateScore;
+        }
+    }
+
+    const boundedRecommended = Math.min(maxGate, Math.max(minGate, bestGate));
+    const nextActive = advisoryOnly
+        ? baselineGate
+        : (() => {
+            const delta = boundedRecommended - boundedPrevious;
+            if (Math.abs(delta) <= stepSize) {
+                return boundedRecommended;
+            }
+            return clampProbabilityGate(boundedPrevious + Math.sign(delta) * stepSize);
+        })();
+
+    return {
+        baseline_score: baselineScore,
+        recommended_gate: boundedRecommended,
+        recommended_score: bestScore,
+        active_gate: Math.min(maxGate, Math.max(minGate, nextActive)),
+    };
+}
+
 async function loadModelGateCalibrationState(): Promise<void> {
     try {
         const raw = await redisClient.get(MODEL_GATE_CALIBRATION_KEY);
@@ -3612,11 +4214,23 @@ async function loadModelGateCalibrationState(): Promise<void> {
         const maxGate = clampProbabilityGate(baselineGate + drift);
         const restoredActive = clampProbabilityGate(asNumber(parsed.active_gate) ?? baselineGate);
         const restoredRecommended = clampProbabilityGate(asNumber(parsed.recommended_gate) ?? restoredActive);
+        const strategyActive = parseGateMap(parsed.strategy_active_gates, minGate, maxGate, STRATEGY_IDS.length * 2);
+        const strategyRecommended = parseGateMap(parsed.strategy_recommended_gates, minGate, maxGate, STRATEGY_IDS.length * 2);
+        const strategyCounts = parseCountMap(parsed.strategy_sample_counts, STRATEGY_IDS.length * 2);
+        const marketActive = parseGateMap(parsed.market_active_gates, minGate, maxGate, MODEL_GATE_MARKET_MAX_KEYS);
+        const marketRecommended = parseGateMap(parsed.market_recommended_gates, minGate, maxGate, MODEL_GATE_MARKET_MAX_KEYS);
+        const marketCounts = parseCountMap(parsed.market_sample_counts, MODEL_GATE_MARKET_MAX_KEYS);
         modelGateCalibrationState = {
             ...modelGateCalibrationState,
             baseline_gate: baselineGate,
             active_gate: Math.min(maxGate, Math.max(minGate, restoredActive)),
             recommended_gate: Math.min(maxGate, Math.max(minGate, restoredRecommended)),
+            strategy_active_gates: strategyActive,
+            strategy_recommended_gates: strategyRecommended,
+            strategy_sample_counts: strategyCounts,
+            market_active_gates: marketActive,
+            market_recommended_gates: marketRecommended,
+            market_sample_counts: marketCounts,
             updated_at: asNumber(parsed.updated_at) ?? Date.now(),
             reason: 'restored calibration state from redis',
         };
@@ -3651,6 +4265,12 @@ async function runModelProbabilityGateCalibration(now = Date.now()): Promise<voi
             delta_expected_pnl: 0,
             profitable_rejected_signals: 0,
             loss_avoided_signals: 0,
+            strategy_active_gates: {},
+            strategy_recommended_gates: {},
+            strategy_sample_counts: {},
+            market_active_gates: {},
+            market_recommended_gates: {},
+            market_sample_counts: {},
             updated_at: now,
             reason: 'tuner disabled by env',
         };
@@ -3661,6 +4281,91 @@ async function runModelProbabilityGateCalibration(now = Date.now()): Promise<voi
     const samples = collectModelGateCalibrationSamples(now);
     const acceptedSamples = samples.filter((sample) => sample.accepted).length;
     const rejectedSamples = samples.length - acceptedSamples;
+    const profitableRejectedSignals = samples.filter((sample) => !sample.accepted && sample.pnl > 0).length;
+    const lossAvoidedSignals = samples.filter((sample) => !sample.accepted && sample.pnl <= 0).length;
+
+    const samplesByStrategy = new Map<string, ModelGateCalibrationSample[]>();
+    const samplesByMarket = new Map<string, ModelGateCalibrationSample[]>();
+    for (const sample of samples) {
+        if (sample.strategy && sample.strategy.trim().length > 0) {
+            const strategy = sample.strategy.trim().toUpperCase();
+            const strategyBucket = samplesByStrategy.get(strategy) || [];
+            strategyBucket.push(sample);
+            samplesByStrategy.set(strategy, strategyBucket);
+            if (sample.market_key) {
+                const marketScope = modelGateMarketScopeKey(strategy, sample.market_key);
+                const marketBucket = samplesByMarket.get(marketScope) || [];
+                marketBucket.push(sample);
+                samplesByMarket.set(marketScope, marketBucket);
+            }
+        }
+    }
+
+    const strategyActiveGates: Record<string, number> = {};
+    const strategyRecommendedGates: Record<string, number> = {};
+    const strategySampleCounts: Record<string, number> = {};
+    for (const [strategy, strategySamples] of samplesByStrategy.entries()) {
+        strategySampleCounts[strategy] = strategySamples.length;
+        if (strategySamples.length < MODEL_GATE_STRATEGY_MIN_SAMPLES) {
+            continue;
+        }
+        const previousActive = asNumber(modelGateCalibrationState.strategy_active_gates[strategy])
+            ?? asNumber(modelGateCalibrationState.active_gate)
+            ?? baselineGate;
+        const strategyOptimization = optimizeModelGate(
+            strategySamples,
+            baselineGate,
+            minGate,
+            maxGate,
+            stepSize,
+            previousActive,
+            MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY,
+        );
+        strategyActiveGates[strategy] = strategyOptimization.active_gate;
+        strategyRecommendedGates[strategy] = strategyOptimization.recommended_gate;
+    }
+
+    const marketBuckets = [...samplesByMarket.entries()]
+        .map(([scope, bucket]) => ({
+            scope,
+            bucket,
+            count: bucket.length,
+            last_ts: bucket.reduce((latest, item) => Math.max(latest, item.timestamp), 0),
+            strategy: scope.split('::')[0] || 'UNKNOWN',
+        }))
+        .filter((bucket) => bucket.count >= MODEL_GATE_MARKET_MIN_SAMPLES)
+        .sort((a, b) => {
+            if (b.count !== a.count) {
+                return b.count - a.count;
+            }
+            return b.last_ts - a.last_ts;
+        })
+        .slice(0, MODEL_GATE_MARKET_MAX_KEYS);
+
+    const marketActiveGates: Record<string, number> = {};
+    const marketRecommendedGates: Record<string, number> = {};
+    const marketSampleCounts: Record<string, number> = {};
+    for (const bucket of marketBuckets) {
+        marketSampleCounts[bucket.scope] = bucket.count;
+        const strategyScopedActive = asNumber(strategyActiveGates[bucket.strategy])
+            ?? asNumber(modelGateCalibrationState.strategy_active_gates[bucket.strategy])
+            ?? asNumber(modelGateCalibrationState.active_gate)
+            ?? baselineGate;
+        const previousActive = asNumber(modelGateCalibrationState.market_active_gates[bucket.scope])
+            ?? strategyScopedActive;
+        const marketOptimization = optimizeModelGate(
+            bucket.bucket,
+            baselineGate,
+            minGate,
+            maxGate,
+            stepSize,
+            previousActive,
+            MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY,
+        );
+        marketActiveGates[bucket.scope] = marketOptimization.active_gate;
+        marketRecommendedGates[bucket.scope] = marketOptimization.recommended_gate;
+    }
+
     if (samples.length < MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES) {
         modelGateCalibrationState = {
             ...modelGateCalibrationState,
@@ -3681,8 +4386,14 @@ async function runModelProbabilityGateCalibration(now = Date.now()): Promise<voi
             expected_pnl_baseline: 0,
             expected_pnl_recommended: 0,
             delta_expected_pnl: 0,
-            profitable_rejected_signals: samples.filter((sample) => !sample.accepted && sample.pnl > 0).length,
-            loss_avoided_signals: samples.filter((sample) => !sample.accepted && sample.pnl <= 0).length,
+            profitable_rejected_signals: profitableRejectedSignals,
+            loss_avoided_signals: lossAvoidedSignals,
+            strategy_active_gates: strategyActiveGates,
+            strategy_recommended_gates: strategyRecommendedGates,
+            strategy_sample_counts: strategySampleCounts,
+            market_active_gates: marketActiveGates,
+            market_recommended_gates: marketRecommendedGates,
+            market_sample_counts: marketSampleCounts,
             updated_at: now,
             reason: `insufficient labeled samples (${samples.length}/${MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES})`,
         };
@@ -3690,39 +4401,23 @@ async function runModelProbabilityGateCalibration(now = Date.now()): Promise<voi
         return;
     }
 
-    const baselineScore = scoreModelGate(samples, baselineGate);
-    let bestGate = baselineGate;
-    let bestScore = baselineScore;
-    for (let gate = minGate; gate <= maxGate + 1e-9; gate += stepSize) {
-        const candidateGate = clampProbabilityGate(gate);
-        const candidateScore = scoreModelGate(samples, candidateGate);
-        const currentDelta = Math.abs(bestGate - modelGateCalibrationState.active_gate);
-        const candidateDelta = Math.abs(candidateGate - modelGateCalibrationState.active_gate);
-        if (candidateScore > bestScore + 1e-9 || (Math.abs(candidateScore - bestScore) <= 1e-9 && candidateDelta < currentDelta)) {
-            bestGate = candidateGate;
-            bestScore = candidateScore;
-        }
-    }
-
-    const boundedRecommended = Math.min(maxGate, Math.max(minGate, bestGate));
-    const previousActive = Math.min(maxGate, Math.max(minGate, modelGateCalibrationState.active_gate));
-    const nextActive = MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY
-        ? baselineGate
-        : (() => {
-            const delta = boundedRecommended - previousActive;
-            if (Math.abs(delta) <= stepSize) {
-                return boundedRecommended;
-            }
-            return clampProbabilityGate(previousActive + Math.sign(delta) * stepSize);
-        })();
+    const globalOptimization = optimizeModelGate(
+        samples,
+        baselineGate,
+        minGate,
+        maxGate,
+        stepSize,
+        modelGateCalibrationState.active_gate,
+        MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY,
+    );
 
     modelGateCalibrationState = {
         ...modelGateCalibrationState,
         enabled: true,
         advisory_only: MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY,
         baseline_gate: baselineGate,
-        active_gate: Math.min(maxGate, Math.max(minGate, nextActive)),
-        recommended_gate: boundedRecommended,
+        active_gate: globalOptimization.active_gate,
+        recommended_gate: globalOptimization.recommended_gate,
         lookback_ms: MODEL_PROBABILITY_GATE_TUNER_LOOKBACK_MS,
         min_samples: MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES,
         step_size: stepSize,
@@ -3730,15 +4425,21 @@ async function runModelProbabilityGateCalibration(now = Date.now()): Promise<voi
         sample_count: samples.length,
         accepted_samples: acceptedSamples,
         rejected_samples: rejectedSamples,
-        expected_pnl_baseline: baselineScore,
-        expected_pnl_recommended: bestScore,
-        delta_expected_pnl: bestScore - baselineScore,
-        profitable_rejected_signals: samples.filter((sample) => !sample.accepted && sample.pnl > 0).length,
-        loss_avoided_signals: samples.filter((sample) => !sample.accepted && sample.pnl <= 0).length,
+        expected_pnl_baseline: globalOptimization.baseline_score,
+        expected_pnl_recommended: globalOptimization.recommended_score,
+        delta_expected_pnl: globalOptimization.recommended_score - globalOptimization.baseline_score,
+        profitable_rejected_signals: profitableRejectedSignals,
+        loss_avoided_signals: lossAvoidedSignals,
+        strategy_active_gates: strategyActiveGates,
+        strategy_recommended_gates: strategyRecommendedGates,
+        strategy_sample_counts: strategySampleCounts,
+        market_active_gates: marketActiveGates,
+        market_recommended_gates: marketRecommendedGates,
+        market_sample_counts: marketSampleCounts,
         updated_at: now,
         reason: MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY
-            ? `recommended ${boundedRecommended.toFixed(3)} from ${samples.length} samples (advisory)`
-            : `active ${nextActive.toFixed(3)} toward ${boundedRecommended.toFixed(3)} from ${samples.length} samples`,
+            ? `recommended ${globalOptimization.recommended_gate.toFixed(3)} from ${samples.length} samples (advisory), strategy/market overlays ready`
+            : `active ${globalOptimization.active_gate.toFixed(3)} toward ${globalOptimization.recommended_gate.toFixed(3)} from ${samples.length} samples with strategy/market overlays`,
     };
 
     touchRuntimeModule(
@@ -3821,7 +4522,7 @@ async function refreshSignalModelArtifact(): Promise<void> {
 function updateModelInferenceFromScan(scan: StrategyScanState, rowId: string | null = null): ModelInferenceEntry {
     const key = buildStrategyMarketKey(scan.strategy, scan.market_key);
     const features = buildScanFeatureMap(scan);
-    const probabilityGate = activeModelProbabilityGate();
+    const probabilityGate = activeModelProbabilityGate(scan.strategy, scan.market_key);
     const fallback: ModelInferenceEntry = {
         strategy: scan.strategy,
         market_key: scan.market_key,
@@ -4054,7 +4755,7 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
 } {
     const strategy = extractExecutionStrategy(payload);
     const marketKey = extractExecutionMarketKey(payload);
-    const probabilityGate = activeModelProbabilityGate();
+    const probabilityGate = activeModelProbabilityGate(strategy, marketKey);
     const enforceMode = (tradingMode === 'PAPER' && MODEL_PROBABILITY_GATE_ENFORCE_PAPER)
         || (tradingMode === 'LIVE' && MODEL_PROBABILITY_GATE_ENFORCE_LIVE);
     if (!MODEL_PROBABILITY_GATE_ENABLED || !enforceMode) {
@@ -4099,7 +4800,7 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
     const strategyRows = Object.values(modelInferenceState.latest)
         .filter((entry) => entry.strategy === strategy)
         .sort((a, b) => b.timestamp - a.timestamp);
-    const fallback = exact || (!marketKey ? strategyRows[0] : null);
+    const fallback = exact || strategyRows[0] || null;
     if (!fallback) {
         return {
             ok: !MODEL_PROBABILITY_GATE_REQUIRE_MODEL,
@@ -4595,9 +5296,11 @@ function computeStrategyMultiplier(state: StrategyPerformance): number {
 }
 
 async function publishStrategyMultiplier(strategyId: string, multiplier: number): Promise<void> {
-    const bounded = Math.min(STRATEGY_WEIGHT_CAP, Math.max(STRATEGY_WEIGHT_FLOOR, multiplier));
+    const bounded = multiplier <= 0
+        ? 0
+        : Math.min(STRATEGY_WEIGHT_CAP, Math.max(STRATEGY_WEIGHT_FLOOR, multiplier));
     await redisClient.set(strategyRiskMultiplierKey(strategyId), bounded.toFixed(6));
-    await redisClient.expire(strategyRiskMultiplierKey(strategyId), 86400); // 24 hours
+    await redisClient.persist(strategyRiskMultiplierKey(strategyId));
 }
 
 async function applyDefaultStrategyStates(force = false): Promise<void> {
@@ -4609,11 +5312,13 @@ async function applyDefaultStrategyStates(force = false): Promise<void> {
         clearRiskGuardBootResumeTimer(strategyId);
         if (force) {
             await redisClient.set(enabledKey, enabledByDefault ? '1' : '0');
+            await redisClient.persist(enabledKey);
             if (enabledByDefault) {
                 await redisClient.del(pauseUntilKey);
             }
         } else {
             await redisClient.setNX(enabledKey, enabledByDefault ? '1' : '0');
+            await redisClient.persist(enabledKey);
 
             // Re-enable strategies whose Risk Guard cooldown expired during a restart.
             // The in-memory setTimeout-based auto-resume is lost when the backend restarts,
@@ -4657,7 +5362,7 @@ async function applyDefaultStrategyStates(force = false): Promise<void> {
                             return;
                         }
                         await redisClient.set(enabledKey, '1');
-                        await redisClient.expire(enabledKey, 86400);
+                        await redisClient.persist(enabledKey);
                         await redisClient.del(pauseUntilKey);
                         strategyStatus[strategyId] = true;
                         io.emit('strategy_status_update', strategyStatus);
@@ -4673,7 +5378,6 @@ async function applyDefaultStrategyStates(force = false): Promise<void> {
                 logger.info(`[Boot] ${strategyId} still in Risk Guard cooldown, resume in ${Math.ceil(remaining / 1000)}s`);
             }
         }
-        await redisClient.expire(enabledKey, 86400); // 24 hours
         const raw = await redisClient.get(enabledKey);
         strategyStatus[strategyId] = raw !== '0';
     }
@@ -4855,11 +5559,56 @@ redisSubscriber.subscribe('arbitrage:opportunities', (message) => {
 
 redisSubscriber.subscribe('arbitrage:execution', (message) => {
     try {
-        const parsed = JSON.parse(message);
-        const executionId = ensureExecutionId(parsed);
+        const parsedEnvelope = JSON.parse(message);
+        const ingress = validateExecutionIngressPayload(parsedEnvelope);
+        const parsed = ingress.payload;
+        const parsedRecord = asRecord(parsed);
+        const executionId = parsedRecord ? ensureExecutionId(parsedRecord) : randomUUID();
         const parsedStrategy = extractExecutionStrategy(parsed);
         const parsedMarketKey = extractExecutionMarketKey(parsed);
-        const parsedRecord = asRecord(parsed);
+
+        if (!ingress.ok) {
+            const mode = normalizeTradingMode(asRecord(parsed)?.mode) || 'PAPER';
+            const reason = `[EXECUTION_INGRESS] ${ingress.reason}`;
+            const ingressRejectPayload = {
+                execution_id: executionId,
+                timestamp: Date.now(),
+                strategy: parsedStrategy || 'UNKNOWN',
+                market_key: parsedMarketKey,
+                reason,
+                mode,
+            };
+            pushExecutionTraceEvent(executionId, 'INTELLIGENCE_GATE', ingressRejectPayload, {
+                strategy: parsedStrategy,
+                market_key: parsedMarketKey,
+            });
+            io.emit('execution_log', {
+                execution_id: executionId,
+                timestamp: ingressRejectPayload.timestamp,
+                side: 'INGRESS_REJECT',
+                market: asString(asRecord(parsed)?.market) || 'Polymarket',
+                price: ingressRejectPayload.reason,
+                size: ingressRejectPayload.strategy,
+                mode,
+                details: ingressRejectPayload,
+            });
+            recordRejectedSignal({
+                stage: 'INTELLIGENCE_GATE',
+                execution_id: executionId,
+                strategy: ingressRejectPayload.strategy,
+                market_key: ingressRejectPayload.market_key,
+                reason: ingressRejectPayload.reason,
+                mode,
+                timestamp: ingressRejectPayload.timestamp,
+                payload: asRecord(ingressRejectPayload),
+            });
+            touchRuntimeModule('TRADING_MODE_GUARD', 'DEGRADED', `execution ingress rejected: ${ingress.reason}`);
+            return;
+        }
+
+        if (parsedRecord) {
+            parsedRecord.execution_ingress_signed = ingress.signed;
+        }
         if (parsedStrategy && parsedRecord) {
             pushStrategyExecutionHistory(parsedStrategy, parsedRecord);
         }
@@ -4909,6 +5658,43 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                         payload: asRecord(haltPayload),
                     });
                     touchRuntimeModule('TRADING_MODE_GUARD', 'DEGRADED', `execution halted: ${reason}`);
+                    return;
+                }
+                if (parsedStrategy && strategyStatus[parsedStrategy] === false) {
+                    const mode = await getTradingMode();
+                    const disabledPayload = {
+                        execution_id: executionId,
+                        timestamp: Date.now(),
+                        strategy: parsedStrategy,
+                        market_key: parsedMarketKey,
+                        reason: `[STRATEGY_DISABLED] ${parsedStrategy} is disabled`,
+                        mode,
+                    };
+                    pushExecutionTraceEvent(executionId, 'INTELLIGENCE_GATE', disabledPayload, {
+                        strategy: parsedStrategy,
+                        market_key: parsedMarketKey,
+                    });
+                    io.emit('execution_log', {
+                        execution_id: executionId,
+                        timestamp: disabledPayload.timestamp,
+                        side: 'STRATEGY_DISABLED_BLOCK',
+                        market: asString(asRecord(parsed)?.market) || 'Polymarket',
+                        price: disabledPayload.reason,
+                        size: disabledPayload.strategy,
+                        mode,
+                        details: disabledPayload,
+                    });
+                    recordRejectedSignal({
+                        stage: 'INTELLIGENCE_GATE',
+                        execution_id: executionId,
+                        strategy: disabledPayload.strategy,
+                        market_key: disabledPayload.market_key,
+                        reason: disabledPayload.reason,
+                        mode,
+                        timestamp: disabledPayload.timestamp,
+                        payload: asRecord(disabledPayload),
+                    });
+                    touchRuntimeModule('INTELLIGENCE_GATE', 'DEGRADED', `${parsedStrategy} disabled`);
                     return;
                 }
                 await processArbitrageExecutionWorker(
@@ -4969,24 +5755,22 @@ redisSubscriber.subscribe('strategy:pnl', (message) => {
         touchRuntimeModule('PNL_LEDGER', 'ONLINE', `${pnlStrategy || 'UNKNOWN'} pnl event recorded`);
 
         const mode = normalizeTradingMode(parsed?.mode) || 'PAPER';
-        if (mode !== 'PAPER') {
-            return;
-        }
-
-        const sample = parseTradeSample(parsed);
-        if (sample) {
-            pushTradeSample(sample);
-            const diagnostics = updateStrategyCostDiagnostics(sample);
-            const labeled = attachLabelToFeature(sample);
-            io.emit('strategy_cost_diagnostics_update', {
-                strategy: sample.strategy,
-                ...diagnostics,
-                avg_cost_drag_bps: Math.round(diagnostics.avg_cost_drag_bps * 10) / 10,
-                avg_net_return_bps: Math.round(diagnostics.avg_net_return_bps * 10) / 10,
-                avg_gross_return_bps: Math.round(diagnostics.avg_gross_return_bps * 10) / 10,
-            });
-            if (labeled) {
-                io.emit('feature_registry_update', featureRegistrySummary());
+        if (mode === 'PAPER') {
+            const sample = parseTradeSample(parsed);
+            if (sample) {
+                pushTradeSample(sample);
+                const diagnostics = updateStrategyCostDiagnostics(sample);
+                const labeled = attachLabelToFeature(sample);
+                io.emit('strategy_cost_diagnostics_update', {
+                    strategy: sample.strategy,
+                    ...diagnostics,
+                    avg_cost_drag_bps: Math.round(diagnostics.avg_cost_drag_bps * 10) / 10,
+                    avg_net_return_bps: Math.round(diagnostics.avg_net_return_bps * 10) / 10,
+                    avg_gross_return_bps: Math.round(diagnostics.avg_gross_return_bps * 10) / 10,
+                });
+                if (labeled) {
+                    io.emit('feature_registry_update', featureRegistrySummary());
+                }
             }
         }
 
@@ -5139,6 +5923,7 @@ redisSubscriber.subscribe('arbitrage:scan', (message) => {
         }
         io.emit('feature_registry_update', featureRegistrySummary());
         requestMetaControllerRefresh();
+        requestCrossHorizonRefresh();
         touchRuntimeModule('SCAN_INGEST', 'ONLINE', `${strategy} ${scanState.passes_threshold ? 'PASS' : 'HOLD'} ${scanState.symbol}`);
         io.emit('intelligence_update', scanState);
         io.emit('scanner_update', parsed);
@@ -5182,6 +5967,19 @@ redisSubscriber.subscribe('ml:features', (message) => {
                 ml_model_eval_auc: asNumber(parsed.ml_model_eval_auc),
                 ml_model_eval_accuracy: asNumber(parsed.ml_model_eval_accuracy),
                 ml_model_eval_brier: asNumber(parsed.ml_model_eval_brier),
+                micro_spread: asNumber(parsed.micro_spread),
+                micro_book_age_ms: asNumber(parsed.micro_book_age_ms),
+                micro_edge_to_spread_ratio: asNumber(parsed.micro_edge_to_spread_ratio),
+                micro_parity_deviation: asNumber(parsed.micro_parity_deviation),
+                micro_obi: asNumber(parsed.micro_obi),
+                micro_buy_pressure: asNumber(parsed.micro_buy_pressure),
+                micro_uptick_ratio: asNumber(parsed.micro_uptick_ratio),
+                micro_cluster_confidence: asNumber(parsed.micro_cluster_confidence),
+                micro_flow_acceleration: asNumber(parsed.micro_flow_acceleration),
+                micro_dynamic_cost_rate: asNumber(parsed.micro_dynamic_cost_rate),
+                micro_momentum_sigma: asNumber(parsed.micro_momentum_sigma),
+                micro_data_fresh: asNumber(parsed.micro_data_fresh),
+                micro_data_age_ms: asNumber(parsed.micro_data_age_ms),
                 timestamp: normalizeTimestampMs(parsed.timestamp),
             };
             const key = `ml:features:latest:${symbol}`;
@@ -5297,6 +6095,9 @@ redisSubscriber.subscribe('system:simulation_reset', (msg) => {
         io.emit('model_drift_update', modelDriftPayload());
         io.emit('entry_freshness_slo_update', entryFreshnessSloPayload());
         requestMetaControllerRefresh();
+        fireAndForget('CrossHorizonRouter.Refresh', runCrossHorizonRefreshSafely(), {
+            source: 'system:simulation_reset',
+        });
         fireAndForget('MLPipeline.Refresh', refreshMlPipelineStatus(), { source: 'system:simulation_reset' });
         fireAndForget('Governance.Cycle', runStrategyGovernanceCycle(), { source: 'system:simulation_reset' });
         fireAndForget('LedgerHealth.Refresh', refreshLedgerHealth(), { source: 'system:simulation_reset' });
@@ -5378,6 +6179,7 @@ io.on('connection', async (socket) => {
     socket.emit('silent_catch_telemetry_snapshot', silentCatchTelemetryPayload());
     socket.emit('ledger_health_update', ledgerHealthState);
     socket.emit('meta_controller_update', metaControllerPayload());
+    socket.emit('cross_horizon_router_update', crossHorizonRouterState);
     socket.emit('ml_pipeline_status_update', mlPipelineStatus);
     socket.emit('model_inference_snapshot', modelInferencePayload());
     socket.emit('model_drift_update', modelDriftPayload());
@@ -5544,7 +6346,7 @@ io.on('connection', async (socket) => {
         strategyStatus[validation.value.id] = validation.value.active;
 
         await redisClient.set(`strategy:enabled:${validation.value.id}`, validation.value.active ? '1' : '0');
-        await redisClient.expire(`strategy:enabled:${validation.value.id}`, 86400); // 24 hours
+        await redisClient.persist(`strategy:enabled:${validation.value.id}`);
         await redisClient.publish('strategy:control', JSON.stringify({
             id: validation.value.id,
             active: validation.value.active,
@@ -5685,6 +6487,7 @@ app.get('/api/arb/stats', async (_req, res) => {
         model_inference: modelInferencePayload(),
         model_drift: modelDriftPayload(),
         model_gate_calibration: modelGateCalibrationPayload(),
+        cross_horizon_router: crossHorizonRouterState,
         strategy_allocator: Object.fromEntries(
             STRATEGY_IDS.map((strategyId) => {
                 const perf = ensureStrategyPerformanceEntry(strategyId);
@@ -5822,7 +6625,12 @@ app.get('/api/arb/intelligence', (_req, res) => {
             mean_margin: Math.round(group.mean_margin * 10000) / 10000,
             mean_normalized_margin: Math.round(group.mean_normalized_margin * 1000) / 1000,
         })),
+        cross_horizon_router: crossHorizonRouterState,
     });
+});
+
+app.get('/api/arb/cross-horizon-router', (_req, res) => {
+    res.json(crossHorizonRouterState);
 });
 
 app.get('/api/arb/data-integrity', (_req, res) => {
@@ -6310,7 +7118,9 @@ async function runStrategyGovernanceCycle(): Promise<void> {
 
 // Agentic Decision Loop — DISABLED by default.
 // Re-enable requires both LEGACY_BRAIN_LOOP_ENABLED=true and LEGACY_BRAIN_LOOP_UNSAFE_OK=true.
-if (LEGACY_BRAIN_LOOP_ENABLED && LEGACY_BRAIN_LOOP_UNSAFE_OK) {
+const LEGACY_BRAIN_LOOP_ALLOW_PRODUCTION = process.env.LEGACY_BRAIN_LOOP_ALLOW_PRODUCTION === 'true';
+const legacyBrainProductionBlocked = process.env.NODE_ENV === 'production' && !LEGACY_BRAIN_LOOP_ALLOW_PRODUCTION;
+if (LEGACY_BRAIN_LOOP_ENABLED && LEGACY_BRAIN_LOOP_UNSAFE_OK && !legacyBrainProductionBlocked) {
     logger.warn('[Brain] legacy decision loop enabled in unsafe mode by explicit override.');
     registerScheduledTask('Brain', 30_000, async () => {
         try {
@@ -6356,7 +7166,9 @@ if (LEGACY_BRAIN_LOOP_ENABLED && LEGACY_BRAIN_LOOP_UNSAFE_OK) {
         }
     });
 } else {
-    if (LEGACY_BRAIN_LOOP_ENABLED && !LEGACY_BRAIN_LOOP_UNSAFE_OK) {
+    if (legacyBrainProductionBlocked && LEGACY_BRAIN_LOOP_ENABLED) {
+        logger.warn('[Brain] LEGACY_BRAIN_LOOP_ENABLED=true ignored in production. Set LEGACY_BRAIN_LOOP_ALLOW_PRODUCTION=true to override.');
+    } else if (LEGACY_BRAIN_LOOP_ENABLED && !LEGACY_BRAIN_LOOP_UNSAFE_OK) {
         logger.warn('[Brain] LEGACY_BRAIN_LOOP_ENABLED=true ignored because LEGACY_BRAIN_LOOP_UNSAFE_OK is not set.');
     } else {
         logger.info('[Brain] Legacy decision loop disabled (default).');
@@ -6446,6 +7258,10 @@ registerScheduledTask('MetaController', 3_000, async () => {
     requestMetaControllerRefresh();
 });
 
+registerScheduledTask('CrossHorizonRouter', CROSS_HORIZON_ROUTER_INTERVAL_MS, async () => {
+    requestCrossHorizonRefresh();
+});
+
 registerScheduledTask('MLPipeline', 10_000, async () => {
     try {
         await refreshMlPipelineStatus();
@@ -6522,6 +7338,7 @@ async function bootstrap() {
     await runStrategyGovernanceCycle();
     await refreshLedgerHealth();
     await refreshMetaController();
+    await runCrossHorizonRefreshSafely();
     await refreshMlPipelineStatus();
     refreshModelDriftRuntime();
     await loadModelGateCalibrationState();

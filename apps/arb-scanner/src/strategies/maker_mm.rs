@@ -12,9 +12,11 @@ use crate::engine::{MarketTarget, PolymarketClient, WS_URL};
 use crate::strategies::control::{
     build_scan_payload,
     compute_strategy_bet_size,
+    entered_live_mode,
     is_strategy_enabled,
     publish_heartbeat,
     publish_event,
+    publish_execution_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -298,88 +300,102 @@ impl Strategy for MakerMmStrategy {
                             continue;
                         }
 
-                        // Exit management.
-                        let mut keep_positions: Vec<Position> = Vec::new();
-                        for pos in open_positions.drain(..) {
-                            let Some(book) = books.get(&pos.market_id) else {
-                                keep_positions.push(pos);
-                                continue;
-                            };
-                            if !book.yes.is_valid() || !book.no.is_valid() || now_ms - book.last_update_ms > BOOK_STALE_MS {
-                                keep_positions.push(pos);
-                                continue;
+                        let trading_mode = read_trading_mode(&mut conn).await;
+                        let just_entered_live = entered_live_mode(&mut conn, "MAKER_MM", trading_mode).await;
+                        if trading_mode == TradingMode::Live && just_entered_live && !open_positions.is_empty() {
+                            let release_notional = open_positions.iter().map(|pos| pos.size).sum::<f64>();
+                            let cleared = open_positions.len();
+                            open_positions.clear();
+                            if release_notional > 0.0 {
+                                let _ = release_sim_notional_for_strategy(&mut conn, "MAKER_MM", release_notional).await;
                             }
-
-                            let (bid, _) = Self::side_bid_ask(book, pos.side);
-                            if bid <= 0.0 || pos.entry_price <= 0.0 {
-                                keep_positions.push(pos);
-                                continue;
-                            }
-
-                            let hold_ms = now_ms - pos.timestamp_ms;
-                            let gross_return = (bid - pos.entry_price) / pos.entry_price;
-
-                            // Adaptive exit via vol-regime detection
-                            let price_history_slice: Vec<(i64, f64)> = vec![
-                                (pos.timestamp_ms, pos.entry_price),
-                                (now_ms, bid),
-                            ];
-                            let (tp_mult, sl_mult) = if let Some(regime) = detect_regime(&price_history_slice) {
-                                regime_exit_multipliers(&regime)
-                            } else {
-                                (1.0, 1.0)
-                            };
-                            let adjusted_tp = TAKE_PROFIT_PCT * tp_mult;
-                            let adjusted_sl = STOP_LOSS_PCT * sl_mult;
-
-                            let close_reason = if gross_return >= adjusted_tp {
-                                Some("TAKE_PROFIT")
-                            } else if gross_return <= adjusted_sl {
-                                Some("STOP_LOSS")
-                            } else if hold_ms >= MAX_HOLD_MS {
-                                Some("TIME_EXIT")
-                            } else {
-                                None
-                            };
-
-                            if let Some(reason) = close_reason {
-                                let pnl = realized_pnl_with_fill(
-                                    pos.size,
-                                    gross_return,
-                                    cost_model,
-                                    FillStyle::Maker,
-                                    FillStyle::Taker,
-                                );
-                                let bankroll = settle_sim_position_for_strategy(&mut conn, "MAKER_MM", pos.size, pnl).await;
-                                let execution_id = pos.execution_id.clone();
-                                let pnl_msg = serde_json::json!({
-                                    "execution_id": execution_id,
-                                    "strategy": "MAKER_MM",
-                                    "variant": variant.as_str(),
-                                    "pnl": pnl,
-                                    "notional": pos.size,
-                                    "timestamp": now_ms,
-                                    "bankroll": bankroll,
-                                    "mode": "PAPER",
-                                    "details": {
-                                        "action": "CLOSE_POSITION",
-                                        "reason": reason,
-                                        "market_id": pos.market_id,
-                                        "question": pos.question,
-                                        "side": Self::side_label(pos.side),
-                                        "entry": pos.entry_price,
-                                        "exit": bid,
-                                        "gross_return": gross_return,
-                                        "hold_ms": hold_ms,
-                                        "fill_model": "MAKER_TAKER",
-                                    }
-                                });
-                                publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
-                            } else {
-                                keep_positions.push(pos);
-                            }
+                            info!("Maker MM: cleared {} paper position(s) on LIVE transition", cleared);
                         }
-                        open_positions = keep_positions;
+
+                        // Exit management.
+                        if trading_mode != TradingMode::Live {
+                            let mut keep_positions: Vec<Position> = Vec::new();
+                            for pos in open_positions.drain(..) {
+                                let Some(book) = books.get(&pos.market_id) else {
+                                    keep_positions.push(pos);
+                                    continue;
+                                };
+                                if !book.yes.is_valid() || !book.no.is_valid() || now_ms - book.last_update_ms > BOOK_STALE_MS {
+                                    keep_positions.push(pos);
+                                    continue;
+                                }
+
+                                let (bid, _) = Self::side_bid_ask(book, pos.side);
+                                if bid <= 0.0 || pos.entry_price <= 0.0 {
+                                    keep_positions.push(pos);
+                                    continue;
+                                }
+
+                                let hold_ms = now_ms - pos.timestamp_ms;
+                                let gross_return = (bid - pos.entry_price) / pos.entry_price;
+
+                                // Adaptive exit via vol-regime detection
+                                let price_history_slice: Vec<(i64, f64)> = vec![
+                                    (pos.timestamp_ms, pos.entry_price),
+                                    (now_ms, bid),
+                                ];
+                                let (tp_mult, sl_mult) = if let Some(regime) = detect_regime(&price_history_slice) {
+                                    regime_exit_multipliers(&regime)
+                                } else {
+                                    (1.0, 1.0)
+                                };
+                                let adjusted_tp = TAKE_PROFIT_PCT * tp_mult;
+                                let adjusted_sl = STOP_LOSS_PCT * sl_mult;
+
+                                let close_reason = if gross_return >= adjusted_tp {
+                                    Some("TAKE_PROFIT")
+                                } else if gross_return <= adjusted_sl {
+                                    Some("STOP_LOSS")
+                                } else if hold_ms >= MAX_HOLD_MS {
+                                    Some("TIME_EXIT")
+                                } else {
+                                    None
+                                };
+
+                                if let Some(reason) = close_reason {
+                                    let pnl = realized_pnl_with_fill(
+                                        pos.size,
+                                        gross_return,
+                                        cost_model,
+                                        FillStyle::Maker,
+                                        FillStyle::Taker,
+                                    );
+                                    let bankroll = settle_sim_position_for_strategy(&mut conn, "MAKER_MM", pos.size, pnl).await;
+                                    let execution_id = pos.execution_id.clone();
+                                    let pnl_msg = serde_json::json!({
+                                        "execution_id": execution_id,
+                                        "strategy": "MAKER_MM",
+                                        "variant": variant.as_str(),
+                                        "pnl": pnl,
+                                        "notional": pos.size,
+                                        "timestamp": now_ms,
+                                        "bankroll": bankroll,
+                                        "mode": "PAPER",
+                                        "details": {
+                                            "action": "CLOSE_POSITION",
+                                            "reason": reason,
+                                            "market_id": pos.market_id,
+                                            "question": pos.question,
+                                            "side": Self::side_label(pos.side),
+                                            "entry": pos.entry_price,
+                                            "exit": bid,
+                                            "gross_return": gross_return,
+                                            "hold_ms": hold_ms,
+                                            "fill_model": "MAKER_TAKER",
+                                        }
+                                    });
+                                    publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
+                                } else {
+                                    keep_positions.push(pos);
+                                }
+                            }
+                            open_positions = keep_positions;
+                        }
 
                         let mut best_candidate: Option<(&MarketTarget, Side, f64, f64, f64, f64, i64, i64)> = None;
                         let dynamic_slippage_rate = adaptive_slippage(
@@ -468,6 +484,11 @@ impl Strategy for MakerMmStrategy {
                             )
                         };
 
+                        let directional_score = if matches!(side, Side::Yes) {
+                            expected_net_return
+                        } else {
+                            -expected_net_return
+                        };
                         let scan_msg = build_scan_payload(
                             &market.market_id,
                             "MAKER-MM",
@@ -477,7 +498,7 @@ impl Strategy for MakerMmStrategy {
                             [entry_price, spread],
                             spread,
                             "TARGET_SPREAD",
-                            expected_net_return,
+                            directional_score,
                             threshold,
                             passes_threshold,
                             reason,
@@ -504,7 +525,6 @@ impl Strategy for MakerMmStrategy {
                             continue;
                         }
 
-                        let trading_mode = read_trading_mode(&mut conn).await;
                         if trading_mode == TradingMode::Live {
                             if now_ms - last_live_preview_ms >= LIVE_PREVIEW_COOLDOWN_MS {
                                 let available_cash = read_sim_available_cash(&mut conn).await;
@@ -557,7 +577,7 @@ impl Strategy for MakerMmStrategy {
                                             }
                                         }
                                     });
-                                    publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
+                                    publish_execution_event(&mut conn, preview_msg).await;
                                     last_live_preview_ms = now_ms;
                                     last_entry_ms = now_ms;
                                 }
@@ -615,7 +635,7 @@ impl Strategy for MakerMmStrategy {
                                     "fill_model": "MAKER_ENTRY",
                                 }
                             });
-                            publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                            publish_execution_event(&mut conn, exec_msg).await;
                         }
 
                         publish_heartbeat(&mut conn, "maker_mm").await;

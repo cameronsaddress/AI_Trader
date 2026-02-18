@@ -66,7 +66,7 @@ type LedgerConcentrationEntry = {
     share_pct: number;
 };
 
-const REFRESH_MS = 2_500;
+const REFRESH_MS = 5_000;
 
 function asRecord(input: unknown): Record<string, unknown> | null {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {

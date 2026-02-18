@@ -12,9 +12,11 @@ use crate::engine::{MarketTarget, PolymarketClient, WS_URL};
 use crate::strategies::control::{
     build_scan_payload,
     compute_strategy_bet_size,
+    entered_live_mode,
     is_strategy_enabled,
     publish_heartbeat,
     publish_event,
+    publish_execution_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -211,10 +213,16 @@ impl Strategy for LongshotBiasStrategy {
                         }
 
                         let mode = read_trading_mode(&mut conn).await;
-                        if mode == TradingMode::Live {
-                            // Release paper positions to avoid ghost capital lockup
-                            for pos in positions.drain(..) {
-                                let _ = release_sim_notional_for_strategy(&mut conn, STRATEGY_ID, pos.size).await;
+                        let just_entered_live = entered_live_mode(&mut conn, STRATEGY_ID, mode).await;
+                        if mode == TradingMode::Live && just_entered_live {
+                            let release_notional = positions.iter().map(|pos| pos.size).sum::<f64>();
+                            let cleared = positions.len();
+                            positions.clear();
+                            if release_notional > 0.0 {
+                                let _ = release_sim_notional_for_strategy(&mut conn, STRATEGY_ID, release_notional).await;
+                            }
+                            if cleared > 0 {
+                                info!("[LONGSHOT] cleared {} paper position(s) on LIVE transition", cleared);
                             }
                         }
 
@@ -265,7 +273,7 @@ impl Strategy for LongshotBiasStrategy {
                                             "pnl": 0.0,
                                         }
                                     });
-                                    publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                                    publish_execution_event(&mut conn, exec_msg).await;
                                     info!("[LONGSHOT] STALE_FORCE_CLOSE {}", pos.question);
                                     continue;
                                 }
@@ -354,7 +362,7 @@ impl Strategy for LongshotBiasStrategy {
                                             "net_return": net,
                                         }
                                     });
-                                    publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                                    publish_execution_event(&mut conn, exec_msg).await;
                                     info!("[LONGSHOT] SETTLED {} pnl=${:.2}", pos.question, pnl);
                                 } else {
                                     keep.push(pos);
@@ -475,7 +483,7 @@ impl Strategy for LongshotBiasStrategy {
                                             }
                                         }
                                     });
-                                    publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
+                                    publish_execution_event(&mut conn, preview_msg).await;
                                     last_entry_ts = now_ms;
                                 } else if sz >= 1.0 && reserve_sim_notional_for_strategy(&mut conn, STRATEGY_ID, sz).await {
                                     let eid = Uuid::new_v4().to_string();
@@ -511,7 +519,7 @@ impl Strategy for LongshotBiasStrategy {
                                             "variant": variant,
                                         }
                                     });
-                                    publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                                    publish_execution_event(&mut conn, exec_msg).await;
                                 }
                             }
                         }

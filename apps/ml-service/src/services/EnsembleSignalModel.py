@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import logging
 import math
 import os
+import pickle
 import time
 from typing import Any
 
@@ -132,6 +133,17 @@ class EnsembleSignalModel:
             1_000,
             3_600_000,
         )
+        self.state_persist_every_samples = _env_int(
+            "ML_SIGNAL_STATE_PERSIST_EVERY_SAMPLES",
+            256,
+            16,
+            10_000,
+        )
+        default_state_dir = os.path.abspath(os.path.join("reports", "models", "ml_service"))
+        self.state_dir = os.getenv("ML_SIGNAL_STATE_DIR", default_state_dir)
+        safe_symbol = self.symbol.replace("-", "_").replace("/", "_").strip().upper()
+        self.state_path = os.path.join(self.state_dir, f"signal_model_state_{safe_symbol}.pkl")
+        self._load_state()
 
     def _record_exception(self, scope: str, exc: Exception, now_ms: int | None = None) -> None:
         ts_ms = int(now_ms if now_ms is not None else (time.time() * 1000))
@@ -151,6 +163,122 @@ class EnsembleSignalModel:
                 self.exception_counts[scope],
                 self.last_exception_message,
             )
+
+    def _load_state(self) -> None:
+        if not self.state_path or not os.path.exists(self.state_path):
+            return
+        try:
+            with open(self.state_path, "rb") as handle:
+                payload = pickle.load(handle)
+            if not isinstance(payload, dict):
+                return
+            if str(payload.get("symbol") or "") != self.symbol:
+                return
+
+            train_features = payload.get("train_features")
+            train_labels = payload.get("train_labels")
+            loaded_features: list[np.ndarray] = []
+            loaded_labels: list[int] = []
+            if isinstance(train_features, np.ndarray) and train_features.ndim == 2:
+                for row in train_features[-self.max_train_samples :]:
+                    loaded_features.append(np.asarray(row, dtype=np.float64))
+            elif isinstance(train_features, list):
+                for row in train_features[-self.max_train_samples :]:
+                    if isinstance(row, np.ndarray):
+                        loaded_features.append(np.asarray(row, dtype=np.float64))
+                    elif isinstance(row, (list, tuple)):
+                        loaded_features.append(np.asarray(row, dtype=np.float64))
+
+            if isinstance(train_labels, np.ndarray):
+                loaded_labels = [int(v) for v in train_labels.tolist()[-self.max_train_samples :]]
+            elif isinstance(train_labels, list):
+                loaded_labels = [int(v) for v in train_labels[-self.max_train_samples :]]
+
+            if loaded_features and loaded_labels:
+                pair_len = min(len(loaded_features), len(loaded_labels))
+                self.train_features = deque(loaded_features[-pair_len:], maxlen=self.max_train_samples)
+                self.train_labels = deque(loaded_labels[-pair_len:], maxlen=self.max_train_samples)
+
+            self.new_labels_since_train = int(payload.get("new_labels_since_train") or 0)
+            self.model_name = str(payload.get("model_name") or self.model_name)
+            self.last_train_ts_ms = int(payload.get("last_train_ts_ms") or 0)
+            self.last_eval_logloss = payload.get("last_eval_logloss")
+            self.last_eval_brier = payload.get("last_eval_brier")
+            self.last_eval_accuracy = payload.get("last_eval_accuracy")
+            self.last_eval_auc = payload.get("last_eval_auc")
+
+            loaded_models: list[TrainedModel] = []
+            raw_models = payload.get("models")
+            if isinstance(raw_models, list):
+                for entry in raw_models:
+                    if not isinstance(entry, dict):
+                        continue
+                    estimator = entry.get("estimator")
+                    if estimator is None or not hasattr(estimator, "predict_proba"):
+                        continue
+                    loaded_models.append(
+                        TrainedModel(
+                            name=str(entry.get("name") or "MODEL"),
+                            estimator=estimator,
+                            weight=float(_safe_number(entry.get("weight"), 0.0)),
+                        )
+                    )
+            if loaded_models:
+                weight_sum = sum(max(0.0, model.weight) for model in loaded_models)
+                if weight_sum <= EPS:
+                    equal_weight = 1.0 / float(len(loaded_models))
+                    for model in loaded_models:
+                        model.weight = equal_weight
+                else:
+                    for model in loaded_models:
+                        model.weight = max(0.0, model.weight) / weight_sum
+                self.models = loaded_models
+                if self.model_name == "HEURISTIC_BOOTSTRAP":
+                    self.model_name = "+".join(model.name for model in self.models)
+            logger.info(
+                "[ML] loaded persisted state for %s (samples=%d, models=%d)",
+                self.symbol,
+                len(self.train_labels),
+                len(self.models),
+            )
+        except Exception as exc:
+            self._record_exception("model_state_load", exc)
+
+    def _persist_state(self, now_ms: int | None = None) -> None:
+        if not self.state_path:
+            return
+        try:
+            os.makedirs(self.state_dir, exist_ok=True)
+            feature_matrix = np.vstack(self.train_features) if self.train_features else np.empty((0, 0), dtype=np.float64)
+            label_array = np.asarray(self.train_labels, dtype=np.int32)
+            payload: dict[str, Any] = {
+                "version": 1,
+                "symbol": self.symbol,
+                "saved_at_ms": int(now_ms if now_ms is not None else (time.time() * 1000)),
+                "train_features": feature_matrix,
+                "train_labels": label_array,
+                "new_labels_since_train": int(self.new_labels_since_train),
+                "model_name": self.model_name,
+                "models": [
+                    {
+                        "name": model.name,
+                        "weight": float(model.weight),
+                        "estimator": model.estimator,
+                    }
+                    for model in self.models
+                ],
+                "last_train_ts_ms": int(self.last_train_ts_ms),
+                "last_eval_logloss": self.last_eval_logloss,
+                "last_eval_brier": self.last_eval_brier,
+                "last_eval_accuracy": self.last_eval_accuracy,
+                "last_eval_auc": self.last_eval_auc,
+            }
+            temp_path = f"{self.state_path}.tmp"
+            with open(temp_path, "wb") as handle:
+                pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(temp_path, self.state_path)
+        except Exception as exc:
+            self._record_exception("model_state_persist", exc, now_ms)
 
     def update(self, timestamp_ms: int, features: dict[str, Any]) -> dict[str, Any]:
         now_ms = int(_safe_number(timestamp_ms, 0))
@@ -184,6 +312,18 @@ class EnsembleSignalModel:
         macd_signal = _safe_number(row.get("macd_signal"), 0.0)
         bb_upper = _safe_number(row.get("bb_upper"), 0.0)
         bb_lower = _safe_number(row.get("bb_lower"), 0.0)
+        micro_spread = _safe_number(row.get("micro_spread"), 0.0)
+        micro_book_age_ms = _safe_number(row.get("micro_book_age_ms"), 0.0)
+        micro_edge_to_spread_ratio = _safe_number(row.get("micro_edge_to_spread_ratio"), 0.0)
+        micro_parity_deviation = _safe_number(row.get("micro_parity_deviation"), 0.0)
+        micro_obi = _safe_number(row.get("micro_obi"), 0.0)
+        micro_buy_pressure = _safe_number(row.get("micro_buy_pressure"), 0.5)
+        micro_uptick_ratio = _safe_number(row.get("micro_uptick_ratio"), 0.5)
+        micro_cluster_confidence = _safe_number(row.get("micro_cluster_confidence"), 0.0)
+        micro_flow_acceleration = _safe_number(row.get("micro_flow_acceleration"), 0.0)
+        micro_dynamic_cost_rate = _safe_number(row.get("micro_dynamic_cost_rate"), 0.0)
+        micro_momentum_sigma = _safe_number(row.get("micro_momentum_sigma"), 0.0)
+        micro_data_fresh = _safe_number(row.get("micro_data_fresh"), 0.0)
 
         rsi_centered = _clip((rsi - 50.0) / 50.0, -1.0, 1.0)
         momentum = _clip(momentum_10, -0.06, 0.06)
@@ -202,6 +342,19 @@ class EnsembleSignalModel:
             normalized = ((price - bb_lower) / band_width) - 0.5
             bb_position = _clip(normalized, -1.0, 1.0)
 
+        spread_norm = _clip(micro_spread / 0.20, 0.0, 1.0)
+        book_staleness = _clip(micro_book_age_ms / 15_000.0, 0.0, 1.0)
+        flow_tilt = _clip((micro_buy_pressure - 0.5) * 2.0, -1.0, 1.0)
+        uptick_tilt = _clip((micro_uptick_ratio - 0.5) * 2.0, -1.0, 1.0)
+        cluster_tilt = _clip((micro_cluster_confidence * 2.0) - 1.0, -1.0, 1.0)
+        obi_norm = _clip(micro_obi, -1.0, 1.0)
+        parity_norm = _clip(micro_parity_deviation / 0.05, 0.0, 1.0)
+        edge_to_spread_norm = _clip(micro_edge_to_spread_ratio / 4.0, 0.0, 1.0)
+        flow_accel_norm = _clip(micro_flow_acceleration / 3.0, 0.0, 1.0)
+        dynamic_cost_norm = _clip(micro_dynamic_cost_rate / 0.05, 0.0, 1.0)
+        momentum_sigma_norm = _clip(micro_momentum_sigma / 0.05, 0.0, 1.0)
+        micro_fresh = _clip(micro_data_fresh, 0.0, 1.0)
+
         return np.array(
             [
                 rsi_centered,
@@ -214,6 +367,18 @@ class EnsembleSignalModel:
                 macd_norm,
                 macd_signal_norm,
                 bb_position,
+                spread_norm,
+                book_staleness,
+                flow_tilt,
+                uptick_tilt,
+                cluster_tilt,
+                obi_norm,
+                parity_norm,
+                edge_to_spread_norm,
+                flow_accel_norm,
+                dynamic_cost_norm,
+                momentum_sigma_norm,
+                micro_fresh,
             ],
             dtype=np.float64,
         )
@@ -234,6 +399,8 @@ class EnsembleSignalModel:
             self.train_features.append(old.features)
             self.train_labels.append(label)
             self.new_labels_since_train += 1
+            if self.new_labels_since_train % self.state_persist_every_samples == 0:
+                self._persist_state(now_ms)
 
     def _train_if_needed(self, now_ms: int) -> None:
         sample_count = len(self.train_labels)
@@ -367,6 +534,7 @@ class EnsembleSignalModel:
         self.last_eval_brier = ensemble_metrics.get("brier")
         self.last_eval_accuracy = ensemble_metrics.get("accuracy")
         self.last_eval_auc = ensemble_metrics.get("auc")
+        self._persist_state(now_ms)
 
         logger.info(
             "[ML] %s trained %s with %d samples (eval=%d, auc=%s, logloss=%s)",
@@ -442,6 +610,18 @@ class EnsembleSignalModel:
             + 0.70 * vector[4]  # distance vs SMA20
             + 0.35 * vector[6]  # EMA spread
             + 0.45 * vector[7]  # MACD normalized
+            - 0.30 * vector[10]  # spread friction
+            - 0.25 * vector[11]  # stale book penalty
+            + 0.45 * vector[12]  # buy pressure
+            + 0.30 * vector[13]  # uptick confirmation
+            + 0.25 * vector[14]  # cluster confidence
+            + 0.35 * vector[15]  # order-book imbalance
+            - 0.20 * vector[16]  # parity instability
+            + 0.20 * vector[17]  # edge/spread efficiency
+            + 0.10 * vector[18]  # accelerating flow
+            - 0.15 * vector[19]  # dynamic cost drag
+            - 0.10 * vector[20]  # sigma expansion risk
+            + 0.20 * vector[21]  # microstructure freshness bonus
         )
         return _safe_probability(_sigmoid(score))
 

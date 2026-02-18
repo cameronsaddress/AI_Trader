@@ -19,9 +19,11 @@ use crate::strategies::control::{
     build_scan_payload,
     check_drawdown_breached,
     compute_strategy_bet_size,
+    entered_live_mode,
     is_strategy_enabled,
     publish_heartbeat,
     publish_event,
+    publish_execution_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -1540,7 +1542,7 @@ impl Strategy for Btc5mLagStrategy {
                                         "slug": slug,
                                     }
                                 });
-                                publish_event(&mut conn, "arbitrage:execution", settle_msg.to_string()).await;
+                                publish_execution_event(&mut conn, settle_msg).await;
 
                                 publish_heartbeat(&mut conn, self.heartbeat_id()).await;
                                 break;
@@ -1617,7 +1619,7 @@ impl Strategy for Btc5mLagStrategy {
                                     "slug": target_market.slug,
                                 }
                             });
-                            publish_event(&mut conn, "arbitrage:execution", settle_msg.to_string()).await;
+                            publish_execution_event(&mut conn, settle_msg).await;
                             break;
                         }
 
@@ -1863,7 +1865,7 @@ impl Strategy for Btc5mLagStrategy {
                                             "slug": pos.slug.clone(),
                                         }
                                     });
-                                    publish_event(&mut conn, "arbitrage:execution", settle_msg.to_string()).await;
+                                    publish_execution_event(&mut conn, settle_msg).await;
                                     clear_open_position(&mut conn, self.strategy_id()).await;
                                     open_position = None;
                                     warn!(
@@ -2541,10 +2543,13 @@ impl Strategy for Btc5mLagStrategy {
                         );
                         publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
 
+                        let just_entered_live = entered_live_mode(&mut conn, self.strategy_id(), mode).await;
                         if mode == TradingMode::Live {
-                            if let Some(pos) = open_position.take() {
-                                let _ = release_sim_notional_for_strategy(&mut conn, self.strategy_id(), pos.notional_usd).await;
-                                clear_open_position(&mut conn, self.strategy_id()).await;
+                            if just_entered_live {
+                                if let Some(pos) = open_position.take() {
+                                    let _ = release_sim_notional_for_strategy(&mut conn, self.strategy_id(), pos.notional_usd).await;
+                                    clear_open_position(&mut conn, self.strategy_id()).await;
+                                }
                             }
                             if passes_threshold && now_ms - last_live_preview_ms >= LIVE_PREVIEW_COOLDOWN_MS {
                                 let available_cash = read_sim_available_cash(&mut conn).await;
@@ -2610,7 +2615,7 @@ impl Strategy for Btc5mLagStrategy {
                                             }
                                         }
                                     });
-                                    publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
+                                    publish_execution_event(&mut conn, preview_msg).await;
                                     last_live_preview_ms = now_ms;
                                 }
                             }
@@ -2692,7 +2697,7 @@ impl Strategy for Btc5mLagStrategy {
                                         "slug": target_market.slug,
                                     }
                                 });
-                                publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                                publish_execution_event(&mut conn, exec_msg).await;
                             }
                         }
 

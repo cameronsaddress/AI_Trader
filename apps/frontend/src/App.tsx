@@ -16,11 +16,6 @@ const LoadingFallback = () => (
   </div>
 );
 
-// Placeholders for now
-const Placeholder = ({ title }: { title: string }) => (
-  <div className="p-10 text-white font-mono text-xl">{title} (Under Construction)</div>
-);
-
 function App() {
   return (
     <SocketProvider>
@@ -64,8 +59,8 @@ function App() {
               path="/maker-mm"
               element={<StrategyPage title="Maker MM Engine" description="Spread capture and maker microstructure logic with risk-aware entry gating." strategyIds={['MAKER_MM', 'AS_MARKET_MAKER']} />}
             />
-            <Route path="/markets" element={<Placeholder title="Market Analysis" />} />
-            <Route path="/intelligence" element={<Placeholder title="Swarm Intelligence" />} />
+            <Route path="/markets" element={<PolymarketPage />} />
+            <Route path="/intelligence" element={<HftDashboardPage />} />
             <Route
               path="/strategies"
               element={<StrategyPage title="Strategy Coverage" description="Unified execution and PnL telemetry across all active production strategies." strategyIds={['BTC_5M', 'BTC_15M', 'ETH_15M', 'SOL_15M', 'CEX_SNIPER', 'SYNDICATE', 'ATOMIC_ARB', 'OBI_SCALPER', 'GRAPH_ARB', 'CONVERGENCE_CARRY', 'MAKER_MM', 'AS_MARKET_MAKER', 'LONGSHOT_BIAS']} />}

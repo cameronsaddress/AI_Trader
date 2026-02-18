@@ -16,9 +16,11 @@ use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
     build_scan_payload,
     compute_strategy_bet_size,
+    entered_live_mode,
     is_strategy_enabled,
     publish_heartbeat,
     publish_event,
+    publish_execution_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -740,7 +742,7 @@ impl Strategy for MarketNeutralStrategy {
                                         "reason": "TIME_EXPIRY",
                                     }
                                 });
-                                publish_event(&mut conn, "arbitrage:execution", settle_msg.to_string()).await;
+                                publish_execution_event(&mut conn, settle_msg).await;
                                 info!("{} TIME_EXPIRY close pnl=${:.2}", strategy_id, pnl);
                             }
                             break;
@@ -865,6 +867,7 @@ impl Strategy for MarketNeutralStrategy {
                         publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
 
                         let trading_mode = read_trading_mode(&mut conn).await;
+                        let just_entered_live = entered_live_mode(&mut conn, &strategy_id, trading_mode).await;
                         if trading_mode == TradingMode::Live {
                             if passes_threshold
                                 && book.yes.best_ask > 0.0
@@ -922,18 +925,20 @@ impl Strategy for MarketNeutralStrategy {
                                             }
                                         }
                                     });
-                                    publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
+                                    publish_execution_event(&mut conn, preview_msg).await;
                                     last_live_preview_ms = now_ms;
                                     last_entry_ms = now_ms;
                                 }
                             }
-                            let released_notional = {
-                                let mut pos_lock = self.open_position.write().await;
-                                pos_lock.take().map(|pos| pos.size).unwrap_or(0.0)
-                            };
-                            if released_notional > 0.0 {
-                                let _ = release_sim_notional_for_strategy(&mut conn, &strategy_id, released_notional).await;
-                                info!("{} strategy: clearing paper position in LIVE mode", strategy_id);
+                            if just_entered_live {
+                                let released_notional = {
+                                    let mut pos_lock = self.open_position.write().await;
+                                    pos_lock.take().map(|pos| pos.size).unwrap_or(0.0)
+                                };
+                                if released_notional > 0.0 {
+                                    let _ = release_sim_notional_for_strategy(&mut conn, &strategy_id, released_notional).await;
+                                    info!("{} strategy: cleared paper position on LIVE transition", strategy_id);
+                                }
                             }
                             publish_heartbeat(&mut conn, &heartbeat_id).await;
                             continue;
@@ -1109,7 +1114,7 @@ impl Strategy for MarketNeutralStrategy {
                                         "slug": self.current_window_slug(),
                                     }
                                 });
-                                publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                                publish_execution_event(&mut conn, exec_msg).await;
                             } else {
                                 let _ = release_sim_notional_for_strategy(&mut conn, &strategy_id, size).await;
                             }

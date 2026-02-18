@@ -15,9 +15,11 @@ use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
     build_scan_payload,
     compute_strategy_bet_size,
+    entered_live_mode,
     is_strategy_enabled,
     publish_heartbeat,
     publish_event,
+    publish_execution_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -696,6 +698,7 @@ impl Strategy for ObiScalperStrategy {
                         }
 
                         let trading_mode = read_trading_mode(&mut conn).await;
+                        let just_entered_live = entered_live_mode(&mut conn, "OBI_SCALPER", trading_mode).await;
                         let side = if obi >= 0.0 { PositionSide::Long } else { PositionSide::Short };
                         let (entry_price, exit_mark, token_id, token_side) = match side {
                             PositionSide::Long => (yes_ask, yes_bid, target_market.yes_token.clone(), "YES"),
@@ -756,14 +759,16 @@ impl Strategy for ObiScalperStrategy {
                                             }
                                         }
                                     });
-                                    publish_event(&mut conn, "arbitrage:execution", dry_run_msg.to_string()).await;
+                                    publish_execution_event(&mut conn, dry_run_msg).await;
                                     last_signal_ms = now_ms;
                                 }
                             }
 
-                            if let Some(pos) = open_position.take() {
-                                let _ = release_sim_notional_for_strategy(&mut conn, "OBI_SCALPER", pos.size).await;
-                                info!("OBI Scalper: clearing paper position in LIVE mode");
+                            if just_entered_live {
+                                if let Some(pos) = open_position.take() {
+                                    let _ = release_sim_notional_for_strategy(&mut conn, "OBI_SCALPER", pos.size).await;
+                                    info!("OBI Scalper: cleared paper position on LIVE transition");
+                                }
                             }
                             publish_heartbeat(&mut conn, "obi_scalper").await;
                             continue;
@@ -869,7 +874,7 @@ impl Strategy for ObiScalperStrategy {
                                             "net_return": net_return,
                                         }
                                     });
-                                    publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                                    publish_execution_event(&mut conn, exec_msg).await;
                                     open_position = None;
                                 }
                             }
@@ -938,7 +943,7 @@ impl Strategy for ObiScalperStrategy {
                                     "type": "ORDER_BOOK_IMBALANCE"
                                 }
                             });
-                            publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                            publish_execution_event(&mut conn, exec_msg).await;
                             last_signal_ms = now_ms;
                         }
 

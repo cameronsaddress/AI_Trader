@@ -12,9 +12,11 @@ use crate::engine::{MarketTarget, PolymarketClient, WS_URL};
 use crate::strategies::control::{
     build_scan_payload,
     compute_strategy_bet_size,
+    entered_live_mode,
     is_strategy_enabled,
     publish_heartbeat,
     publish_event,
+    publish_execution_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -314,7 +316,7 @@ impl Strategy for GraphArbStrategy {
                                     "net_edge": pending.net_edge,
                                 }
                             });
-                            publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                            publish_execution_event(&mut conn, exec_msg).await;
                         }
                         pending_settlements = carry_forward;
 
@@ -436,8 +438,9 @@ impl Strategy for GraphArbStrategy {
                         publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
 
                         let trading_mode = read_trading_mode(&mut conn).await;
+                        let just_entered_live = entered_live_mode(&mut conn, "GRAPH_ARB", trading_mode).await;
                         if trading_mode == TradingMode::Live {
-                            if !pending_settlements.is_empty() {
+                            if just_entered_live && !pending_settlements.is_empty() {
                                 let release_notional = pending_settlements.iter().map(|trade| trade.notional_usd).sum::<f64>();
                                 pending_settlements.clear();
                                 if release_notional > 0.0 {
@@ -502,7 +505,7 @@ impl Strategy for GraphArbStrategy {
                                             }
                                         }
                                     });
-                                    publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
+                                    publish_execution_event(&mut conn, preview_msg).await;
                                     last_live_preview_ms = now_ms;
                                 }
                             }
@@ -553,7 +556,7 @@ impl Strategy for GraphArbStrategy {
                                         "book_age_ms": book_age_ms,
                                     }
                                 });
-                                publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                                publish_execution_event(&mut conn, exec_msg).await;
                                 last_fire_ms = now_ms;
                             }
                         }

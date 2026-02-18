@@ -242,7 +242,6 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
         if (shouldPause) {
             state.pausedUntil = now + pauseDurationMs;
             await deps.redis.set(`strategy:enabled:${strategyId}`, '0');
-            await deps.redis.expire(`strategy:enabled:${strategyId}`, 86400);
             await deps.redis.set(pausedUntilKey(strategyId), String(state.pausedUntil));
             await deps.redis.expire(
                 pausedUntilKey(strategyId),
@@ -267,7 +266,6 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
                         }
                         if (current.pausedUntil <= Date.now()) {
                             await deps.redis.set(`strategy:enabled:${strategyId}`, '1');
-                            await deps.redis.expire(`strategy:enabled:${strategyId}`, 86400);
                             await deps.redis.del(pausedUntilKey(strategyId));
                             deps.strategyStatus[strategyId] = true;
                             deps.emitStrategyStatusUpdate(deps.strategyStatus);

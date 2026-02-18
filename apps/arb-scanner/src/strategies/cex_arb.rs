@@ -15,9 +15,11 @@ use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
     build_scan_payload,
     compute_strategy_bet_size,
+    entered_live_mode,
     is_strategy_enabled,
     publish_heartbeat,
     publish_event,
+    publish_execution_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -528,6 +530,7 @@ impl Strategy for CexArbStrategy {
                         publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
 
                         let trading_mode = read_trading_mode(&mut conn).await;
+                        let just_entered_live = entered_live_mode(&mut conn, "CEX_SNIPER", trading_mode).await;
                         if trading_mode == TradingMode::Live {
                             let time_to_expiry_ms = market_expiry.saturating_mul(1000) - now_ms;
                             let yes_spread = (book.yes.best_ask - book.yes.best_bid).max(0.0);
@@ -602,25 +605,27 @@ impl Strategy for CexArbStrategy {
                                                 }
                                             }
                                         });
-                                        publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
+                                        publish_execution_event(&mut conn, preview_msg).await;
                                         last_live_preview_ms = now_ms;
                                     }
                                 }
                             }
-                            let (cleared, released_notional) = {
-                                let mut positions = positions_link.write().await;
-                                let count = positions.len();
-                                let release = positions.iter().map(|pos| pos.size).sum::<f64>();
-                                if count > 0 {
-                                    positions.clear();
+                            if just_entered_live {
+                                let (cleared, released_notional) = {
+                                    let mut positions = positions_link.write().await;
+                                    let count = positions.len();
+                                    let release = positions.iter().map(|pos| pos.size).sum::<f64>();
+                                    if count > 0 {
+                                        positions.clear();
+                                    }
+                                    (count, release)
+                                };
+                                if released_notional > 0.0 {
+                                    let _ = release_sim_notional_for_strategy(&mut conn, "CEX_SNIPER", released_notional).await;
                                 }
-                                (count, release)
-                            };
-                            if released_notional > 0.0 {
-                                let _ = release_sim_notional_for_strategy(&mut conn, "CEX_SNIPER", released_notional).await;
-                            }
-                            if cleared > 0 {
-                                info!("CEX Sniper: clearing {} paper position(s) in LIVE mode", cleared);
+                                if cleared > 0 {
+                                    info!("CEX Sniper: cleared {} paper position(s) on LIVE transition", cleared);
+                                }
                             }
                             publish_heartbeat(&mut conn, "cex_arb").await;
                             continue;
@@ -768,7 +773,7 @@ impl Strategy for CexArbStrategy {
                                     "hold_ms": hold_ms,
                                 }
                             });
-                            publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                            publish_execution_event(&mut conn, exec_msg).await;
                         }
 
                         if let Some(mut pos) = new_entry {
@@ -829,7 +834,7 @@ impl Strategy for CexArbStrategy {
                                     "position_id": pos.id,
                                 }
                             });
-                            publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                            publish_execution_event(&mut conn, exec_msg).await;
                         }
 
                         publish_heartbeat(&mut conn, "cex_arb").await;

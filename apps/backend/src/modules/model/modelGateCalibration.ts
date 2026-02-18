@@ -7,6 +7,7 @@ export type ModelGateCalibrationSample = {
     accepted: boolean;
     execution_id: string;
     strategy: string;
+    market_key: string | null;
     timestamp: number;
 };
 
@@ -137,6 +138,7 @@ export function buildModelGateCalibrationSamples(
             accepted: true,
             execution_id: executionId,
             strategy: outcome.strategy,
+            market_key: outcome.market_key,
             timestamp: outcome.timestamp,
         });
     }
@@ -159,6 +161,7 @@ export function buildModelGateCalibrationSamples(
                 accepted: false,
                 execution_id: rejected.execution_id,
                 strategy: directOutcome.strategy || rejected.strategy || 'UNKNOWN',
+                market_key: directOutcome.market_key || rejected.market_key || null,
                 timestamp: directOutcome.timestamp,
             });
             continue;
@@ -201,6 +204,7 @@ export function buildModelGateCalibrationSamples(
             accepted: false,
             execution_id: rejected.execution_id,
             strategy: bestCandidate.strategy || rejected.strategy || 'UNKNOWN',
+            market_key: bestCandidate.market_key,
             timestamp: bestCandidate.label_timestamp,
         });
     }

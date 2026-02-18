@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
+from contextlib import suppress
 import logging
 from src.services.MarketDataConsumer import MarketDataConsumer
 import asyncio
@@ -13,11 +14,14 @@ consumer = MarketDataConsumer()
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("ML Service starting up...")
-    asyncio.create_task(consumer.start())
+    consumer_task = asyncio.create_task(consumer.start())
     yield
     # Shutdown
     logger.info("ML Service shutting down...")
     await consumer.stop()
+    consumer_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await consumer_task
 
 app = FastAPI(lifespan=lifespan)
 

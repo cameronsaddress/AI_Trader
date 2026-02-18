@@ -12,9 +12,11 @@ use crate::engine::{MarketTarget, PolymarketClient, WS_URL};
 use crate::strategies::control::{
     build_scan_payload,
     compute_strategy_bet_size,
+    entered_live_mode,
     is_strategy_enabled,
     publish_heartbeat,
     publish_event,
+    publish_execution_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -334,116 +336,130 @@ impl Strategy for ConvergenceCarryStrategy {
                             continue;
                         }
 
+                        let trading_mode = read_trading_mode(&mut conn).await;
+                        let just_entered_live = entered_live_mode(&mut conn, "CONVERGENCE_CARRY", trading_mode).await;
+                        if trading_mode == TradingMode::Live && just_entered_live && !open_positions.is_empty() {
+                            let release_notional = open_positions.iter().map(|pos| pos.size).sum::<f64>();
+                            let cleared = open_positions.len();
+                            open_positions.clear();
+                            if release_notional > 0.0 {
+                                let _ = release_sim_notional_for_strategy(&mut conn, "CONVERGENCE_CARRY", release_notional).await;
+                            }
+                            info!("Convergence Carry: cleared {} paper position(s) on LIVE transition", cleared);
+                        }
+
                         // Exit management first.
-                        let mut keep_positions: Vec<Position> = Vec::new();
-                        for pos in open_positions.drain(..) {
-                            let hold_ms = now_ms - pos.timestamp_ms;
+                        if trading_mode != TradingMode::Live {
+                            let mut keep_positions: Vec<Position> = Vec::new();
+                            for pos in open_positions.drain(..) {
+                                let hold_ms = now_ms - pos.timestamp_ms;
 
-                            // Force-close positions whose book is missing or stale
-                            // (e.g. market fell out of universe). Check time exit BEFORE
-                            // staleness guard so orphaned positions don't lock capital forever.
-                            let book_opt = books.get(&pos.market_id);
-                            let book_fresh = book_opt
-                                .map(|b| now_ms - b.last_update_ms <= BOOK_STALE_MS && b.yes.is_valid() && b.no.is_valid())
-                                .unwrap_or(false);
+                                // Force-close positions whose book is missing or stale
+                                // (e.g. market fell out of universe). Check time exit BEFORE
+                                // staleness guard so orphaned positions don't lock capital forever.
+                                let book_opt = books.get(&pos.market_id);
+                                let book_fresh = book_opt
+                                    .map(|b| now_ms - b.last_update_ms <= BOOK_STALE_MS && b.yes.is_valid() && b.no.is_valid())
+                                    .unwrap_or(false);
 
-                            if !book_fresh {
-                                if hold_ms >= MAX_HOLD_MS {
-                                    // Force-close at entry price (zero PnL) to free capital
-                                    let _ = settle_sim_position_for_strategy(&mut conn, "CONVERGENCE_CARRY", pos.size, 0.0).await;
+                                if !book_fresh {
+                                    if hold_ms >= MAX_HOLD_MS {
+                                        // Force-close at entry price (zero PnL) to free capital
+                                        let _ = settle_sim_position_for_strategy(&mut conn, "CONVERGENCE_CARRY", pos.size, 0.0).await;
+                                        let pnl_msg = serde_json::json!({
+                                            "execution_id": pos.execution_id,
+                                            "strategy": "CONVERGENCE_CARRY",
+                                            "variant": variant.as_str(),
+                                            "pnl": 0.0, "notional": pos.size, "timestamp": now_ms,
+                                            "mode": "PAPER",
+                                            "details": {
+                                                "action": "CLOSE_POSITION", "reason": "STALE_TIMEOUT",
+                                                "market_id": pos.market_id, "question": pos.question,
+                                                "side": Self::side_label(pos.side),
+                                                "entry": pos.entry_price, "hold_ms": hold_ms,
+                                            }
+                                        });
+                                        publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
+                                    } else {
+                                        keep_positions.push(pos);
+                                    }
+                                    continue;
+                                }
+
+                                let Some(book) = book_opt else {
+                                    keep_positions.push(pos);
+                                    continue;
+                                };
+                                let mark = Self::mark_price(book, pos.side);
+                                if mark <= 0.0 || pos.entry_price <= 0.0 {
+                                    keep_positions.push(pos);
+                                    continue;
+                                }
+
+                                let gross_return = (mark - pos.entry_price) / pos.entry_price;
+                                let (yes_edge, no_edge) = Self::parity_edges(book);
+                                let active_edge = match pos.side {
+                                    Side::Yes => yes_edge,
+                                    Side::No => no_edge,
+                                };
+
+                                // Adaptive exit via vol-regime detection
+                                let price_history_slice: Vec<(i64, f64)> = vec![
+                                    (pos.timestamp_ms, pos.entry_price),
+                                    (now_ms, mark),
+                                ];
+                                let (tp_mult, sl_mult) = if let Some(regime) = detect_regime(&price_history_slice) {
+                                    regime_exit_multipliers(&regime)
+                                } else {
+                                    (1.0, 1.0)
+                                };
+                                let adjusted_tp = TAKE_PROFIT_PCT * tp_mult;
+                                let adjusted_sl = STOP_LOSS_PCT * sl_mult;
+
+                                let close_reason = if gross_return >= adjusted_tp {
+                                    Some("TAKE_PROFIT")
+                                } else if gross_return <= adjusted_sl {
+                                    Some("STOP_LOSS")
+                                } else if hold_ms >= MAX_HOLD_MS {
+                                    Some("TIME_EXIT")
+                                } else if active_edge <= exit_parity_edge() {
+                                    Some("EDGE_DECAY")
+                                } else {
+                                    None
+                                };
+
+                                if let Some(reason) = close_reason {
+                                    let pnl = realized_pnl(pos.size, gross_return, cost_model);
+                                    let bankroll = settle_sim_position_for_strategy(&mut conn, "CONVERGENCE_CARRY", pos.size, pnl).await;
                                     let pnl_msg = serde_json::json!({
                                         "execution_id": pos.execution_id,
                                         "strategy": "CONVERGENCE_CARRY",
                                         "variant": variant.as_str(),
-                                        "pnl": 0.0, "notional": pos.size, "timestamp": now_ms,
+                                        "pnl": pnl,
+                                        "notional": pos.size,
+                                        "timestamp": now_ms,
+                                        "bankroll": bankroll,
                                         "mode": "PAPER",
                                         "details": {
-                                            "action": "CLOSE_POSITION", "reason": "STALE_TIMEOUT",
-                                            "market_id": pos.market_id, "question": pos.question,
+                                            "action": "CLOSE_POSITION",
+                                            "reason": reason,
+                                            "market_id": pos.market_id,
+                                            "question": pos.question,
                                             "side": Self::side_label(pos.side),
-                                            "entry": pos.entry_price, "hold_ms": hold_ms,
+                                            "entry": pos.entry_price,
+                                            "exit": mark,
+                                            "gross_return": gross_return,
+                                            "hold_ms": hold_ms,
+                                            "parity_edge": active_edge,
                                         }
                                     });
                                     publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
                                 } else {
                                     keep_positions.push(pos);
                                 }
-                                continue;
                             }
-
-                            let Some(book) = book_opt else {
-                                keep_positions.push(pos);
-                                continue;
-                            };
-                            let mark = Self::mark_price(book, pos.side);
-                            if mark <= 0.0 || pos.entry_price <= 0.0 {
-                                keep_positions.push(pos);
-                                continue;
-                            }
-
-                            let gross_return = (mark - pos.entry_price) / pos.entry_price;
-                            let (yes_edge, no_edge) = Self::parity_edges(book);
-                            let active_edge = match pos.side {
-                                Side::Yes => yes_edge,
-                                Side::No => no_edge,
-                            };
-
-                            // Adaptive exit via vol-regime detection
-                            let price_history_slice: Vec<(i64, f64)> = vec![
-                                (pos.timestamp_ms, pos.entry_price),
-                                (now_ms, mark),
-                            ];
-                            let (tp_mult, sl_mult) = if let Some(regime) = detect_regime(&price_history_slice) {
-                                regime_exit_multipliers(&regime)
-                            } else {
-                                (1.0, 1.0)
-                            };
-                            let adjusted_tp = TAKE_PROFIT_PCT * tp_mult;
-                            let adjusted_sl = STOP_LOSS_PCT * sl_mult;
-
-                            let close_reason = if gross_return >= adjusted_tp {
-                                Some("TAKE_PROFIT")
-                            } else if gross_return <= adjusted_sl {
-                                Some("STOP_LOSS")
-                            } else if hold_ms >= MAX_HOLD_MS {
-                                Some("TIME_EXIT")
-                            } else if active_edge <= exit_parity_edge() {
-                                Some("EDGE_DECAY")
-                            } else {
-                                None
-                            };
-
-                            if let Some(reason) = close_reason {
-                                let pnl = realized_pnl(pos.size, gross_return, cost_model);
-                                let bankroll = settle_sim_position_for_strategy(&mut conn, "CONVERGENCE_CARRY", pos.size, pnl).await;
-                                let pnl_msg = serde_json::json!({
-                                    "execution_id": pos.execution_id,
-                                    "strategy": "CONVERGENCE_CARRY",
-                                    "variant": variant.as_str(),
-                                    "pnl": pnl,
-                                    "notional": pos.size,
-                                    "timestamp": now_ms,
-                                    "bankroll": bankroll,
-                                    "mode": "PAPER",
-                                    "details": {
-                                        "action": "CLOSE_POSITION",
-                                        "reason": reason,
-                                        "market_id": pos.market_id,
-                                        "question": pos.question,
-                                        "side": Self::side_label(pos.side),
-                                        "entry": pos.entry_price,
-                                        "exit": mark,
-                                        "gross_return": gross_return,
-                                        "hold_ms": hold_ms,
-                                        "parity_edge": active_edge,
-                                    }
-                                });
-                                publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
-                            } else {
-                                keep_positions.push(pos);
-                            }
+                            open_positions = keep_positions;
                         }
-                        open_positions = keep_positions;
 
                         let mut best_candidate: Option<(&MarketTarget, Side, f64, f64, f64, f64, i64, i64)> = None;
                         for market in market_by_id.values() {
@@ -523,6 +539,11 @@ impl Strategy for ConvergenceCarryStrategy {
                             )
                         };
 
+                        let directional_edge = if matches!(side, Side::Yes) {
+                            edge
+                        } else {
+                            -edge
+                        };
                         let scan_msg = build_scan_payload(
                             &market.market_id,
                             "CONVERGENCE-CARRY",
@@ -532,7 +553,7 @@ impl Strategy for ConvergenceCarryStrategy {
                             [entry_price, spread],
                             market.best_bid.unwrap_or(0.0) + market.best_ask.unwrap_or(0.0),
                             "MARKET_TOP_SUM",
-                            edge,
+                            directional_edge,
                             threshold,
                             passes_threshold,
                             reason,
@@ -560,7 +581,6 @@ impl Strategy for ConvergenceCarryStrategy {
                             continue;
                         }
 
-                        let trading_mode = read_trading_mode(&mut conn).await;
                         if trading_mode == TradingMode::Live {
                             if now_ms - last_live_preview_ms >= LIVE_PREVIEW_COOLDOWN_MS {
                                 let available_cash = read_sim_available_cash(&mut conn).await;
@@ -612,7 +632,7 @@ impl Strategy for ConvergenceCarryStrategy {
                                             }
                                         }
                                     });
-                                    publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
+                                    publish_execution_event(&mut conn, preview_msg).await;
                                     last_live_preview_ms = now_ms;
                                     last_entry_ms = now_ms;
                                 }
@@ -661,7 +681,7 @@ impl Strategy for ConvergenceCarryStrategy {
                                     "book_age_ms": book_age_ms,
                                 }
                             });
-                            publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                            publish_execution_event(&mut conn, exec_msg).await;
                         }
 
                         publish_heartbeat(&mut conn, "convergence_carry").await;

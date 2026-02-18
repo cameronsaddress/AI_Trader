@@ -44,6 +44,12 @@ export const SCANNER_HEARTBEAT_IDS = [
 // ── Execution trace ─────────────────────────────────────────────────
 export const EXECUTION_TRACE_TTL_MS = Math.max(60_000, Number(process.env.EXECUTION_TRACE_TTL_MS || String(6 * 60 * 60 * 1000)));
 export const EXECUTION_TRACE_MAX_EVENTS = Math.max(10, Number(process.env.EXECUTION_TRACE_MAX_EVENTS || '80'));
+export const EXECUTION_EVENT_HMAC_SECRET = (process.env.EXECUTION_EVENT_HMAC_SECRET || '').trim();
+export const EXECUTION_EVENT_REQUIRE_SIGNATURE = (
+    process.env.EXECUTION_EVENT_REQUIRE_SIGNATURE === undefined
+        ? EXECUTION_EVENT_HMAC_SECRET.length > 0
+        : process.env.EXECUTION_EVENT_REQUIRE_SIGNATURE === 'true'
+);
 
 // ── Sim ledger ──────────────────────────────────────────────────────
 export const DEFAULT_SIM_BANKROLL = 1000;
@@ -129,9 +135,7 @@ export const INTELLIGENCE_GATE_CONFIRMATION_STRATEGIES = new Set([
     'SOL_15M',
     'CEX_SNIPER',
     'OBI_SCALPER',
-    'SYNDICATE',
     'CONVERGENCE_CARRY',
-    'GRAPH_ARB',
     'MAKER_MM',
 ]);
 export const INTELLIGENCE_SCAN_RETENTION_MS = Math.max(60_000, INTELLIGENCE_GATE_CONFIRMATION_WINDOW_MS * 20);
@@ -183,6 +187,35 @@ export const META_CONTROLLER_REFRESH_DEBOUNCE_MS = Math.max(
     100,
     Number(process.env.META_CONTROLLER_REFRESH_DEBOUNCE_MS || '400'),
 );
+export const CROSS_HORIZON_ROUTER_ENABLED = process.env.CROSS_HORIZON_ROUTER_ENABLED !== 'false';
+export const CROSS_HORIZON_ROUTER_INTERVAL_MS = Math.max(
+    1_000,
+    Number(process.env.CROSS_HORIZON_ROUTER_INTERVAL_MS || '5000'),
+);
+export const CROSS_HORIZON_ROUTER_MIN_MARGIN = Math.max(
+    0,
+    Number(process.env.CROSS_HORIZON_ROUTER_MIN_MARGIN || '0.012'),
+);
+export const CROSS_HORIZON_ROUTER_STRONG_MARGIN = Math.max(
+    CROSS_HORIZON_ROUTER_MIN_MARGIN,
+    Number(process.env.CROSS_HORIZON_ROUTER_STRONG_MARGIN || '0.030'),
+);
+export const CROSS_HORIZON_ROUTER_CONFLICT_MULT = Math.min(
+    1.0,
+    Math.max(0.10, Number(process.env.CROSS_HORIZON_ROUTER_CONFLICT_MULT || '0.70')),
+);
+export const CROSS_HORIZON_ROUTER_CONFIRM_MULT = Math.max(
+    1.0,
+    Number(process.env.CROSS_HORIZON_ROUTER_CONFIRM_MULT || '1.15'),
+);
+export const CROSS_HORIZON_ROUTER_MAX_BOOST = Math.max(
+    CROSS_HORIZON_ROUTER_CONFIRM_MULT,
+    Number(process.env.CROSS_HORIZON_ROUTER_MAX_BOOST || '1.30'),
+);
+export const CROSS_HORIZON_OVERLAY_KEY_PREFIX = (
+    process.env.CROSS_HORIZON_OVERLAY_KEY_PREFIX
+    || 'strategy:risk_overlay:cross_horizon:'
+).trim() || 'strategy:risk_overlay:cross_horizon:';
 
 // ── Model Probability Gate ──────────────────────────────────────────
 export const MODEL_PROBABILITY_GATE_ENABLED = process.env.MODEL_PROBABILITY_GATE_ENABLED !== 'false';
@@ -205,7 +238,7 @@ export const MODEL_PROBABILITY_GATE_DRIFT_DISABLE_MS = Math.max(
     Number(process.env.MODEL_PROBABILITY_GATE_DRIFT_DISABLE_MS || '900000'),
 );
 export const MODEL_PROBABILITY_GATE_TUNER_ENABLED = process.env.MODEL_PROBABILITY_GATE_TUNER_ENABLED !== 'false';
-export const MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY = process.env.MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY === 'true';
+export const MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY = process.env.MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY !== 'false';
 export const MODEL_PROBABILITY_GATE_TUNER_INTERVAL_MS = Math.max(
     30_000,
     Number(process.env.MODEL_PROBABILITY_GATE_TUNER_INTERVAL_MS || '120000'),
@@ -362,6 +395,13 @@ export const RUNTIME_MODULE_CATALOG: Array<Omit<RuntimeModuleState, 'heartbeat_m
         phase: 'PHASE_3',
         health: 'STANDBY',
         expected_interval_ms: 0,
+    },
+    {
+        id: 'CROSS_HORIZON_ROUTER',
+        label: 'Cross-Horizon Router',
+        phase: 'PHASE_3',
+        health: 'STANDBY',
+        expected_interval_ms: CROSS_HORIZON_ROUTER_INTERVAL_MS,
     },
     {
         id: 'REGIME_ENGINE',

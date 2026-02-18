@@ -12,9 +12,11 @@ use crate::engine::PolymarketClient;
 use crate::strategies::control::{
     build_scan_payload,
     compute_strategy_bet_size,
+    entered_live_mode,
     is_strategy_enabled,
     publish_heartbeat,
     publish_event,
+    publish_execution_event,
     read_risk_config,
     read_sim_available_cash,
     read_simulation_reset_ts,
@@ -225,13 +227,19 @@ impl Strategy for SyndicateStrategy {
 
                             // Exit logic on incoming trade updates.
                             let trading_mode = read_trading_mode(&mut event_conn).await;
-                            let mut cleared_live: Option<Position> = None;
+                            let just_entered_live = entered_live_mode(&mut event_conn, "SYNDICATE", trading_mode).await;
+                            let mut cleared_live_count = 0usize;
+                            let mut cleared_live_notional = 0.0_f64;
                             let mut close_candidate: Option<(Position, f64, &'static str)> = None;
 
                             {
                                 let mut positions = positions_writer.write().await;
                                 if trading_mode == TradingMode::Live {
-                                    cleared_live = positions.remove(&token_id);
+                                    if just_entered_live {
+                                        cleared_live_count = positions.len();
+                                        cleared_live_notional = positions.values().map(|pos| pos.size).sum::<f64>();
+                                        positions.clear();
+                                    }
                                 } else if let Some(pos) = positions.get(&token_id).cloned() {
                                     if Utc::now().timestamp() - pos.timestamp >= MIN_HOLD_SECS {
                                         let pnl_pct = (price - pos.entry_price) / pos.entry_price;
@@ -245,9 +253,14 @@ impl Strategy for SyndicateStrategy {
                             }
 
                             if trading_mode == TradingMode::Live {
-                                if let Some(pos) = cleared_live {
-                                    let _ = release_sim_notional_for_strategy(&mut event_conn, "SYNDICATE", pos.size).await;
-                                    info!("Syndicate: clearing paper position for token {} in LIVE mode", token_id);
+                                if cleared_live_notional > 0.0 {
+                                    let _ = release_sim_notional_for_strategy(&mut event_conn, "SYNDICATE", cleared_live_notional).await;
+                                }
+                                if cleared_live_count > 0 {
+                                    info!(
+                                        "Syndicate: cleared {} paper position(s) on LIVE transition",
+                                        cleared_live_count
+                                    );
                                 }
                                 continue;
                             }
@@ -312,13 +325,14 @@ impl Strategy for SyndicateStrategy {
             }
 
             let trading_mode = read_trading_mode(&mut conn).await;
-            if trading_mode == TradingMode::Live {
+            let just_entered_live = entered_live_mode(&mut conn, "SYNDICATE", trading_mode).await;
+            if trading_mode == TradingMode::Live && just_entered_live {
                 let released_notional = {
                     let mut positions = self.open_positions.write().await;
                     if positions.is_empty() {
                         0.0
                     } else {
-                        info!("Syndicate: clearing {} paper position(s) in LIVE mode", positions.len());
+                        info!("Syndicate: clearing {} paper position(s) on LIVE transition", positions.len());
                         let release = positions.values().map(|pos| pos.size).sum::<f64>();
                         positions.clear();
                         release
@@ -451,7 +465,7 @@ impl Strategy for SyndicateStrategy {
                             "net_return": net_return,
                         }
                     });
-                    publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                    publish_execution_event(&mut conn, exec_msg).await;
                 }
             }
 
@@ -737,7 +751,7 @@ impl Strategy for SyndicateStrategy {
                             }
                         }
                     });
-                    publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
+                    publish_execution_event(&mut conn, preview_msg).await;
                     {
                         let mut last_entry_ts = self.last_entry_ts.write().await;
                         last_entry_ts.insert(*token_id, now);
@@ -798,7 +812,7 @@ impl Strategy for SyndicateStrategy {
                         "cluster_start_age_ms": cluster_start_age_ms,
                     }
                 });
-                publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                publish_execution_event(&mut conn, exec_msg).await;
 
                 info!(
                     "SYNDICATE ENTRY token={} wallets={} vol={:.2} price={:.3}",

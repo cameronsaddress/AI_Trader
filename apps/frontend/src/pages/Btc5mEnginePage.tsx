@@ -1111,7 +1111,7 @@ export const Btc5mEnginePage: React.FC = () => {
     void runFetchStats();
     const timer = window.setInterval(() => {
       void runFetchStats();
-    }, 1500);
+    }, 3000);
     return () => {
       active = false;
       rerunRequested = false;

@@ -28,3 +28,5 @@ rand = "=0.8.5"
 regex = "1.10"
 statrs = "0.16"
 uuid = { version = "1.7", features = ["v4"] }
+hmac = "0.12"
+sha2 = "0.10"

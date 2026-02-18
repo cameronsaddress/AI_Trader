@@ -1,7 +1,9 @@
 use chrono::Utc;
+use hmac::{Hmac, Mac};
 use log::warn;
 use redis::AsyncCommands;
 use serde::Deserialize;
+use sha2::Sha256;
 
 pub const DEFAULT_SIM_BANKROLL: f64 = 1000.0;
 const SIM_BANKROLL_KEY: &str = "sim_bankroll";
@@ -11,10 +13,13 @@ const SIM_LEDGER_REALIZED_PNL_KEY: &str = "sim_ledger:realized_pnl";
 const SIM_LEDGER_RESERVED_BY_STRATEGY_PREFIX: &str = "sim_ledger:reserved:strategy:";
 const SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX: &str = "sim_ledger:reserved:family:";
 const STRATEGY_RISK_MULTIPLIER_PREFIX: &str = "strategy:risk_multiplier:";
+const STRATEGY_RISK_OVERLAY_PREFIX: &str = "strategy:risk_overlay:cross_horizon:";
+const STRATEGY_LAST_MODE_PREFIX: &str = "strategy:last_mode:";
 const DEFAULT_STRATEGY_CONCENTRATION_CAP_PCT: f64 = 0.35;
 const DEFAULT_FAMILY_CONCENTRATION_CAP_PCT: f64 = 0.60;
 const DEFAULT_UNDERLYING_CONCENTRATION_CAP_PCT: f64 = 0.70;
 const DEFAULT_GLOBAL_UTILIZATION_CAP_PCT: f64 = 0.90;
+const DEFAULT_GLOBAL_MAX_DRAWDOWN_PCT: f64 = -5.0;
 const DEFAULT_NUMERIC_EPSILON: f64 = 1e-9;
 const SIM_LEDGER_RESERVED_BY_UNDERLYING_PREFIX: &str = "sim_ledger:reserved:underlying:";
 
@@ -56,6 +61,15 @@ fn regime_sizing_enabled() -> bool {
         }
         Err(_) => true,
     }
+}
+
+fn global_max_drawdown_pct() -> f64 {
+    std::env::var("SIM_GLOBAL_MAX_DRAWDOWN_PCT")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(DEFAULT_GLOBAL_MAX_DRAWDOWN_PCT)
+        .clamp(-95.0, -0.1)
 }
 
 fn regime_min_confidence() -> f64 {
@@ -695,6 +709,33 @@ pub async fn read_trading_mode(conn: &mut redis::aio::MultiplexedConnection) -> 
     }
 }
 
+/// Persist strategy mode marker and return true only when this process
+/// observes a PAPER -> LIVE transition for the strategy.
+pub async fn entered_live_mode(
+    conn: &mut redis::aio::MultiplexedConnection,
+    strategy_id: &str,
+    current_mode: TradingMode,
+) -> bool {
+    let strategy_key = strategy_id.trim().to_uppercase();
+    if strategy_key.is_empty() {
+        return false;
+    }
+    let key = format!("{}{}", STRATEGY_LAST_MODE_PREFIX, strategy_key);
+    let current = match current_mode {
+        TradingMode::Live => "LIVE",
+        TradingMode::Paper => "PAPER",
+    };
+    let previous = conn.get::<_, Option<String>>(&key).await.unwrap_or(None);
+    let just_entered_live = matches!(current_mode, TradingMode::Live)
+        && !previous
+            .as_deref()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("LIVE"));
+    if let Err(error) = conn.set::<_, _, ()>(&key, current).await {
+        warn!("failed to persist strategy mode marker {}: {}", key, error);
+    }
+    just_entered_live
+}
+
 pub fn strategy_variant() -> String {
     let raw = std::env::var("STRATEGY_VARIANT").unwrap_or_else(|_| "baseline".to_string());
     let trimmed = raw.trim();
@@ -738,7 +779,7 @@ pub fn compute_bet_size(bankroll: f64, cfg: &RiskConfig, min_size: f64, max_frac
 
 pub async fn read_strategy_risk_multiplier(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> f64 {
     if strategy_id.trim().is_empty() {
-        return 1.0;
+        return 0.25;
     }
 
     let key = format!("{}{}", STRATEGY_RISK_MULTIPLIER_PREFIX, strategy_id.trim());
@@ -748,10 +789,26 @@ pub async fn read_strategy_risk_multiplier(conn: &mut redis::aio::MultiplexedCon
         Err(error) => warn!("failed to read strategy risk multiplier {}: {}", key, error),
     }
 
-    if let Err(error) = conn.set_nx::<_, _, bool>(&key, 1.0_f64).await {
+    if let Err(error) = conn.set_nx::<_, _, bool>(&key, 0.25_f64).await {
         warn!("failed to initialize strategy risk multiplier {}: {}", key, error);
     }
-    1.0
+    0.25
+}
+
+pub async fn read_strategy_risk_overlay(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> f64 {
+    if strategy_id.trim().is_empty() {
+        return 1.0;
+    }
+    let key = format!("{}{}", STRATEGY_RISK_OVERLAY_PREFIX, strategy_id.trim());
+    match conn.get::<_, Option<f64>>(&key).await {
+        Ok(Some(value)) if value.is_finite() => value.clamp(0.0, 2.5),
+        Ok(Some(_)) => 1.0,
+        Ok(None) => 1.0,
+        Err(error) => {
+            warn!("failed to read strategy risk overlay {}: {}", key, error);
+            1.0
+        }
+    }
 }
 
 /// Read anti-martingale size factor from Redis (set by backend risk guard).
@@ -788,6 +845,11 @@ pub async fn compute_strategy_bet_size(
     min_size: f64,
     max_fraction: f64,
 ) -> f64 {
+    let portfolio_dd_limit = global_max_drawdown_pct();
+    if check_drawdown_breached(conn, portfolio_dd_limit).await {
+        return 0.0;
+    }
+
     let base = compute_bet_size(bankroll, cfg, min_size, max_fraction);
     if base <= 0.0 || !base.is_finite() {
         return 0.0;
@@ -801,6 +863,12 @@ pub async fn compute_strategy_bet_size(
     if !sized.is_finite() {
         return 0.0;
     }
+
+    let overlay = read_strategy_risk_overlay(conn, strategy_id).await;
+    if overlay <= 0.0 {
+        return 0.0;
+    }
+    sized *= overlay;
 
     // Apply anti-martingale size reduction (from backend risk guard).
     let size_factor = read_risk_guard_size_factor(conn, strategy_id).await;
@@ -866,8 +934,17 @@ pub async fn compute_strategy_bet_size(
 
 pub async fn is_strategy_enabled(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> bool {
     let key = format!("strategy:enabled:{}", strategy_id);
-    let raw: String = conn.get(key).await.unwrap_or_else(|_| "1".to_string());
-    raw != "0"
+    match conn.get::<_, Option<String>>(key).await {
+        Ok(Some(raw)) => raw != "0",
+        Ok(None) => {
+            warn!("strategy enable key missing for {}; fail-closed", strategy_id);
+            false
+        }
+        Err(error) => {
+            warn!("failed to read strategy enable key for {}; fail-closed: {}", strategy_id, error);
+            false
+        }
+    }
 }
 
 pub async fn publish_heartbeat(conn: &mut redis::aio::MultiplexedConnection, id: &str) {
@@ -890,6 +967,41 @@ pub async fn publish_event(
     if let Err(error) = conn.publish::<_, _, ()>(channel, encoded).await {
         warn!("[RedisPublish] channel={} error={}", channel, error);
     }
+}
+
+fn execution_event_hmac_secret() -> Option<String> {
+    std::env::var("EXECUTION_EVENT_HMAC_SECRET")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+}
+
+fn execution_event_hmac(payload: &serde_json::Value, secret: &str) -> Option<String> {
+    let serialized = serde_json::to_string(payload).ok()?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(serialized.as_bytes());
+    Some(hex::encode(mac.finalize().into_bytes()))
+}
+
+pub async fn publish_execution_event(
+    conn: &mut redis::aio::MultiplexedConnection,
+    payload: serde_json::Value,
+) {
+    let encoded = if let Some(secret) = execution_event_hmac_secret() {
+        if let Some(signature) = execution_event_hmac(&payload, &secret) {
+            serde_json::json!({
+                "payload": payload,
+                "_sig_algo": "HMAC_SHA256",
+                "_sig": signature,
+            })
+            .to_string()
+        } else {
+            payload.to_string()
+        }
+    } else {
+        payload.to_string()
+    };
+    publish_event(conn, "arbitrage:execution", encoded).await;
 }
 
 #[allow(clippy::too_many_arguments)]

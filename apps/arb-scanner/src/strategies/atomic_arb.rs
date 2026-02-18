@@ -11,9 +11,11 @@ use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
     build_scan_payload,
     compute_strategy_bet_size,
+    entered_live_mode,
     is_strategy_enabled,
     publish_heartbeat,
     publish_event,
+    publish_execution_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -300,8 +302,10 @@ impl Strategy for AtomicArbStrategy {
                         );
                         publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
 
-                        if read_trading_mode(&mut conn).await == TradingMode::Live {
-                            if !pending_settlements.is_empty() {
+                        let trading_mode = read_trading_mode(&mut conn).await;
+                        let just_entered_live = entered_live_mode(&mut conn, "ATOMIC_ARB", trading_mode).await;
+                        if trading_mode == TradingMode::Live {
+                            if just_entered_live && !pending_settlements.is_empty() {
                                 let release_notional = pending_settlements
                                     .iter()
                                     .map(|pending| pending.notional_usd)
@@ -378,7 +382,7 @@ impl Strategy for AtomicArbStrategy {
                                             }
                                         }
                                     });
-                                    publish_event(&mut conn, "arbitrage:execution", dry_run_msg.to_string()).await;
+                                    publish_execution_event(&mut conn, dry_run_msg).await;
                                     last_fire_ms = now_ms;
                                 }
                             }
@@ -445,7 +449,7 @@ impl Strategy for AtomicArbStrategy {
                                     "settlement_status": "PENDING_EXPIRY",
                                 }
                             });
-                            publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
+                            publish_execution_event(&mut conn, exec_msg).await;
 
                             last_fire_ms = now_ms;
                         }
@@ -497,7 +501,7 @@ impl Strategy for AtomicArbStrategy {
                                     "hold_ms": settle_ts_ms - pending.entry_ts_ms,
                                 }
                             });
-                            publish_event(&mut conn, "arbitrage:execution", settle_msg.to_string()).await;
+                            publish_execution_event(&mut conn, settle_msg).await;
                         }
 
                         info!(
