@@ -170,6 +170,41 @@ type DataIntegrityState = {
     updated_at: number;
 };
 
+type EntryFreshnessViolationCategory = 'MISSING_TELEMETRY' | 'STALE_SOURCE' | 'STALE_GATE' | 'OTHER';
+
+type EntryFreshnessSloAlert = {
+    execution_id: string;
+    strategy: string;
+    market_key: string | null;
+    category: EntryFreshnessViolationCategory;
+    reason: string;
+    timestamp: number;
+};
+
+type EntryFreshnessSloStrategy = {
+    strategy: string;
+    total: number;
+    missing_telemetry: number;
+    stale_source: number;
+    stale_gate: number;
+    other: number;
+    last_violation_at: number;
+    last_reason: string;
+};
+
+type EntryFreshnessSloState = {
+    totals: {
+        total: number;
+        missing_telemetry: number;
+        stale_source: number;
+        stale_gate: number;
+        other: number;
+    };
+    strategies: Record<string, EntryFreshnessSloStrategy>;
+    recent_alerts: EntryFreshnessSloAlert[];
+    updated_at: number;
+};
+
 type StrategyCostDiagnosticsEntry = {
     trades: number;
     notional_sum: number;
@@ -803,6 +838,115 @@ function parseDataIntegrityState(input: unknown): DataIntegrityState {
             stale: parseNumber((totals as Record<string, unknown>).stale) ?? 0,
             risk: parseNumber((totals as Record<string, unknown>).risk) ?? 0,
             other: parseNumber((totals as Record<string, unknown>).other) ?? 0,
+        },
+        strategies,
+        recent_alerts: alerts,
+        updated_at: parseNumber(payload.updated_at) ?? 0,
+    };
+}
+
+function emptyEntryFreshnessSloState(updatedAt = 0): EntryFreshnessSloState {
+    return {
+        totals: {
+            total: 0,
+            missing_telemetry: 0,
+            stale_source: 0,
+            stale_gate: 0,
+            other: 0,
+        },
+        strategies: {},
+        recent_alerts: [],
+        updated_at: updatedAt,
+    };
+}
+
+function parseEntryFreshnessViolationCategory(value: unknown): EntryFreshnessViolationCategory {
+    if (value === 'MISSING_TELEMETRY') {
+        return value;
+    }
+    if (value === 'STALE_SOURCE') {
+        return value;
+    }
+    if (value === 'STALE_GATE') {
+        return value;
+    }
+    return 'OTHER';
+}
+
+function parseEntryFreshnessSloStrategy(
+    input: unknown,
+    strategyFallback: string,
+): EntryFreshnessSloStrategy | null {
+    if (!input || typeof input !== 'object') {
+        return null;
+    }
+    const payload = input as Partial<EntryFreshnessSloStrategy>;
+    const strategy = typeof payload.strategy === 'string' && payload.strategy.trim().length > 0
+        ? payload.strategy.trim().toUpperCase()
+        : strategyFallback.trim().toUpperCase() || 'UNKNOWN';
+    return {
+        strategy,
+        total: parseNumber(payload.total) ?? 0,
+        missing_telemetry: parseNumber(payload.missing_telemetry) ?? 0,
+        stale_source: parseNumber(payload.stale_source) ?? 0,
+        stale_gate: parseNumber(payload.stale_gate) ?? 0,
+        other: parseNumber(payload.other) ?? 0,
+        last_violation_at: parseNumber(payload.last_violation_at) ?? 0,
+        last_reason: typeof payload.last_reason === 'string' ? payload.last_reason : '',
+    };
+}
+
+function parseEntryFreshnessSloAlert(input: unknown): EntryFreshnessSloAlert | null {
+    if (!input || typeof input !== 'object') {
+        return null;
+    }
+    const payload = input as Partial<EntryFreshnessSloAlert>;
+    const strategy = typeof payload.strategy === 'string' && payload.strategy.trim().length > 0
+        ? payload.strategy.trim().toUpperCase()
+        : 'UNKNOWN';
+    const executionId = typeof payload.execution_id === 'string' && payload.execution_id.trim().length > 0
+        ? payload.execution_id
+        : `${strategy}:${Date.now()}`;
+    return {
+        execution_id: executionId,
+        strategy,
+        market_key: typeof payload.market_key === 'string' ? payload.market_key : null,
+        category: parseEntryFreshnessViolationCategory(payload.category),
+        reason: typeof payload.reason === 'string' ? payload.reason : '',
+        timestamp: parseNumber(payload.timestamp) ?? Date.now(),
+    };
+}
+
+function parseEntryFreshnessSloState(input: unknown): EntryFreshnessSloState {
+    if (!input || typeof input !== 'object') {
+        return emptyEntryFreshnessSloState();
+    }
+    const payload = input as Partial<EntryFreshnessSloState>;
+    const totals = payload.totals && typeof payload.totals === 'object'
+        ? payload.totals as Record<string, unknown>
+        : {};
+    const strategiesRaw = payload.strategies && typeof payload.strategies === 'object'
+        ? payload.strategies as Record<string, unknown>
+        : {};
+    const strategies: Record<string, EntryFreshnessSloStrategy> = {};
+    for (const [strategy, value] of Object.entries(strategiesRaw)) {
+        const parsed = parseEntryFreshnessSloStrategy(value, strategy);
+        if (parsed) {
+            strategies[parsed.strategy] = parsed;
+        }
+    }
+    const alerts = Array.isArray(payload.recent_alerts)
+        ? payload.recent_alerts
+            .map((entry) => parseEntryFreshnessSloAlert(entry))
+            .filter((entry): entry is EntryFreshnessSloAlert => entry !== null)
+        : [];
+    return {
+        totals: {
+            total: parseNumber(totals.total) ?? 0,
+            missing_telemetry: parseNumber(totals.missing_telemetry) ?? 0,
+            stale_source: parseNumber(totals.stale_source) ?? 0,
+            stale_gate: parseNumber(totals.stale_gate) ?? 0,
+            other: parseNumber(totals.other) ?? 0,
         },
         strategies,
         recent_alerts: alerts,
@@ -1457,6 +1601,19 @@ function rejectedStageClass(stage: RejectedSignalStage): string {
     return 'text-gray-400';
 }
 
+function entryFreshnessCategoryClass(category: EntryFreshnessViolationCategory): string {
+    if (category === 'MISSING_TELEMETRY') {
+        return 'text-rose-300';
+    }
+    if (category === 'STALE_SOURCE') {
+        return 'text-amber-300';
+    }
+    if (category === 'STALE_GATE') {
+        return 'text-cyan-300';
+    }
+    return 'text-gray-300';
+}
+
 function formatAgeMs(timestamp: number, now: number): string {
     if (!Number.isFinite(timestamp) || timestamp <= 0) {
         return '--';
@@ -1535,6 +1692,9 @@ export const PolymarketPage: React.FC = () => {
         recent_alerts: [],
         updated_at: 0,
     });
+    const [entryFreshnessSlo, setEntryFreshnessSlo] = React.useState<EntryFreshnessSloState>(
+        emptyEntryFreshnessSloState(),
+    );
     const [governance, setGovernance] = React.useState<GovernanceState>({
         autopilot_enabled: false,
         autopilot_effective: false,
@@ -1779,6 +1939,26 @@ export const PolymarketPage: React.FC = () => {
         }
         return (dataIntegrity.totals.hold_scans / total) * 100;
     }, [dataIntegrity.totals]);
+    const entryFreshnessViolationRatePct = React.useMemo(() => {
+        const totalScans = dataIntegrity.totals.total_scans;
+        if (totalScans <= 0) {
+            return 0;
+        }
+        return (entryFreshnessSlo.totals.total / totalScans) * 100;
+    }, [dataIntegrity.totals.total_scans, entryFreshnessSlo.totals.total]);
+    const entryFreshnessStrategyRows = React.useMemo(
+        () => Object.values(entryFreshnessSlo.strategies)
+            .filter((entry) => entry.total > 0)
+            .sort((a, b) => b.total - a.total)
+            .slice(0, 5),
+        [entryFreshnessSlo.strategies],
+    );
+    const entryFreshnessAlertRows = React.useMemo(
+        () => [...entryFreshnessSlo.recent_alerts]
+            .sort((a, b) => b.timestamp - a.timestamp)
+            .slice(0, 4),
+        [entryFreshnessSlo.recent_alerts],
+    );
     const costDragRows = React.useMemo(
         () => Object.entries(strategyCostDiagnostics)
             .map(([strategy, entry]) => ({ strategy, ...entry }))
@@ -1881,6 +2061,7 @@ export const PolymarketPage: React.FC = () => {
                     strategy_quality?: unknown;
                     strategy_cost_diagnostics?: unknown;
                     data_integrity?: unknown;
+                    entry_freshness_slo?: unknown;
                     strategy_governance?: unknown;
                     ledger_health?: unknown;
                     feature_registry?: unknown;
@@ -1916,6 +2097,7 @@ export const PolymarketPage: React.FC = () => {
                 const quality = parseQualityMap(data.strategy_quality);
                 const costDiagnostics = parseCostDiagnosticsMap(data.strategy_cost_diagnostics);
                 const integrity = parseDataIntegrityState(data.data_integrity);
+                const parsedEntryFreshnessSlo = parseEntryFreshnessSloState(data.entry_freshness_slo);
                 const governanceState = parseGovernanceState(data.strategy_governance);
                 const parsedLedgerHealth = parseLedgerHealthState(data.ledger_health);
                 const parsedFeatureRegistry = parseFeatureRegistrySummary(data.feature_registry);
@@ -1944,6 +2126,7 @@ export const PolymarketPage: React.FC = () => {
                 setStrategyQuality(quality);
                 setStrategyCostDiagnostics(costDiagnostics);
                 setDataIntegrity(integrity);
+                setEntryFreshnessSlo(parsedEntryFreshnessSlo);
                 setGovernance(governanceState);
                 setLedgerHealth(parsedLedgerHealth);
                 setFeatureRegistry(parsedFeatureRegistry);
@@ -2067,6 +2250,7 @@ export const PolymarketPage: React.FC = () => {
                 recent_alerts: [],
                 updated_at: Date.now(),
             });
+            setEntryFreshnessSlo(emptyEntryFreshnessSloState(Date.now()));
             setGovernance((prev) => ({
                 ...prev,
                 decisions: {},
@@ -2231,6 +2415,26 @@ export const PolymarketPage: React.FC = () => {
         const handleDataIntegritySnapshot = (payload: unknown) => {
             setDataIntegrity(parseDataIntegrityState(payload));
         };
+        const handleEntryFreshnessAlert = (payload: unknown) => {
+            const parsed = parseEntryFreshnessSloAlert(payload);
+            if (!parsed) {
+                return;
+            }
+            setEntryFreshnessSlo((prev) => ({
+                ...prev,
+                recent_alerts: [
+                    parsed,
+                    ...prev.recent_alerts.filter((entry) => !(
+                        entry.execution_id === parsed.execution_id
+                        && entry.timestamp === parsed.timestamp
+                    )),
+                ].slice(0, 150),
+                updated_at: parsed.timestamp,
+            }));
+        };
+        const handleEntryFreshnessSloUpdate = (payload: unknown) => {
+            setEntryFreshnessSlo(parseEntryFreshnessSloState(payload));
+        };
         const handleStrategyCostDiagnosticsUpdate = (payload: unknown) => {
             if (!payload || typeof payload !== 'object') {
                 return;
@@ -2363,6 +2567,8 @@ export const PolymarketPage: React.FC = () => {
         socket.on('data_integrity_update', handleDataIntegrityUpdate);
         socket.on('data_integrity_alert', handleDataIntegrityAlert);
         socket.on('data_integrity_snapshot', handleDataIntegritySnapshot);
+        socket.on('entry_freshness_alert', handleEntryFreshnessAlert);
+        socket.on('entry_freshness_slo_update', handleEntryFreshnessSloUpdate);
         socket.on('strategy_governance_update', handleGovernanceUpdate);
         socket.on('strategy_governance_audit', handleGovernanceAudit);
         socket.on('strategy_governance_snapshot', handleGovernanceSnapshot);
@@ -2410,6 +2616,8 @@ export const PolymarketPage: React.FC = () => {
             socket.off('data_integrity_update', handleDataIntegrityUpdate);
             socket.off('data_integrity_alert', handleDataIntegrityAlert);
             socket.off('data_integrity_snapshot', handleDataIntegritySnapshot);
+            socket.off('entry_freshness_alert', handleEntryFreshnessAlert);
+            socket.off('entry_freshness_slo_update', handleEntryFreshnessSloUpdate);
             socket.off('strategy_governance_update', handleGovernanceUpdate);
             socket.off('strategy_governance_audit', handleGovernanceAudit);
             socket.off('strategy_governance_snapshot', handleGovernanceSnapshot);
@@ -2781,6 +2989,62 @@ export const PolymarketPage: React.FC = () => {
                                             <div className="flex justify-between items-center text-[10px] text-gray-500 font-mono mt-1">
                                                 <span>x{alert.consecutive_holds}</span>
                                                 <span>{new Date(alert.timestamp).toLocaleTimeString()}</span>
+                                            </div>
+                                            <div className="text-[10px] text-gray-400 truncate" title={alert.reason}>
+                                                {alert.reason}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            <div>
+                                <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-2">Entry Freshness SLO</div>
+                                <div className="space-y-1">
+                                    <div className="text-[10px] text-gray-500 font-mono">
+                                        total {entryFreshnessSlo.totals.total} | miss {entryFreshnessSlo.totals.missing_telemetry}
+                                        {' '}| stale src {entryFreshnessSlo.totals.stale_source} | stale gate {entryFreshnessSlo.totals.stale_gate}
+                                    </div>
+                                    <div className="text-[10px] text-gray-500 font-mono">
+                                        violation rate{' '}
+                                        <span className={`${
+                                            entryFreshnessViolationRatePct >= 2
+                                                ? 'text-rose-300'
+                                                : entryFreshnessViolationRatePct >= 0.5
+                                                    ? 'text-amber-300'
+                                                    : 'text-emerald-300'
+                                        }`}>
+                                            {entryFreshnessViolationRatePct.toFixed(2)}%
+                                        </span>
+                                        {' '}| updated {formatAgeMs(entryFreshnessSlo.updated_at, Date.now())}
+                                    </div>
+                                    {entryFreshnessStrategyRows.length === 0 && (
+                                        <div className="text-xs text-gray-500 font-mono">No entry-freshness violations recorded</div>
+                                    )}
+                                    {entryFreshnessStrategyRows.map((entry) => (
+                                        <div key={entry.strategy} className="border border-white/10 rounded p-2 bg-black/20">
+                                            <div className="flex justify-between items-center text-[11px] font-mono">
+                                                <span className="text-gray-200 truncate pr-2">{STRATEGY_NAME_MAP[entry.strategy] || entry.strategy}</span>
+                                                <span className="text-rose-300">{entry.total}</span>
+                                            </div>
+                                            <div className="text-[10px] text-gray-500 font-mono mt-1">
+                                                miss {entry.missing_telemetry} | src {entry.stale_source} | gate {entry.stale_gate} | other {entry.other}
+                                            </div>
+                                            {entry.last_reason && (
+                                                <div className="text-[10px] text-gray-400 truncate" title={entry.last_reason}>
+                                                    {entry.last_reason}
+                                                </div>
+                                            )}
+                                        </div>
+                                    ))}
+                                    {entryFreshnessAlertRows.map((alert, index) => (
+                                        <div key={`${alert.execution_id}:${alert.timestamp}:${index}`} className="border border-white/10 rounded p-2 bg-black/20">
+                                            <div className="flex justify-between items-center text-[10px] font-mono">
+                                                <span className={entryFreshnessCategoryClass(alert.category)}>{alert.category}</span>
+                                                <span className="text-gray-500">{new Date(alert.timestamp).toLocaleTimeString()}</span>
+                                            </div>
+                                            <div className="text-[10px] text-gray-300 truncate mt-1">
+                                                {STRATEGY_NAME_MAP[alert.strategy] || alert.strategy}
                                             </div>
                                             <div className="text-[10px] text-gray-400 truncate" title={alert.reason}>
                                                 {alert.reason}
