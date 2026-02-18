@@ -1,6 +1,8 @@
 import { logger } from '../../utils/logger';
 
-export function scheduleNonOverlappingTask(taskName: string, intervalMs: number, task: () => Promise<void>): void {
+export type ScheduledTaskStop = () => void;
+
+export function scheduleNonOverlappingTask(taskName: string, intervalMs: number, task: () => Promise<void>): ScheduledTaskStop {
     const safeIntervalMs = Number.isFinite(intervalMs) && intervalMs > 0
         ? Math.floor(intervalMs)
         : 1000;
@@ -9,7 +11,7 @@ export function scheduleNonOverlappingTask(taskName: string, intervalMs: number,
     }
 
     let inFlight = false;
-    setInterval(() => {
+    const intervalId = setInterval(() => {
         if (inFlight) {
             return;
         }
@@ -23,4 +25,13 @@ export function scheduleNonOverlappingTask(taskName: string, intervalMs: number,
                 inFlight = false;
             });
     }, safeIntervalMs);
+
+    let stopped = false;
+    return () => {
+        if (stopped) {
+            return;
+        }
+        stopped = true;
+        clearInterval(intervalId);
+    };
 }

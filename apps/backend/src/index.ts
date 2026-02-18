@@ -654,6 +654,7 @@ let metaControllerRefreshScheduled = false;
 let metaControllerRefreshInFlight = false;
 const heartbeats: Record<string, number> = {};
 const riskGuardBootResumeTimers = new Map<string, NodeJS.Timeout>();
+const scheduledTaskStops: Array<() => void> = [];
 const latestStrategyScans = new Map<string, StrategyScanState>();
 const latestStrategyScansByMarket = new Map<string, StrategyScanState>();
 const runtimeModules: Record<string, RuntimeModuleState> = Object.fromEntries(
@@ -691,6 +692,22 @@ function clearRiskGuardBootResumeTimer(strategyId: string): void {
     }
     clearTimeout(timer);
     riskGuardBootResumeTimers.delete(strategyId);
+}
+
+function registerScheduledTask(taskName: string, intervalMs: number, task: () => Promise<void>): void {
+    const stop = scheduleNonOverlappingTask(taskName, intervalMs, task);
+    scheduledTaskStops.push(stop);
+}
+
+function stopAllScheduledTasks(): void {
+    while (scheduledTaskStops.length > 0) {
+        const stop = scheduledTaskStops.pop();
+        try {
+            stop?.();
+        } catch (error) {
+            recordSilentCatch('Scheduler.StopTask', error);
+        }
+    }
 }
 
 function isControlPlaneTokenConfigured(): boolean {
@@ -6079,7 +6096,7 @@ async function runStrategyGovernanceCycle(): Promise<void> {
 // Re-enable requires both LEGACY_BRAIN_LOOP_ENABLED=true and LEGACY_BRAIN_LOOP_UNSAFE_OK=true.
 if (LEGACY_BRAIN_LOOP_ENABLED && LEGACY_BRAIN_LOOP_UNSAFE_OK) {
     logger.warn('[Brain] legacy decision loop enabled in unsafe mode by explicit override.');
-    scheduleNonOverlappingTask('Brain', 30_000, async () => {
+    registerScheduledTask('Brain', 30_000, async () => {
         try {
             const symbol = 'BTC-USD';
 
@@ -6122,7 +6139,7 @@ if (LEGACY_BRAIN_LOOP_ENABLED && LEGACY_BRAIN_LOOP_UNSAFE_OK) {
 }
 
 // System Health Heartbeat (Every 2s)
-scheduleNonOverlappingTask('SystemHealth', 2000, async () => {
+registerScheduledTask('SystemHealth', 2000, async () => {
     const start = Date.now();
     let redisLatency = 0;
     try {
@@ -6168,7 +6185,7 @@ scheduleNonOverlappingTask('SystemHealth', 2000, async () => {
     io.emit('runtime_status_update', runtimeStatusPayload());
 });
 
-scheduleNonOverlappingTask('Settlement', settlementService.getPollIntervalMs(), async () => {
+registerScheduledTask('Settlement', settlementService.getPollIntervalMs(), async () => {
     try {
         const events = await settlementService.runCycle(await getTradingMode(), isLiveOrderPostingEnabled());
         touchRuntimeModule('SETTLEMENT_ENGINE', 'ONLINE', `cycle complete (${events.length} new event${events.length === 1 ? '' : 's'})`);
@@ -6182,7 +6199,7 @@ scheduleNonOverlappingTask('Settlement', settlementService.getPollIntervalMs(), 
     }
 });
 
-scheduleNonOverlappingTask('Governance', STRATEGY_GOVERNANCE_INTERVAL_MS, async () => {
+registerScheduledTask('Governance', STRATEGY_GOVERNANCE_INTERVAL_MS, async () => {
     try {
         await runStrategyGovernanceCycle();
     } catch (error) {
@@ -6191,7 +6208,7 @@ scheduleNonOverlappingTask('Governance', STRATEGY_GOVERNANCE_INTERVAL_MS, async 
     }
 });
 
-scheduleNonOverlappingTask('LedgerHealth', 5_000, async () => {
+registerScheduledTask('LedgerHealth', 5_000, async () => {
     try {
         await refreshLedgerHealth();
     } catch (error) {
@@ -6200,11 +6217,11 @@ scheduleNonOverlappingTask('LedgerHealth', 5_000, async () => {
     }
 });
 
-scheduleNonOverlappingTask('MetaController', 3_000, async () => {
+registerScheduledTask('MetaController', 3_000, async () => {
     requestMetaControllerRefresh();
 });
 
-scheduleNonOverlappingTask('MLPipeline', 10_000, async () => {
+registerScheduledTask('MLPipeline', 10_000, async () => {
     try {
         await refreshMlPipelineStatus();
     } catch (error) {
@@ -6215,7 +6232,7 @@ scheduleNonOverlappingTask('MLPipeline', 10_000, async () => {
     }
 });
 
-scheduleNonOverlappingTask('MLTrainer', MODEL_TRAINER_INTERVAL_MS, async () => {
+registerScheduledTask('MLTrainer', MODEL_TRAINER_INTERVAL_MS, async () => {
     try {
         await runInProcessModelTraining(false);
     } catch (error) {
@@ -6224,7 +6241,7 @@ scheduleNonOverlappingTask('MLTrainer', MODEL_TRAINER_INTERVAL_MS, async () => {
     }
 });
 
-scheduleNonOverlappingTask('ModelGateCalibration', MODEL_PROBABILITY_GATE_TUNER_INTERVAL_MS, async () => {
+registerScheduledTask('ModelGateCalibration', MODEL_PROBABILITY_GATE_TUNER_INTERVAL_MS, async () => {
     try {
         await runModelProbabilityGateCalibration();
     } catch (error) {
@@ -6278,7 +6295,7 @@ async function bootstrap() {
     await runInProcessModelTraining(false);
 
     // ── Periodic state broadcast: keep all dashboards live ──
-    scheduleNonOverlappingTask('StateBroadcast', 5000, async () => {
+    registerScheduledTask('StateBroadcast', 5000, async () => {
         try {
             const ledger = await getSimulationLedgerSnapshot();
             const vault = parseFloat(await redisClient.get(VAULT_REDIS_KEY) || '0');
@@ -6320,6 +6337,7 @@ const shutdown = async (signal: string) => {
     }
     shutdownInProgress = true;
     logger.info(`[System] ${signal} received, shutting down gracefully...`);
+    stopAllScheduledTasks();
     for (const strategyId of [...riskGuardBootResumeTimers.keys()]) {
         clearRiskGuardBootResumeTimer(strategyId);
     }

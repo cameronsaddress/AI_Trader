@@ -21,7 +21,7 @@ describe('scheduleNonOverlappingTask', () => {
 
     it('clears inFlight even when task throws synchronously', async () => {
         let calls = 0;
-        scheduleNonOverlappingTask('SyncThrow', 10, () => {
+        const stop = scheduleNonOverlappingTask('SyncThrow', 10, () => {
             calls += 1;
             if (calls === 1) {
                 throw new Error('boom');
@@ -36,11 +36,12 @@ describe('scheduleNonOverlappingTask', () => {
         jest.advanceTimersByTime(11);
         await flushMicrotasks();
         expect(calls).toBe(2);
+        stop();
     });
 
     it('uses a safe default interval when input interval is invalid', async () => {
         const task = jest.fn(async () => undefined);
-        scheduleNonOverlappingTask('BadInterval', Number.NaN, task);
+        const stop = scheduleNonOverlappingTask('BadInterval', Number.NaN, task);
 
         jest.advanceTimersByTime(999);
         await flushMicrotasks();
@@ -50,5 +51,21 @@ describe('scheduleNonOverlappingTask', () => {
         await flushMicrotasks();
         expect(task).toHaveBeenCalledTimes(1);
         expect(logger.warn).toHaveBeenCalled();
+        stop();
+    });
+
+    it('returns an idempotent stop function that prevents future runs', async () => {
+        const task = jest.fn(async () => undefined);
+        const stop = scheduleNonOverlappingTask('StopTask', 10, task);
+
+        jest.advanceTimersByTime(11);
+        await flushMicrotasks();
+        expect(task).toHaveBeenCalledTimes(1);
+
+        stop();
+        stop();
+        jest.advanceTimersByTime(100);
+        await flushMicrotasks();
+        expect(task).toHaveBeenCalledTimes(1);
     });
 });
