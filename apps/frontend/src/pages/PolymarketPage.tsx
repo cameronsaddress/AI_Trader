@@ -2102,6 +2102,8 @@ export const PolymarketPage: React.FC = () => {
 
     React.useEffect(() => {
         let mounted = true;
+        let inFlight = false;
+        let rerunRequested = false;
 
         const fetchStats = async () => {
             try {
@@ -2222,13 +2224,34 @@ export const PolymarketPage: React.FC = () => {
             }
         };
 
-        void fetchStats();
+        const runFetchStats = async () => {
+            if (!mounted) {
+                return;
+            }
+            if (inFlight) {
+                rerunRequested = true;
+                return;
+            }
+            inFlight = true;
+            try {
+                await fetchStats();
+            } finally {
+                inFlight = false;
+                if (mounted && rerunRequested) {
+                    rerunRequested = false;
+                    void runFetchStats();
+                }
+            }
+        };
+
+        void runFetchStats();
         const intervalId = window.setInterval(() => {
-            void fetchStats();
+            void runFetchStats();
         }, 2000);
 
         return () => {
             mounted = false;
+            rerunRequested = false;
             window.clearInterval(intervalId);
         };
     }, []);

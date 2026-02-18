@@ -11,10 +11,12 @@ interface CoinbaseConfig {
 export class CoinbaseClient extends EventEmitter {
     private ws: WebSocket | null = null;
     private pingInterval: NodeJS.Timeout | null = null;
+    private reconnectTimer: NodeJS.Timeout | null = null;
     private url: string;
     private subscriptions: Set<string> = new Set();
     private reconnectAttempts = 0;
     private maxReconnectAttempts = 5;
+    private manualDisconnect = false;
 
     constructor(private config: CoinbaseConfig) {
         super();
@@ -24,6 +26,11 @@ export class CoinbaseClient extends EventEmitter {
     }
 
     public connect() {
+        this.manualDisconnect = false;
+        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+            return;
+        }
+        this.clearReconnectTimer();
         try {
             this.ws = new WebSocket(this.url);
 
@@ -54,7 +61,12 @@ export class CoinbaseClient extends EventEmitter {
 
             this.ws.on('close', () => {
                 logger.warn('Coinbase WebSocket closed');
+                this.ws = null;
                 this.stopHeartbeat();
+                if (this.manualDisconnect) {
+                    logger.info('Coinbase WebSocket closed by manual disconnect');
+                    return;
+                }
                 this.reconnect();
             });
 
@@ -68,10 +80,25 @@ export class CoinbaseClient extends EventEmitter {
         }
     }
 
+    public disconnect() {
+        this.manualDisconnect = true;
+        this.stopHeartbeat();
+        this.clearReconnectTimer();
+        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+            this.ws.close();
+        }
+        this.ws = null;
+    }
+
     public subscribe(productIds: string[], channels: string[]) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
             logger.warn('WebSocket not open, queuing subscription');
             // Logic to queue could go here, for now rely on reconnect
+            const subscriptionKey = JSON.stringify({
+                product_ids: [...productIds].sort(),
+                channels: [...channels].sort(),
+            });
+            this.subscriptions.add(subscriptionKey);
             return;
         }
 
@@ -82,23 +109,52 @@ export class CoinbaseClient extends EventEmitter {
         };
 
         this.ws.send(JSON.stringify(startMsg));
-        productIds.forEach(id => this.subscriptions.add(id));
+        const subscriptionKey = JSON.stringify({
+            product_ids: [...productIds].sort(),
+            channels: [...channels].sort(),
+        });
+        this.subscriptions.add(subscriptionKey);
         logger.info(`Subscribed to ${productIds.join(', ')} on channels ${channels.join(', ')}`);
     }
 
     private resubscribe() {
         if (this.subscriptions.size > 0) {
             logger.info('Resubscribing to previous channels...');
-            this.subscribe(Array.from(this.subscriptions), ['level2', 'ticker', 'matches']);
+            for (const sub of this.subscriptions) {
+                try {
+                    const parsed = JSON.parse(sub) as {
+                        product_ids?: unknown;
+                        channels?: unknown;
+                    };
+                    const productIds = Array.isArray(parsed.product_ids)
+                        ? parsed.product_ids.filter((id): id is string => typeof id === 'string')
+                        : [];
+                    const channels = Array.isArray(parsed.channels)
+                        ? parsed.channels.filter((id): id is string => typeof id === 'string')
+                        : [];
+                    if (productIds.length > 0 && channels.length > 0) {
+                        this.subscribe(productIds, channels);
+                    }
+                } catch (error) {
+                    logger.error('Failed to parse stored Coinbase subscription', { error });
+                }
+            }
         }
     }
 
     private reconnect() {
+        if (this.manualDisconnect) {
+            return;
+        }
         if (this.reconnectAttempts < this.maxReconnectAttempts) {
             this.reconnectAttempts++;
             const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
             logger.info(`Attempting reconnect in ${delay}ms...`);
-            setTimeout(() => this.connect(), delay);
+            this.clearReconnectTimer();
+            this.reconnectTimer = setTimeout(() => {
+                this.reconnectTimer = null;
+                this.connect();
+            }, delay);
         } else {
             logger.error('Max reconnect attempts reached. Manual intervention required.');
             this.emit('fatal_error');
@@ -118,6 +174,13 @@ export class CoinbaseClient extends EventEmitter {
         if (this.pingInterval) {
             clearInterval(this.pingInterval);
             this.pingInterval = null;
+        }
+    }
+
+    private clearReconnectTimer() {
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
         }
     }
 }
