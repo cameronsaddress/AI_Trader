@@ -119,6 +119,19 @@ function extractExecutionStrategy(event: ExecutionLogEvent): string | null {
   return raw.trim().toUpperCase();
 }
 
+function parseNumber(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
 export function HomeDashboard() {
   const { socket } = useSocket();
   const navigate = useNavigate();
@@ -134,14 +147,19 @@ export function HomeDashboard() {
     daily_pnl: 0, daily_target: 300, cooldown_active: false, open_notional: 0, drawdown_pct: 0,
   });
   const [tradingMode, setTradingMode] = useState<'PAPER' | 'LIVE'>('PAPER');
-  const [lastMetricsUpdate, setLastMetricsUpdate] = useState(Date.now());
+  const [lastDataUpdate, setLastDataUpdate] = useState(Date.now());
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
     if (!socket) return;
 
+    const touchData = () => {
+      const stamp = Date.now();
+      setLastDataUpdate((prev) => (stamp - prev >= 250 ? stamp : prev));
+    };
+
     const handleMetrics = (data: Record<string, { pnl?: number; daily_trades?: number }>) => {
-      setLastMetricsUpdate(Date.now());
+      touchData();
       setMetrics((prev) => {
         const next = { ...prev };
         for (const [id, m] of Object.entries(data)) {
@@ -155,10 +173,14 @@ export function HomeDashboard() {
       });
     };
 
-    const handleStatus = (data: Record<string, boolean>) => setStatuses(data);
+    const handleStatus = (data: Record<string, boolean>) => {
+      touchData();
+      setStatuses(data);
+    };
 
     const handleScan = (data: ScannerUpdateEvent) => {
       if (!data?.strategy) return;
+      touchData();
       setScans((prev) => {
         const filtered = prev.filter((s) => s.strategy !== data.strategy);
         return [{
@@ -175,6 +197,7 @@ export function HomeDashboard() {
     const handleExec = (data: ExecutionLogEvent) => {
       const strategy = extractExecutionStrategy(data);
       if (!strategy) return;
+      touchData();
 
       const executionType = typeof data.type === 'string' && data.type.trim().length > 0
         ? data.type
@@ -184,19 +207,15 @@ export function HomeDashboard() {
       const executionId = typeof data.execution_id === 'string' && data.execution_id.trim().length > 0
         ? data.execution_id
         : `exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const entryPrice = typeof data.entry_price === 'number'
-        ? data.entry_price
-        : typeof data.price === 'number'
-          ? data.price
-          : undefined;
-      const size = typeof data.size === 'number' ? data.size : undefined;
+      const entryPrice = parseNumber(data.entry_price) ?? parseNumber(data.price) ?? undefined;
+      const size = parseNumber(data.size) ?? undefined;
       const question = typeof data.question === 'string'
         ? data.question
         : typeof data.market === 'string'
           ? data.market
           : undefined;
-      const pnl = typeof data.pnl === 'number' ? data.pnl : undefined;
-      const timestamp = typeof data.timestamp === 'number' ? data.timestamp : Date.now();
+      const pnl = parseNumber(data.pnl) ?? undefined;
+      const timestamp = parseNumber(data.timestamp) ?? Date.now();
 
       const entry: ExecEntry = {
         type: executionType,
@@ -212,7 +231,13 @@ export function HomeDashboard() {
 
       setExecutions((prev) => [entry, ...prev].slice(0, 20));
 
-      if (executionType === 'EXIT' && pnl !== undefined) {
+      const normalizedType = executionType.toUpperCase();
+      const isCloseEvent = normalizedType === 'EXIT'
+        || normalizedType === 'WIN'
+        || normalizedType === 'LOSS'
+        || normalizedType === 'SETTLEMENT'
+        || normalizedType === 'CLOSE';
+      if (isCloseEvent && pnl !== undefined) {
         setMetrics((prev) => {
           const s = prev[strategy] || { pnl: 0, daily_trades: 0, status: 'active' };
           return { ...prev, [strategy]: { ...s, pnl: s.pnl + pnl, daily_trades: s.daily_trades + 1 } };
@@ -221,10 +246,14 @@ export function HomeDashboard() {
     };
 
     const handleVault = (data: VaultUpdateEvent) => {
-      if (typeof data?.vault === 'number') setVaultBalance(data.vault);
+      if (typeof data?.vault === 'number') {
+        touchData();
+        setVaultBalance(data.vault);
+      }
     };
 
     const handleBankroll = (data: BankrollUpdateEvent) => {
+      touchData();
       if (typeof data?.available_cash === 'number') setBankroll(data.available_cash);
       if (typeof data?.equity === 'number') setBankroll(data.equity);
       const reserved = typeof data?.reserved === 'number' ? data.reserved : null;
@@ -235,11 +264,15 @@ export function HomeDashboard() {
 
     const handleHeartbeat = (data: HeartbeatEvent) => {
       const heartbeatId = typeof data?.id === 'string' && data.id.trim().length > 0 ? data.id : null;
-      if (heartbeatId) setHeartbeats((prev) => ({ ...prev, [heartbeatId]: Date.now() }));
+      if (heartbeatId) {
+        touchData();
+        setHeartbeats((prev) => ({ ...prev, [heartbeatId]: Date.now() }));
+      }
     };
 
     const handleRiskGuard = (data: RiskGuardEvent) => {
       if (!data) return;
+      touchData();
       // Backend sends RiskGuardState: { strategy, cumPnl, peakPnl, consecutiveLosses, pausedUntil, ... }
       const cumPnl = typeof data.cumPnl === 'number' ? data.cumPnl : undefined;
       const peakPnl = typeof data.peakPnl === 'number' ? data.peakPnl : 0;
@@ -255,7 +288,26 @@ export function HomeDashboard() {
     };
 
     const handleMode = (data: TradingModeEvent) => {
-      if (data?.mode === 'PAPER' || data?.mode === 'LIVE') setTradingMode(data.mode);
+      if (data?.mode === 'PAPER' || data?.mode === 'LIVE') {
+        touchData();
+        setTradingMode(data.mode);
+      }
+    };
+    const handleSimulationReset = (payload: { bankroll?: number }) => {
+      touchData();
+      const resetBankroll = parseNumber(payload?.bankroll) ?? 1000;
+      setMetrics({});
+      setScans([]);
+      setExecutions([]);
+      setBankroll(resetBankroll);
+      setVaultBalance(0);
+      setRiskGuard((prev) => ({
+        ...prev,
+        daily_pnl: 0,
+        cooldown_active: false,
+        open_notional: 0,
+        drawdown_pct: 0,
+      }));
     };
 
     // Request all initial state on connect/reconnect
@@ -277,6 +329,7 @@ export function HomeDashboard() {
     socket.on('heartbeat', handleHeartbeat);
     socket.on('risk_guard_update', handleRiskGuard);
     socket.on('trading_mode_update', handleMode);
+    socket.on('simulation_reset', handleSimulationReset);
     socket.on('connect', requestAllState);
 
     // Initial request
@@ -292,6 +345,7 @@ export function HomeDashboard() {
       socket.off('heartbeat', handleHeartbeat);
       socket.off('risk_guard_update', handleRiskGuard);
       socket.off('trading_mode_update', handleMode);
+      socket.off('simulation_reset', handleSimulationReset);
       socket.off('connect', requestAllState);
     };
   }, [socket]);
@@ -346,8 +400,10 @@ export function HomeDashboard() {
             accent={tradingMode === 'LIVE' ? 'red' : 'blue'} />
         </div>
 
-        {now - lastMetricsUpdate > 30000 && (
-          <span className="text-yellow-400 text-xs animate-pulse">DATA STALE</span>
+        {now - lastDataUpdate > 30000 && (
+          <span className="text-yellow-400 text-xs animate-pulse">
+            DATA STALE ({Math.round((now - lastDataUpdate) / 1000)}s)
+          </span>
         )}
 
         {/* ── Risk Guard Strip ── */}
@@ -387,7 +443,8 @@ export function HomeDashboard() {
                         const pnl = m?.pnl || 0;
                         const trades = m?.daily_trades || 0;
                         const isActive = statuses[s.id] !== false;
-                        const alive = heartbeats[s.id] && Date.now() - heartbeats[s.id] < 15000;
+                        const lastHeartbeat = heartbeats[s.id];
+                        const alive = typeof lastHeartbeat === 'number' && now - lastHeartbeat < 15000;
                         return (
                           <div key={s.id} className="flex items-center gap-2 text-[10px] font-mono">
                             <div className={`w-2 h-2 rounded-full ${alive ? 'bg-emerald-500 animate-pulse' : isActive ? 'bg-gray-500' : 'bg-red-500/50'}`} />

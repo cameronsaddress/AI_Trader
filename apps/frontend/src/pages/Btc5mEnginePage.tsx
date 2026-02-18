@@ -71,6 +71,53 @@ type RejectedSignalSummaryState = {
   by_stage: Record<string, number>;
 };
 
+type EntryFreshnessViolationCategory = 'MISSING_TELEMETRY' | 'STALE_SOURCE' | 'STALE_GATE' | 'OTHER';
+
+type EntryFreshnessSloAlert = {
+  execution_id: string;
+  strategy: string;
+  market_key: string | null;
+  category: EntryFreshnessViolationCategory;
+  reason: string;
+  timestamp: number;
+};
+
+type EntryFreshnessSloStrategy = {
+  strategy: string;
+  total: number;
+  missing_telemetry: number;
+  stale_source: number;
+  stale_gate: number;
+  other: number;
+  last_violation_at: number;
+  last_reason: string;
+};
+
+type EntryFreshnessSloState = {
+  totals: {
+    total: number;
+    missing_telemetry: number;
+    stale_source: number;
+    stale_gate: number;
+    other: number;
+  };
+  strategies: Record<string, EntryFreshnessSloStrategy>;
+  recent_alerts: EntryFreshnessSloAlert[];
+  updated_at: number;
+};
+
+type SilentCatchContextValue = string | number | boolean | null;
+
+type SilentCatchTelemetryEntry = {
+  count: number;
+  first_seen: number;
+  last_seen: number;
+  last_message: string;
+  last_context: Record<string, SilentCatchContextValue>;
+};
+
+type SilentCatchTelemetryState = Record<string, SilentCatchTelemetryEntry>;
+
 type TradeStatus = 'OPEN' | 'RESOLVED' | 'STOPPED';
 
 type TradeRecord = {
@@ -178,6 +225,125 @@ function parseModelGateCalibration(input: unknown): ModelGateCalibrationState {
     updated_at: parseNumber(row.updated_at) ?? 0,
     reason: parseText(row.reason) || '',
   };
+}
+
+function emptyEntryFreshnessSloState(updatedAt = 0): EntryFreshnessSloState {
+  return {
+    totals: {
+      total: 0,
+      missing_telemetry: 0,
+      stale_source: 0,
+      stale_gate: 0,
+      other: 0,
+    },
+    strategies: {},
+    recent_alerts: [],
+    updated_at: updatedAt,
+  };
+}
+
+function parseEntryFreshnessCategory(value: unknown): EntryFreshnessViolationCategory {
+  if (value === 'MISSING_TELEMETRY') return value;
+  if (value === 'STALE_SOURCE') return value;
+  if (value === 'STALE_GATE') return value;
+  return 'OTHER';
+}
+
+function parseEntryFreshnessSloStrategy(input: unknown, strategyFallback: string): EntryFreshnessSloStrategy | null {
+  const row = asRecord(input);
+  if (!row) return null;
+  const strategy = (parseText(row.strategy) || strategyFallback || 'UNKNOWN').toUpperCase();
+  return {
+    strategy,
+    total: parseNumber(row.total) ?? 0,
+    missing_telemetry: parseNumber(row.missing_telemetry) ?? 0,
+    stale_source: parseNumber(row.stale_source) ?? 0,
+    stale_gate: parseNumber(row.stale_gate) ?? 0,
+    other: parseNumber(row.other) ?? 0,
+    last_violation_at: parseNumber(row.last_violation_at) ?? 0,
+    last_reason: parseText(row.last_reason) || '',
+  };
+}
+
+function parseEntryFreshnessSloAlert(input: unknown): EntryFreshnessSloAlert | null {
+  const row = asRecord(input);
+  if (!row) return null;
+  const strategy = (parseText(row.strategy) || 'UNKNOWN').toUpperCase();
+  const executionId = parseText(row.execution_id) || `${strategy}:${Date.now()}`;
+  return {
+    execution_id: executionId,
+    strategy,
+    market_key: parseText(row.market_key),
+    category: parseEntryFreshnessCategory(row.category),
+    reason: parseText(row.reason) || '',
+    timestamp: parseNumber(row.timestamp) ?? Date.now(),
+  };
+}
+
+function parseEntryFreshnessSloState(input: unknown): EntryFreshnessSloState {
+  const row = asRecord(input);
+  if (!row) return emptyEntryFreshnessSloState();
+  const totals = asRecord(row.totals) || {};
+  const strategiesRaw = asRecord(row.strategies) || {};
+  const strategies: Record<string, EntryFreshnessSloStrategy> = {};
+  Object.entries(strategiesRaw).forEach(([key, value]) => {
+    const parsed = parseEntryFreshnessSloStrategy(value, key);
+    if (parsed) strategies[parsed.strategy] = parsed;
+  });
+  const recentAlerts = Array.isArray(row.recent_alerts)
+    ? row.recent_alerts
+      .map((entry) => parseEntryFreshnessSloAlert(entry))
+      .filter((entry): entry is EntryFreshnessSloAlert => entry !== null)
+    : [];
+  return {
+    totals: {
+      total: parseNumber(totals.total) ?? 0,
+      missing_telemetry: parseNumber(totals.missing_telemetry) ?? 0,
+      stale_source: parseNumber(totals.stale_source) ?? 0,
+      stale_gate: parseNumber(totals.stale_gate) ?? 0,
+      other: parseNumber(totals.other) ?? 0,
+    },
+    strategies,
+    recent_alerts: recentAlerts,
+    updated_at: parseNumber(row.updated_at) ?? 0,
+  };
+}
+
+function parseSilentCatchContext(input: unknown): Record<string, SilentCatchContextValue> {
+  const row = asRecord(input);
+  if (!row) return {};
+  const parsed: Record<string, SilentCatchContextValue> = {};
+  Object.entries(row).forEach(([key, value]) => {
+    if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      parsed[key] = value;
+    } else {
+      parsed[key] = String(value);
+    }
+  });
+  return parsed;
+}
+
+function parseSilentCatchTelemetry(input: unknown): SilentCatchTelemetryState {
+  const row = asRecord(input);
+  if (!row) return {};
+  const parsed: SilentCatchTelemetryState = {};
+  Object.entries(row).forEach(([scope, value]) => {
+    const entry = asRecord(value);
+    if (!entry) return;
+    parsed[scope] = {
+      count: parseNumber(entry.count) ?? 0,
+      first_seen: parseNumber(entry.first_seen) ?? 0,
+      last_seen: parseNumber(entry.last_seen) ?? 0,
+      last_message: parseText(entry.last_message) || '',
+      last_context: parseSilentCatchContext(entry.last_context),
+    };
+  });
+  return parsed;
+}
+
+function formatAgeMs(timestamp: number, now: number): string {
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return '--';
+  return `${Math.max(0, now - timestamp)}ms`;
 }
 
 function rejectedSignalStrategy(input: unknown): string | null {
@@ -400,6 +566,9 @@ export const Btc5mEnginePage: React.FC = () => {
     persisted_rows: 0,
     by_stage: {},
   });
+  const [entryFreshnessSlo, setEntryFreshnessSlo] = useState<EntryFreshnessSloState>(emptyEntryFreshnessSloState());
+  const [silentCatchTelemetry, setSilentCatchTelemetry] = useState<SilentCatchTelemetryState>({});
+  const [strategyQualityTotalScans, setStrategyQualityTotalScans] = useState(0);
 
   const closeTrace = React.useCallback(() => {
     setTraceExecutionId(null);
@@ -736,10 +905,77 @@ export const Btc5mEnginePage: React.FC = () => {
         by_stage: byStage,
       }));
     };
+    const handleEntryFreshnessSloUpdate = (payload: unknown) => {
+      setEntryFreshnessSlo(parseEntryFreshnessSloState(payload));
+    };
+    const handleEntryFreshnessAlert = (payload: unknown) => {
+      const alert = parseEntryFreshnessSloAlert(payload);
+      if (!alert) return;
+      setEntryFreshnessSlo((prev) => ({
+        ...prev,
+        recent_alerts: [
+          alert,
+          ...prev.recent_alerts.filter((entry) => !(
+            entry.execution_id === alert.execution_id
+            && entry.timestamp === alert.timestamp
+          )),
+        ].slice(0, 150),
+        updated_at: alert.timestamp,
+      }));
+    };
+    const handleSilentCatchTelemetrySnapshot = (payload: unknown) => {
+      setSilentCatchTelemetry(parseSilentCatchTelemetry(payload));
+    };
+    const handleSilentCatchTelemetryUpdate = (payload: unknown) => {
+      const row = asRecord(payload);
+      const scope = parseText(row?.scope);
+      if (!scope || !row) return;
+      const parsed = parseSilentCatchTelemetry({ [scope]: row });
+      if (!parsed[scope]) return;
+      setSilentCatchTelemetry((prev) => ({
+        ...prev,
+        [scope]: parsed[scope],
+      }));
+    };
+    const handleSimulationReset = () => {
+      setTradeBlotter({});
+      setSpotSeries([]);
+      setImpliedSeries([]);
+      setLatestScanMeta(null);
+      setLatestMlFeatures(null);
+      setLatestScanPasses(false);
+      setEntryFreshnessSlo(emptyEntryFreshnessSloState(Date.now()));
+      setRejectedSignalSummary({
+        tracked: 0,
+        persisted_rows: 0,
+        by_stage: {},
+      });
+      setStrategyMetrics((prev) => ({
+        ...prev,
+        [STRATEGY_ID]: {
+          pnl: 0,
+          daily_trades: 0,
+        },
+      }));
+      setStrategyQualityTotalScans(0);
+      setLastScannerUpdate(Date.now());
+      setVaultBalance(0);
+      flowMaxAbsRef.current = Array(FLOW_ROWS.length).fill(1e-9);
+      lastGoodSpotRef.current = null;
+      lastCexSnapshotRef.current = {};
+      lastSpotPush.current = 0;
+      lastImpliedPush.current = 0;
+      setFlowColumns(Array.from({ length: FLOW_COLS }, () => Array(FLOW_ROWS.length).fill(0)));
+    };
     socket.on('vault_update', handleVault);
     socket.on('model_gate_calibration_update', handleModelGateCalibration);
     socket.on('rejected_signal', handleRejectedSignal);
     socket.on('rejected_signal_snapshot', handleRejectedSignalSnapshot);
+    socket.on('entry_freshness_alert', handleEntryFreshnessAlert);
+    socket.on('entry_freshness_slo_update', handleEntryFreshnessSloUpdate);
+    socket.on('silent_catch_telemetry_snapshot', handleSilentCatchTelemetrySnapshot);
+    socket.on('silent_catch_telemetry_update', handleSilentCatchTelemetryUpdate);
+    socket.on('simulation_reset', handleSimulationReset);
 
     const requestAllState = () => {
       socket.emit('request_trading_mode');
@@ -767,6 +1003,11 @@ export const Btc5mEnginePage: React.FC = () => {
       socket.off('model_gate_calibration_update', handleModelGateCalibration);
       socket.off('rejected_signal', handleRejectedSignal);
       socket.off('rejected_signal_snapshot', handleRejectedSignalSnapshot);
+      socket.off('entry_freshness_alert', handleEntryFreshnessAlert);
+      socket.off('entry_freshness_slo_update', handleEntryFreshnessSloUpdate);
+      socket.off('silent_catch_telemetry_snapshot', handleSilentCatchTelemetrySnapshot);
+      socket.off('silent_catch_telemetry_update', handleSilentCatchTelemetryUpdate);
+      socket.off('simulation_reset', handleSimulationReset);
       socket.off('connect', requestAllState);
     };
   }, [socket]);
@@ -777,7 +1018,15 @@ export const Btc5mEnginePage: React.FC = () => {
       try {
         const res = await fetch(apiUrl('/api/arb/stats'));
         if (!res.ok) return;
-        const json = await res.json();
+        const json = await res.json() as {
+          trading_mode?: TradingMode;
+          live_order_posting_enabled?: boolean;
+          model_gate_calibration?: unknown;
+          entry_freshness_slo?: unknown;
+          silent_catch_telemetry?: unknown;
+          strategy_quality?: Record<string, { total_scans?: unknown; updated_at?: unknown }>;
+          scanner_last_heartbeat_ms?: unknown;
+        };
         if (!active) return;
         const tradingMode = json?.trading_mode;
         if (tradingMode === 'PAPER' || tradingMode === 'LIVE') {
@@ -787,6 +1036,12 @@ export const Btc5mEnginePage: React.FC = () => {
           setLiveOrderPostingEnabled(json.live_order_posting_enabled);
         }
         setModelGateCalibration(parseModelGateCalibration(json?.model_gate_calibration));
+        setEntryFreshnessSlo(parseEntryFreshnessSloState(json?.entry_freshness_slo));
+        setSilentCatchTelemetry(parseSilentCatchTelemetry(json?.silent_catch_telemetry));
+        const strategyTotalScans = parseNumber(json?.strategy_quality?.[STRATEGY_ID]?.total_scans);
+        if (strategyTotalScans !== null) {
+          setStrategyQualityTotalScans(strategyTotalScans);
+        }
         const strategyUpdatedAt = parseNumber(json?.strategy_quality?.[STRATEGY_ID]?.updated_at);
         const scannerHeartbeat = parseNumber(json?.scanner_last_heartbeat_ms);
         const fallbackTs = strategyUpdatedAt ?? scannerHeartbeat;
@@ -983,6 +1238,32 @@ export const Btc5mEnginePage: React.FC = () => {
   const modelGateDeltaBps = (modelGateCalibration.recommended_gate - modelGateCalibration.active_gate) * 10_000;
   const modelGateBlocks = rejectedSignalSummary.by_stage.MODEL_GATE ?? 0;
   const liveExecBlocks = rejectedSignalSummary.by_stage.LIVE_EXECUTION ?? 0;
+  const strategyFreshness = entryFreshnessSlo.strategies[STRATEGY_ID]
+    || entryFreshnessSlo.strategies[STRATEGY_ID.toUpperCase()]
+    || null;
+  const freshnessDenominator = Math.max(
+    strategyQualityTotalScans,
+    strategyFreshness?.total ?? 0,
+  );
+  const entryFreshnessRatePct = freshnessDenominator > 0
+    ? ((strategyFreshness?.total ?? 0) / freshnessDenominator) * 100
+    : 0;
+  const entryFreshnessSeverity = entryFreshnessRatePct >= 2
+    ? 'CRITICAL'
+    : entryFreshnessRatePct >= 0.5
+      ? 'WARN'
+      : 'HEALTHY';
+  const latestEntryFreshnessAlert = [...entryFreshnessSlo.recent_alerts]
+    .filter((alert) => alert.strategy === STRATEGY_ID)
+    .sort((a, b) => b.timestamp - a.timestamp)[0] || null;
+  const silentCatchRows = Object.entries(silentCatchTelemetry)
+    .map(([scope, entry]) => ({ scope, ...entry }))
+    .sort((a, b) => b.last_seen - a.last_seen)
+    .slice(0, 3);
+  const silentCatchTotal = silentCatchRows.reduce((sum, row) => sum + row.count, 0);
+  const staleSourceCount = strategyFreshness?.stale_source ?? 0;
+  const staleGateCount = strategyFreshness?.stale_gate ?? 0;
+  const missingTelemetryCount = strategyFreshness?.missing_telemetry ?? 0;
 
   const orderFeed = allTradesSorted.slice(0, ORDER_FEED_ROWS);
   const positions = allTradesSorted.slice(0, POSITIONS_ROWS);
@@ -1060,6 +1341,44 @@ export const Btc5mEnginePage: React.FC = () => {
             SCANNER OFFLINE — No updates for {Math.round((nowMs - lastScannerUpdate) / 1000)}s
           </div>
         )}
+        <div className="mx-3 mt-1 border border-white/10 rounded bg-black/35 px-3 py-1.5 text-[10px] font-mono flex flex-wrap items-center gap-x-4 gap-y-1">
+          <span className="text-gray-500 uppercase">Ops Guard</span>
+          <span className="text-gray-300">
+            Entry Freshness: <b className={`${
+              entryFreshnessSeverity === 'CRITICAL'
+                ? 'text-rose-300'
+                : entryFreshnessSeverity === 'WARN'
+                  ? 'text-amber-300'
+                  : 'text-emerald-300'
+            }`}>{entryFreshnessSeverity}</b>
+          </span>
+          <span className="text-gray-400">
+            rate <span className={`${
+              entryFreshnessSeverity === 'CRITICAL'
+                ? 'text-rose-300'
+                : entryFreshnessSeverity === 'WARN'
+                  ? 'text-amber-300'
+                  : 'text-emerald-300'
+            }`}>{entryFreshnessRatePct.toFixed(2)}%</span>
+            {' '}({strategyFreshness?.total ?? 0}/{freshnessDenominator || 0})
+          </span>
+          <span className="text-gray-500">
+            miss {missingTelemetryCount} | src {staleSourceCount} | gate {staleGateCount}
+          </span>
+          <span className="text-gray-400">
+            Silent Catches <span className={silentCatchTotal > 25 ? 'text-rose-300' : silentCatchTotal > 5 ? 'text-amber-300' : 'text-emerald-300'}>{silentCatchTotal}</span>
+          </span>
+          {silentCatchRows[0] && (
+            <span className="text-gray-500 truncate max-w-[480px]" title={`${silentCatchRows[0].scope} | ${silentCatchRows[0].last_message}`}>
+              top {silentCatchRows[0].scope} x{silentCatchRows[0].count}
+            </span>
+          )}
+          {latestEntryFreshnessAlert && (
+            <span className="text-gray-500 truncate max-w-[520px]" title={latestEntryFreshnessAlert.reason}>
+              last {latestEntryFreshnessAlert.category} {formatAgeMs(latestEntryFreshnessAlert.timestamp, nowMs)}
+            </span>
+          )}
+        </div>
 
         <EngineTuningPanel
           open={tuningOpen}
