@@ -1266,8 +1266,11 @@ async function persistStrategyExecutionHistoryEntry(
     }
     const key = strategyExecutionHistoryRedisKey(strategyId);
     const serialized = JSON.stringify(payload);
-    await redisClient.rPush(key, serialized);
-    await redisClient.lTrim(key, -STRATEGY_EXECUTION_HISTORY_LIMIT, -1);
+    await redisClient
+        .multi()
+        .rPush(key, serialized)
+        .lTrim(key, -STRATEGY_EXECUTION_HISTORY_LIMIT, -1)
+        .exec();
 }
 
 async function loadStrategyExecutionHistoryFromRedis(): Promise<void> {
