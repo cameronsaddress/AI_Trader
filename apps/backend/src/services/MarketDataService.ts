@@ -25,6 +25,10 @@ export class MarketDataService extends EventEmitter {
         this.hlClient.connect();
     }
 
+    public async stop() {
+        this.hlClient.disconnect();
+    }
+
     private setupListeners() {
         this.hlClient.on('open', () => {
             logger.info('Connected to Hyperliquid WebSocket');

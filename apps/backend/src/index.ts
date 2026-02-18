@@ -6341,6 +6341,9 @@ const shutdown = async (signal: string) => {
     for (const strategyId of [...riskGuardBootResumeTimers.keys()]) {
         clearRiskGuardBootResumeTimer(strategyId);
     }
+    await marketDataService.stop().catch((error) => {
+        recordSilentCatch('Shutdown.MarketDataStop', error, { signal });
+    });
 
     await new Promise<void>((resolve) => {
         httpServer.close(() => resolve());

@@ -80,17 +80,21 @@ function extractBestPx(levels: unknown, sideIndex: number): number | null {
 export class HyperliquidClient extends EventEmitter {
     private ws: WebSocket | null = null;
     private pingInterval: NodeJS.Timeout | null = null;
+    private reconnectTimer: NodeJS.Timeout | null = null;
     private subscriptions: Set<string> = new Set();
     private connected: boolean = false;
+    private manualDisconnect: boolean = false;
 
     constructor() {
         super();
     }
 
     public connect() {
+        this.manualDisconnect = false;
         if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
             return;
         }
+        this.clearReconnectTimer();
 
         logger.info('[Hyperliquid] Connecting to WebSocket...');
         this.ws = new WebSocket(HYPERLIQUID_WS_URL);
@@ -113,10 +117,19 @@ export class HyperliquidClient extends EventEmitter {
         });
 
         this.ws.on('close', () => {
-            logger.warn('[Hyperliquid] WebSocket closed, reconnecting...');
             this.connected = false;
+            this.ws = null;
             this.stopPing();
-            setTimeout(() => this.connect(), 5000);
+            if (this.manualDisconnect) {
+                logger.info('[Hyperliquid] WebSocket closed by manual disconnect');
+                return;
+            }
+            logger.warn('[Hyperliquid] WebSocket closed, reconnecting...');
+            this.clearReconnectTimer();
+            this.reconnectTimer = setTimeout(() => {
+                this.reconnectTimer = null;
+                this.connect();
+            }, 5000);
         });
 
         this.ws.on('error', (err) => {
@@ -138,6 +151,24 @@ export class HyperliquidClient extends EventEmitter {
             clearInterval(this.pingInterval);
             this.pingInterval = null;
         }
+    }
+
+    private clearReconnectTimer() {
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+    }
+
+    public disconnect() {
+        this.manualDisconnect = true;
+        this.connected = false;
+        this.stopPing();
+        this.clearReconnectTimer();
+        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+            this.ws.close();
+        }
+        this.ws = null;
     }
 
     public subscribe(symbols: string[]) {
