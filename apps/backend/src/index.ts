@@ -179,6 +179,10 @@ const STRATEGY_EXECUTION_HISTORY_LIMIT = Math.max(
     100,
     Number(process.env.STRATEGY_EXECUTION_HISTORY_LIMIT || '500'),
 );
+const STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX = (
+    process.env.STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX
+    || 'system:strategy_execution_history:v1:'
+).trim() || 'system:strategy_execution_history:v1:';
 
 const strategyStatus: Record<string, boolean> = Object.fromEntries(STRATEGY_IDS.map((id) => [id, true]));
 
@@ -1241,6 +1245,90 @@ function ensureExecutionId(payload: unknown): string {
     return id;
 }
 
+function strategyExecutionHistoryRedisKey(strategyId: string): string {
+    return `${STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX}${strategyId.trim().toUpperCase()}`;
+}
+
+function strategyIdFromExecutionHistoryRedisKey(key: string): string | null {
+    if (!key.startsWith(STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX)) {
+        return null;
+    }
+    const suffix = key.slice(STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX.length).trim().toUpperCase();
+    return suffix.length > 0 ? suffix : null;
+}
+
+async function persistStrategyExecutionHistoryEntry(
+    strategyId: string,
+    payload: Record<string, unknown>,
+): Promise<void> {
+    if (!redisClient.isOpen) {
+        return;
+    }
+    const key = strategyExecutionHistoryRedisKey(strategyId);
+    const serialized = JSON.stringify(payload);
+    await redisClient.rPush(key, serialized);
+    await redisClient.lTrim(key, -STRATEGY_EXECUTION_HISTORY_LIMIT, -1);
+}
+
+async function loadStrategyExecutionHistoryFromRedis(): Promise<void> {
+    if (!redisClient.isOpen) {
+        return;
+    }
+    const keys = new Set<string>(STRATEGY_IDS.map((strategyId) => strategyExecutionHistoryRedisKey(strategyId)));
+    try {
+        const pattern = `${STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX}*`;
+        for await (const redisKey of redisClient.scanIterator({ MATCH: pattern, COUNT: 200 })) {
+            if (typeof redisKey === 'string' && redisKey.startsWith(STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX)) {
+                keys.add(redisKey);
+            }
+        }
+    } catch (error) {
+        recordSilentCatch('StrategyExecutionHistory.RestoreScan', error, {
+            prefix: STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX,
+        });
+    }
+
+    for (const redisKey of keys) {
+        try {
+            const strategy = strategyIdFromExecutionHistoryRedisKey(redisKey);
+            if (!strategy) {
+                continue;
+            }
+            const rows = await redisClient.lRange(redisKey, -STRATEGY_EXECUTION_HISTORY_LIMIT, -1);
+            if (!rows.length) {
+                continue;
+            }
+            const normalizedRows: Record<string, unknown>[] = [];
+            for (const row of rows) {
+                try {
+                    const parsed = JSON.parse(row);
+                    const record = asRecord(parsed);
+                    if (!record) {
+                        continue;
+                    }
+                    normalizedRows.push({
+                        ...record,
+                        strategy,
+                        timestamp: asNumber(record.timestamp) ?? Date.now(),
+                    });
+                } catch (error) {
+                    recordSilentCatch('StrategyExecutionHistory.RestoreParse', error, {
+                        strategy,
+                        preview: row.slice(0, 180),
+                    });
+                }
+            }
+            if (normalizedRows.length > 0) {
+                strategyExecutionHistory.set(strategy, normalizedRows);
+            }
+        } catch (error) {
+            recordSilentCatch('StrategyExecutionHistory.RestoreLoad', error, {
+                key: redisKey,
+            });
+        }
+    }
+}
+
 function pushStrategyExecutionHistory(strategyId: string, payload: Record<string, unknown>): void {
     const key = strategyId.trim().toUpperCase();
     if (!key) {
@@ -1257,10 +1345,41 @@ function pushStrategyExecutionHistory(strategyId: string, payload: Record<string
         existing.splice(0, existing.length - STRATEGY_EXECUTION_HISTORY_LIMIT);
     }
     strategyExecutionHistory.set(key, existing);
+    fireAndForget(
+        'StrategyExecutionHistory.Persist',
+        persistStrategyExecutionHistoryEntry(key, normalized),
+        { strategy: key },
+    );
 }
 
-function clearStrategyExecutionHistory(): void {
+async function clearStrategyExecutionHistory(): Promise<void> {
     strategyExecutionHistory.clear();
+    if (!redisClient.isOpen) {
+        return;
+    }
+    const keys = new Set<string>(STRATEGY_IDS.map((strategyId) => strategyExecutionHistoryRedisKey(strategyId)));
+    try {
+        const pattern = `${STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX}*`;
+        for await (const redisKey of redisClient.scanIterator({ MATCH: pattern, COUNT: 200 })) {
+            if (typeof redisKey === 'string' && redisKey.startsWith(STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX)) {
+                keys.add(redisKey);
+            }
+        }
+    } catch (error) {
+        recordSilentCatch('StrategyExecutionHistory.ClearScan', error, {
+            prefix: STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX,
+        });
+    }
+    if (keys.size === 0) {
+        return;
+    }
+    try {
+        await redisClient.del(Array.from(keys));
+    } catch (error) {
+        recordSilentCatch('StrategyExecutionHistory.ClearDelete', error, {
+            keys: keys.size,
+        });
+    }
 }
 
 function pruneExecutionTraces(now = Date.now()): void {
@@ -4414,7 +4533,7 @@ async function resetSimulationState(
     clearStrategyPerformance();
     clearStrategyCostDiagnostics();
     clearStrategyTradeSamples();
-    clearStrategyExecutionHistory();
+    await clearStrategyExecutionHistory();
     clearDataIntegrityState();
     clearGovernanceState();
     clearFeatureRegistry();
@@ -5993,6 +6112,7 @@ async function bootstrap() {
         await resetSimulationState(DEFAULT_SIM_BANKROLL, { forceDefaults: true });
     } else {
         await getSimulationLedgerSnapshot();
+        await loadStrategyExecutionHistoryFromRedis();
     }
     await loadStrategyMetrics();
     await reconcileSimulationLedgerWithStrategyMetrics();

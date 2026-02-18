@@ -411,15 +411,16 @@ impl Strategy for CexArbStrategy {
                             continue;
                         }
 
-                        let reference_price = cb_history
+                        let reference_snapshot = cb_history
                             .iter()
                             .find(|(ts, _)| now_ms - *ts >= MOMENTUM_LOOKBACK_MS)
-                            .map(|(_, p)| *p);
+                            .copied();
 
-                        let Some(reference_price) = reference_price else {
+                        let Some((reference_ts_ms, reference_price)) = reference_snapshot else {
                             publish_heartbeat(&mut conn, "cex_arb").await;
                             continue;
                         };
+                        let momentum_reference_age_ms = now_ms.saturating_sub(reference_ts_ms);
 
                         let momentum = if reference_price > 0.0 {
                             (cb_price - reference_price) / reference_price
@@ -487,6 +488,8 @@ impl Strategy for CexArbStrategy {
                                 regime_label
                             )
                         };
+                        let coinbase_age_ms = now_ms.saturating_sub(cb_ts_ms);
+                        let poly_book_age_ms = now_ms.saturating_sub(book.last_update_ms);
 
                         let scan_msg = build_scan_payload(
                             &target_market.market_id,
@@ -517,6 +520,9 @@ impl Strategy for CexArbStrategy {
                                     "sl_multiplier": sl_mult,
                                     "required_momentum": required_momentum,
                                     "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
+                                    "coinbase_age_ms": coinbase_age_ms,
+                                    "poly_book_age_ms": poly_book_age_ms,
+                                    "momentum_reference_age_ms": momentum_reference_age_ms,
                                 }),
                         );
                         publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
@@ -574,6 +580,9 @@ impl Strategy for CexArbStrategy {
                                                 "regime_parkinson_vol": regime_parkinson_vol,
                                                 "regime_size_multiplier": regime_size_multiplier,
                                                 "coinbase_price": cb_price,
+                                                "coinbase_age_ms": coinbase_age_ms,
+                                                "poly_book_age_ms": poly_book_age_ms,
+                                                "momentum_reference_age_ms": momentum_reference_age_ms,
                                                 "time_to_expiry_ms": time_to_expiry_ms,
                                                 "yes_spread": yes_spread,
                                                 "no_spread": no_spread,
@@ -814,6 +823,9 @@ impl Strategy for CexArbStrategy {
                                     "required_momentum": required_momentum,
                                     "regime": regime_label,
                                     "regime_size_multiplier": regime_size_multiplier,
+                                    "coinbase_age_ms": coinbase_age_ms,
+                                    "poly_book_age_ms": poly_book_age_ms,
+                                    "momentum_reference_age_ms": momentum_reference_age_ms,
                                     "position_id": pos.id,
                                 }
                             });

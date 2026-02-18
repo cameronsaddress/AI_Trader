@@ -445,7 +445,7 @@ impl Strategy for ConvergenceCarryStrategy {
                         }
                         open_positions = keep_positions;
 
-                        let mut best_candidate: Option<(&MarketTarget, Side, f64, f64, f64, f64, i64)> = None;
+                        let mut best_candidate: Option<(&MarketTarget, Side, f64, f64, f64, f64, i64, i64)> = None;
                         for market in market_by_id.values() {
                             let Some(book) = books.get(&market.market_id) else {
                                 continue;
@@ -453,6 +453,7 @@ impl Strategy for ConvergenceCarryStrategy {
                             if !book.yes.is_valid() || !book.no.is_valid() || now_ms - book.last_update_ms > BOOK_STALE_MS {
                                 continue;
                             }
+                            let book_age_ms = now_ms.saturating_sub(book.last_update_ms);
                             let expiry_ts = market.expiry_ts.unwrap_or(i64::MAX);
                             let time_to_expiry = expiry_ts.saturating_sub(now_ts);
                             if time_to_expiry <= MIN_TIME_TO_EXPIRY_SECS || time_to_expiry > MAX_TIME_TO_EXPIRY_SECS {
@@ -484,7 +485,7 @@ impl Strategy for ConvergenceCarryStrategy {
                             }
 
                             match best_candidate {
-                                Some((_, _, current_edge, _, _, _, _)) if edge <= current_edge => {}
+                                Some((_, _, current_edge, _, _, _, _, _)) if edge <= current_edge => {}
                                 _ => {
                                     best_candidate = Some((
                                         market,
@@ -494,12 +495,13 @@ impl Strategy for ConvergenceCarryStrategy {
                                         entry_price,
                                         spread,
                                         time_to_expiry,
+                                        book_age_ms,
                                     ));
                                 }
                             }
                         }
 
-                        let Some((market, side, edge, threshold, entry_price, spread, time_to_expiry)) = best_candidate else {
+                        let Some((market, side, edge, threshold, entry_price, spread, time_to_expiry, book_age_ms)) = best_candidate else {
                             publish_heartbeat(&mut conn, "convergence_carry").await;
                             continue;
                         };
@@ -542,6 +544,7 @@ impl Strategy for ConvergenceCarryStrategy {
                                 "entry_price": entry_price,
                                 "spread": spread,
                                 "time_to_expiry_secs": time_to_expiry,
+                                "book_age_ms": book_age_ms,
                                 "open_positions": open_positions.len(),
                             }),
                         );
@@ -592,6 +595,7 @@ impl Strategy for ConvergenceCarryStrategy {
                                             "token_side": Self::side_label(side),
                                             "parity_edge": edge,
                                             "threshold": threshold,
+                                            "book_age_ms": book_age_ms,
                                             "preflight": {
                                                 "venue": "POLYMARKET",
                                                 "strategy": "CONVERGENCE_CARRY",
@@ -654,6 +658,7 @@ impl Strategy for ConvergenceCarryStrategy {
                                     "parity_edge": edge,
                                     "threshold": threshold,
                                     "spread": spread,
+                                    "book_age_ms": book_age_ms,
                                 }
                             });
                             publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;

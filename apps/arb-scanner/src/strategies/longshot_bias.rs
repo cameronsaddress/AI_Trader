@@ -369,13 +369,14 @@ impl Strategy for LongshotBiasStrategy {
                         let threshold = min_net_edge();
                         let fee_rate = fee_curve_rate();
 
-                        struct Opp { mid: String, fade: &'static str, entry: &'static str, ep: f64, lp: f64, bias: f64, ne: f64, exp: i64 }
+                        struct Opp { mid: String, fade: &'static str, entry: &'static str, ep: f64, lp: f64, bias: f64, ne: f64, exp: i64, book_age_ms: i64 }
                         let mut best: Option<Opp> = None;
 
                         for (mid, market) in &market_by_id {
                             if positions.iter().any(|p| p.market_id == *mid) { continue; }
                             let book = match books.get(mid) { Some(b) => b, None => continue };
                             if now_ms - book.last_update_ms > BOOK_STALE_MS { continue; }
+                            let book_age_ms = now_ms.saturating_sub(book.last_update_ms);
                             let ym = book.yes.mid(); let nm = book.no.mid();
                             if ym <= 0.0 || nm <= 0.0 { continue; }
                             if (ym + nm - 1.0).abs() > MAX_PARITY_DEVIATION { continue; }
@@ -388,7 +389,7 @@ impl Strategy for LongshotBiasStrategy {
                                 if opp_ask > 0.0 && opp_ask <= 0.98 {
                                     let ne = bias - polymarket_taker_fee(opp_ask, fee_rate) - cost_model.slippage_bps_per_side / 10_000.0;
                                     if ne >= threshold && best.as_ref().is_none_or(|current| ne > current.ne) {
-                                        best = Some(Opp { mid: mid.clone(), fade: "YES", entry: "NO", ep: opp_ask, lp: ym, bias, ne, exp });
+                                        best = Some(Opp { mid: mid.clone(), fade: "YES", entry: "NO", ep: opp_ask, lp: ym, bias, ne, exp, book_age_ms });
                                     }
                                 }
                             }
@@ -399,7 +400,7 @@ impl Strategy for LongshotBiasStrategy {
                                 if opp_ask > 0.0 && opp_ask <= 0.98 {
                                     let ne = bias - polymarket_taker_fee(opp_ask, fee_rate) - cost_model.slippage_bps_per_side / 10_000.0;
                                     if ne >= threshold && best.as_ref().is_none_or(|current| ne > current.ne) {
-                                        best = Some(Opp { mid: mid.clone(), fade: "NO", entry: "YES", ep: opp_ask, lp: nm, bias, ne, exp });
+                                        best = Some(Opp { mid: mid.clone(), fade: "NO", entry: "YES", ep: opp_ask, lp: nm, bias, ne, exp, book_age_ms });
                                     }
                                 }
                             }
@@ -456,6 +457,7 @@ impl Strategy for LongshotBiasStrategy {
                                             "longshot_price": opp.lp,
                                             "bias_edge_pct": opp.bias*100.0,
                                             "net_edge_pct": opp.ne*100.0,
+                                            "book_age_ms": opp.book_age_ms,
                                             "variant": variant,
                                             "preflight": {
                                                 "venue": "POLYMARKET",
@@ -505,6 +507,7 @@ impl Strategy for LongshotBiasStrategy {
                                             "longshot_price": opp.lp,
                                             "bias_edge_pct": opp.bias*100.0,
                                             "net_edge_pct": opp.ne*100.0,
+                                            "book_age_ms": opp.book_age_ms,
                                             "variant": variant,
                                         }
                                     });

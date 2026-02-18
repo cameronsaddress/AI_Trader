@@ -243,6 +243,7 @@ impl Strategy for AtomicArbStrategy {
                         }
 
                         let ask_sum = book.yes.best_ask + book.no.best_ask;
+                        let book_age_ms = now_ms.saturating_sub(book.last_update_ms);
                         let gross_edge = Self::gross_pair_edge(ask_sum);
                         let static_net_edge = pair_net_edge_after_cost(gross_edge, cost_model);
                         let yes_fee = polymarket_taker_fee(book.yes.best_ask, fee_curve_rate());
@@ -294,6 +295,7 @@ impl Strategy for AtomicArbStrategy {
                                 "buffer_used": gross_edge - net_edge,
                                 "dynamic_cost_rate": total_dynamic_cost,
                                 "seconds_to_expiry": seconds_to_expiry,
+                                "book_age_ms": book_age_ms,
                             }),
                         );
                         publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
@@ -348,6 +350,7 @@ impl Strategy for AtomicArbStrategy {
                                             "net_edge": net_edge,
                                             "threshold": min_net_edge(),
                                             "shares": shares,
+                                            "book_age_ms": book_age_ms,
                                             "yes_notional": yes_notional,
                                             "no_notional": no_notional,
                                             "expected_pnl": expected_pnl,
@@ -438,6 +441,7 @@ impl Strategy for AtomicArbStrategy {
                                     "gross_edge": gross_edge,
                                     "net_edge": net_edge,
                                     "expected_profit": expected_profit,
+                                    "book_age_ms": book_age_ms,
                                     "settlement_status": "PENDING_EXPIRY",
                                 }
                             });

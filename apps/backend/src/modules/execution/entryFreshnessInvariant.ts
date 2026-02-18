@@ -121,6 +121,17 @@ export function evaluateEntryFreshnessInvariant(
         };
     }
 
+    if (ageFields.length === 0) {
+        return {
+            applicable: true,
+            ok: false,
+            reason: 'missing entry freshness telemetry (*_age_ms fields)',
+            checked_fields: [],
+            max_observed_age_ms: null,
+            side,
+        };
+    }
+
     if (!gate.ok && isStaleGateReason(gate.reason)) {
         return {
             applicable: true,
@@ -141,4 +152,3 @@ export function evaluateEntryFreshnessInvariant(
         side,
     };
 }
-

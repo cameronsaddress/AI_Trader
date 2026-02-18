@@ -571,6 +571,8 @@ impl Strategy for ObiScalperStrategy {
                             publish_heartbeat(&mut conn, "obi_scalper").await;
                             continue;
                         }
+                        let coinbase_book_age_ms = now_ms.saturating_sub(book_last_update_ms);
+                        let poly_book_age_ms = now_ms.saturating_sub(poly_book.last_update_ms);
 
                         let yes_bid = poly_book.yes.best_bid;
                         let yes_ask = poly_book.yes.best_ask;
@@ -677,6 +679,8 @@ impl Strategy for ObiScalperStrategy {
                                 "poly_no_ask": no_ask,
                                 "poly_entry_spread_bps": poly_entry_spread_bps,
                                 "max_entry_spread_bps": MAX_ENTRY_SPREAD_BPS,
+                                "coinbase_book_age_ms": coinbase_book_age_ms,
+                                "poly_book_age_ms": poly_book_age_ms,
                             }),
                         );
                         publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
@@ -734,6 +738,8 @@ impl Strategy for ObiScalperStrategy {
                                             "coinbase_mid": mid_price,
                                             "token_side": token_side,
                                             "entry_price": entry_price,
+                                            "coinbase_book_age_ms": coinbase_book_age_ms,
+                                            "poly_book_age_ms": poly_book_age_ms,
                                             "preflight": {
                                                 "venue": "POLYMARKET",
                                                 "strategy": "OBI_SCALPER",
@@ -927,6 +933,8 @@ impl Strategy for ObiScalperStrategy {
                                     "adaptive_threshold": adaptive_threshold,
                                     "pass_streak": pass_streak,
                                     "token_side": token_side,
+                                    "coinbase_book_age_ms": coinbase_book_age_ms,
+                                    "poly_book_age_ms": poly_book_age_ms,
                                     "type": "ORDER_BOOK_IMBALANCE"
                                 }
                             });

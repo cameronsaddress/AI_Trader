@@ -611,6 +611,8 @@ impl Strategy for MarketNeutralStrategy {
                             publish_heartbeat(&mut conn, &heartbeat_id).await;
                             continue;
                         }
+                        let spot_age_ms = now_ms.saturating_sub(spot_ts_ms);
+                        let book_age_ms = now_ms.saturating_sub(book.last_update_ms);
 
                         // Safety guard: never carry a position across market rollovers.
                         let rollover_position = {
@@ -839,6 +841,8 @@ impl Strategy for MarketNeutralStrategy {
                             now_ms,
                             serde_json::json!({
                                 "spot": spot,
+                                "spot_age_ms": spot_age_ms,
+                                "book_age_ms": book_age_ms,
                                 "window_start_spot": window_start_spot,
                                 "tte_years": tte_years,
                                 "sigma_annualized": sigma,
@@ -895,6 +899,8 @@ impl Strategy for MarketNeutralStrategy {
                                             "adaptive_entry_edge": adaptive_entry_edge,
                                             "required_edge": required_edge,
                                             "spot": spot,
+                                            "spot_age_ms": spot_age_ms,
+                                            "book_age_ms": book_age_ms,
                                             "sigma_annualized": sigma,
                                             "yes_spread": yes_spread,
                                             "parity_deviation": parity_deviation,
@@ -1094,6 +1100,8 @@ impl Strategy for MarketNeutralStrategy {
                                         "edge": edge,
                                         "adaptive_entry_edge": adaptive_entry_edge,
                                         "spot": spot,
+                                        "spot_age_ms": spot_age_ms,
+                                        "book_age_ms": book_age_ms,
                                         "sigma_annualized": sigma,
                                         "parity_deviation": parity_deviation,
                                         "edge_to_spread_ratio": edge_to_spread_ratio,

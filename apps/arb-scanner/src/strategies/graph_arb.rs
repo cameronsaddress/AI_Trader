@@ -330,7 +330,7 @@ impl Strategy for GraphArbStrategy {
                             continue;
                         }
 
-                        let mut best_candidate: Option<(&MarketTarget, f64, f64, f64, f64, i64, f64, f64)> = None;
+                        let mut best_candidate: Option<(&MarketTarget, f64, f64, f64, f64, i64, f64, f64, i64)> = None;
                         for market in market_by_id.values() {
                             let Some(book) = books.get(&market.market_id) else {
                                 continue;
@@ -338,6 +338,7 @@ impl Strategy for GraphArbStrategy {
                             if !book.yes.is_valid() || !book.no.is_valid() || now_ms - book.last_update_ms > BOOK_STALE_MS {
                                 continue;
                             }
+                            let book_age_ms = now_ms.saturating_sub(book.last_update_ms);
                             if book.yes.best_ask < MIN_LEG_PRICE
                                 || book.yes.best_ask > MAX_LEG_PRICE
                                 || book.no.best_ask < MIN_LEG_PRICE
@@ -367,7 +368,7 @@ impl Strategy for GraphArbStrategy {
                             }
 
                             match best_candidate {
-                                Some((_, current_edge, _, _, _, _, _, _)) if net_edge <= current_edge => {}
+                                Some((_, current_edge, _, _, _, _, _, _, _)) if net_edge <= current_edge => {}
                                 _ => {
                                     best_candidate = Some((
                                         market,
@@ -378,12 +379,13 @@ impl Strategy for GraphArbStrategy {
                                         seconds_to_expiry,
                                         book.yes.best_ask,
                                         book.no.best_ask,
+                                        book_age_ms,
                                     ));
                                 }
                             }
                         }
 
-                        let Some((market, net_edge, ask_sum, gross_edge, required_edge, seconds_to_expiry, yes_ask, no_ask)) = best_candidate else {
+                        let Some((market, net_edge, ask_sum, gross_edge, required_edge, seconds_to_expiry, yes_ask, no_ask, book_age_ms)) = best_candidate else {
                             publish_heartbeat(&mut conn, "graph_arb").await;
                             continue;
                         };
@@ -426,6 +428,7 @@ impl Strategy for GraphArbStrategy {
                                 "net_edge": net_edge,
                                 "required_edge": required_edge,
                                 "seconds_to_expiry": seconds_to_expiry,
+                                "book_age_ms": book_age_ms,
                                 "dynamic_cost_rate": polymarket_taker_fee(yes_ask, fee_curve_rate()) + polymarket_taker_fee(no_ask, fee_curve_rate()) + 2.0 * (cost_model.slippage_bps_per_side / 10_000.0),
                                 "active_pending_settlements": pending_settlements.len(),
                             }),
@@ -474,6 +477,7 @@ impl Strategy for GraphArbStrategy {
                                             "net_edge": net_edge,
                                             "required_edge": required_edge,
                                             "seconds_to_expiry": seconds_to_expiry,
+                                            "book_age_ms": book_age_ms,
                                             "preflight": {
                                                 "venue": "POLYMARKET",
                                                 "strategy": "GRAPH_ARB",
@@ -546,6 +550,7 @@ impl Strategy for GraphArbStrategy {
                                         "net_edge": net_edge,
                                         "required_edge": required_edge,
                                         "seconds_to_expiry": seconds_to_expiry,
+                                        "book_age_ms": book_age_ms,
                                     }
                                 });
                                 publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;

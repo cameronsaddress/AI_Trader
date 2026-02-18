@@ -466,6 +466,10 @@ impl Strategy for SyndicateStrategy {
                 if trades.len() < 3 {
                     continue;
                 }
+                let latest_trade_ts = trades.iter().map(|trade| trade.timestamp).max().unwrap_or(now);
+                let earliest_trade_ts = trades.iter().map(|trade| trade.timestamp).min().unwrap_or(latest_trade_ts);
+                let latest_trade_age_ms = now.saturating_sub(latest_trade_ts).saturating_mul(1000);
+                let cluster_start_age_ms = now.saturating_sub(earliest_trade_ts).saturating_mul(1000);
 
                 let mut buyer_wallets = HashSet::new();
                 let mut wallet_volume: HashMap<Address, f64> = HashMap::new();
@@ -689,6 +693,8 @@ impl Strategy for SyndicateStrategy {
                         "cluster_confidence": cluster_confidence,
                         "confidence_size_scalar": confidence_size_scalar,
                         "max_wallet_share": max_wallet_share,
+                        "latest_trade_age_ms": latest_trade_age_ms,
+                        "cluster_start_age_ms": cluster_start_age_ms,
                     }),
                 );
                 publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
@@ -714,6 +720,8 @@ impl Strategy for SyndicateStrategy {
                             "flow_acceleration": flow_acceleration,
                             "cluster_confidence": cluster_confidence,
                             "max_wallet_share": max_wallet_share,
+                            "latest_trade_age_ms": latest_trade_age_ms,
+                            "cluster_start_age_ms": cluster_start_age_ms,
                             "preflight": {
                                 "venue": "POLYMARKET",
                                 "strategy": "SYNDICATE",
@@ -786,6 +794,8 @@ impl Strategy for SyndicateStrategy {
                         "flow_acceleration": flow_acceleration,
                         "cluster_confidence": cluster_confidence,
                         "max_wallet_share": max_wallet_share,
+                        "latest_trade_age_ms": latest_trade_age_ms,
+                        "cluster_start_age_ms": cluster_start_age_ms,
                     }
                 });
                 publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;

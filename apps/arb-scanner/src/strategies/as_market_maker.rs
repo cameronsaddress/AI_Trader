@@ -327,7 +327,7 @@ impl Strategy for AsMarketMakerStrategy {
 
                         // ── Scan all markets ──
                         let can_enter = positions.len() < MAX_OPEN_POSITIONS && (now_ms - last_entry_ts) > ENTRY_COOLDOWN_MS;
-                        let mut best: Option<(String, Side, f64, f64, f64, f64, f64, f64)> = None;
+                        let mut best: Option<(String, Side, f64, f64, f64, f64, f64, f64, i64)> = None;
 
                         for (mid, market) in &market_by_id {
                             let book = match books.get(mid) { Some(b) => b, None => continue };
@@ -359,6 +359,7 @@ impl Strategy for AsMarketMakerStrategy {
                             let ya = book.yes.best_ask; let na = book.no.best_ask;
                             let ys = (book.yes.best_ask - book.yes.best_bid).max(0.0);
                             let ns = (book.no.best_ask - book.no.best_bid).max(0.0);
+                            let book_age_ms = now_ms.saturating_sub(book.last_update_ms);
 
                             // YES opportunity
                             if (MIN_ENTRY_PRICE..=MAX_ENTRY_PRICE).contains(&ya) && ys <= MAX_SPREAD {
@@ -370,7 +371,7 @@ impl Strategy for AsMarketMakerStrategy {
                                 ) + (cost_model.slippage_bps_per_side / 10_000.0);
                                 let ne = e - maker_entry_cost - taker_exit_cost;
                                 if ne > min_edge && best.as_ref().is_none_or(|current| ne > current.2) {
-                                    best = Some((mid.clone(), Side::Yes, ne, ya, r_yes, hs, sigma, tte));
+                                    best = Some((mid.clone(), Side::Yes, ne, ya, r_yes, hs, sigma, tte, book_age_ms));
                                 }
                             }
                             // NO opportunity
@@ -383,7 +384,7 @@ impl Strategy for AsMarketMakerStrategy {
                                 ) + (cost_model.slippage_bps_per_side / 10_000.0);
                                 let ne = e - maker_entry_cost - taker_exit_cost;
                                 if ne > min_edge && best.as_ref().is_none_or(|current| ne > current.2) {
-                                    best = Some((mid.clone(), Side::No, ne, na, r_no, hs, sigma, tte));
+                                    best = Some((mid.clone(), Side::No, ne, na, r_no, hs, sigma, tte, book_age_ms));
                                 }
                             }
 
@@ -407,7 +408,7 @@ impl Strategy for AsMarketMakerStrategy {
 
                         // ── Execute best entry ──
                         if can_enter {
-                            if let Some((mid, side, ne, ep, res, hs, sigma, tte)) = best {
+                            if let Some((mid, side, ne, ep, res, hs, sigma, tte, book_age_ms)) = best {
                                 // Skip if already positioned in this market
                                 let already_in = positions.iter().any(|p| p.market_id == mid);
                                 if already_in { continue; }
@@ -439,6 +440,7 @@ impl Strategy for AsMarketMakerStrategy {
                                             "half_spread": hs,
                                             "sigma": sigma,
                                             "tte_years": tte,
+                                            "book_age_ms": book_age_ms,
                                             "variant": variant,
                                             "preflight": {
                                                 "venue": "POLYMARKET",
@@ -485,6 +487,7 @@ impl Strategy for AsMarketMakerStrategy {
                                             "half_spread": hs,
                                             "sigma": sigma,
                                             "tte_years": tte,
+                                            "book_age_ms": book_age_ms,
                                             "variant": variant,
                                         }
                                     });

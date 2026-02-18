@@ -25,7 +25,7 @@ describe('evaluateEntryFreshnessInvariant', () => {
 
     it('fails when intelligence gate rejects entry due to staleness', () => {
         const result = evaluateEntryFreshnessInvariant(
-            { side: 'ENTRY' },
+            { side: 'ENTRY', details: { spot_age_ms: 900 } },
             { ok: false, reason: 'Scan stale for BTC_5M' },
             3_000,
         );
@@ -34,9 +34,20 @@ describe('evaluateEntryFreshnessInvariant', () => {
         expect(result.reason).toContain('freshness gate rejected entry');
     });
 
-    it('passes entry without explicit age fields when gate is healthy', () => {
+    it('fails entry without explicit age fields when gate is healthy', () => {
         const result = evaluateEntryFreshnessInvariant(
             { side: 'ENTRY', details: { expected_profit: 1.2 } },
+            { ok: true },
+            3_000,
+        );
+        expect(result.applicable).toBe(true);
+        expect(result.ok).toBe(false);
+        expect(result.reason).toContain('missing entry freshness telemetry');
+    });
+
+    it('passes entry when at least one age field is fresh', () => {
+        const result = evaluateEntryFreshnessInvariant(
+            { side: 'ENTRY_SHORT', details: { book_age_ms: 1_250, expected_profit: 1.2 } },
             { ok: true },
             3_000,
         );
@@ -44,4 +55,3 @@ describe('evaluateEntryFreshnessInvariant', () => {
         expect(result.ok).toBe(true);
     });
 });
-

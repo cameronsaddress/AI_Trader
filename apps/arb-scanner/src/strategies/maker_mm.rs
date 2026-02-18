@@ -381,7 +381,7 @@ impl Strategy for MakerMmStrategy {
                         }
                         open_positions = keep_positions;
 
-                        let mut best_candidate: Option<(&MarketTarget, Side, f64, f64, f64, f64, i64)> = None;
+                        let mut best_candidate: Option<(&MarketTarget, Side, f64, f64, f64, f64, i64, i64)> = None;
                         let dynamic_slippage_rate = adaptive_slippage(
                             cost_model.slippage_bps_per_side,
                             Utc::now().hour(),
@@ -394,6 +394,7 @@ impl Strategy for MakerMmStrategy {
                             if !book.yes.is_valid() || !book.no.is_valid() || now_ms - book.last_update_ms > BOOK_STALE_MS {
                                 continue;
                             }
+                            let book_age_ms = now_ms.saturating_sub(book.last_update_ms);
 
                             let expiry_ts = market.expiry_ts.unwrap_or(i64::MAX);
                             let time_to_expiry = expiry_ts.saturating_sub(now_ts);
@@ -429,7 +430,7 @@ impl Strategy for MakerMmStrategy {
                             let threshold = min_expected_net_return();
 
                             match best_candidate {
-                                Some((_, _, current_expected, _, _, _, _)) if expected_net_return <= current_expected => {}
+                                Some((_, _, current_expected, _, _, _, _, _)) if expected_net_return <= current_expected => {}
                                 _ => {
                                     best_candidate = Some((
                                         market,
@@ -439,12 +440,13 @@ impl Strategy for MakerMmStrategy {
                                         bid,
                                         spread,
                                         time_to_expiry,
+                                        book_age_ms,
                                     ));
                                 }
                             }
                         }
 
-                        let Some((market, side, expected_net_return, threshold, entry_price, spread, time_to_expiry)) = best_candidate else {
+                        let Some((market, side, expected_net_return, threshold, entry_price, spread, time_to_expiry, book_age_ms)) = best_candidate else {
                             publish_heartbeat(&mut conn, "maker_mm").await;
                             continue;
                         };
@@ -537,6 +539,7 @@ impl Strategy for MakerMmStrategy {
                                             "token_side": Self::side_label(side),
                                             "expected_net_return": expected_net_return,
                                             "threshold": threshold,
+                                            "book_age_ms": book_age_ms,
                                             "maker_intent": true,
                                             "preflight": {
                                                 "venue": "POLYMARKET",
@@ -608,6 +611,7 @@ impl Strategy for MakerMmStrategy {
                                     "expected_net_return": expected_net_return,
                                     "threshold": threshold,
                                     "spread": spread,
+                                    "book_age_ms": book_age_ms,
                                     "fill_model": "MAKER_ENTRY",
                                 }
                             });
