@@ -4506,12 +4506,18 @@ async function applyDefaultStrategyStates(force = false): Promise<void> {
             // strategies carrying a Risk Guard pause marker (or legacy cooldown key).
             const currentVal = await redisClient.get(enabledKey);
             const now = Date.now();
+            let pauseUntil: number | null = null;
+            let legacyCooldownUntil: number | null = null;
+            if (currentVal === '0' && enabledByDefault) {
+                pauseUntil = asNumber(await redisClient.get(pauseUntilKey));
+                legacyCooldownUntil = asNumber(await redisClient.get(cooldownKey));
+            }
             const decision = decideBootResumeAction({
                 current_enabled: currentVal,
                 enabled_by_default: enabledByDefault,
                 now_ms: now,
-                pause_until_ms: asNumber(await redisClient.get(pauseUntilKey)),
-                legacy_cooldown_until_ms: asNumber(await redisClient.get(cooldownKey)),
+                pause_until_ms: pauseUntil,
+                legacy_cooldown_until_ms: legacyCooldownUntil,
             });
             if (decision.action === 'PRESERVE_MANUAL_DISABLE') {
                 logger.info(`[Boot] preserving manual disable for ${strategyId}`);
