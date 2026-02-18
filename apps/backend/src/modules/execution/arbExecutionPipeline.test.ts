@@ -205,17 +205,19 @@ describe('processArbitrageExecutionWorker', () => {
     });
 
     it('records preflight failures for replay analysis', async () => {
+        const executeSpy = jest.fn(async () => buildLiveExecution());
         const { deps, rejected } = createDeps({
             preflightFromExecution: async () => buildPreflight({
                 ok: false,
                 failed: 1,
                 error: 'signature failed',
             }),
-            executeFromExecution: async () => null,
+            executeFromExecution: executeSpy,
         });
 
         await processArbitrageExecutionWorker(buildContext(), deps);
 
+        expect(executeSpy).not.toHaveBeenCalled();
         expect(rejected.some((entry) => entry.stage === 'PREFLIGHT')).toBe(true);
     });
 

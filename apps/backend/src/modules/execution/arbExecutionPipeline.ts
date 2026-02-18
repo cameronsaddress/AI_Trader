@@ -472,6 +472,7 @@ export async function processArbitrageExecutionWorker(
             timestamp: preflight.timestamp,
             payload: asRecord(preflight),
         });
+        return;
     }
 
     let liveExecution: PolymarketLiveExecutionResult | null;
