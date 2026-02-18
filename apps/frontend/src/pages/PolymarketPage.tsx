@@ -76,6 +76,18 @@ type RuntimeStatusState = {
     timestamp: number;
 };
 
+type SilentCatchContextValue = string | number | boolean | null;
+
+type SilentCatchTelemetryEntryState = {
+    count: number;
+    first_seen: number;
+    last_seen: number;
+    last_message: string;
+    last_context: Record<string, SilentCatchContextValue>;
+};
+
+type SilentCatchTelemetryState = Record<string, SilentCatchTelemetryEntryState>;
+
 type StrategySignalState = {
     strategy: string;
     symbol: string;
@@ -688,6 +700,46 @@ function parseRuntimeStatus(input: unknown): RuntimeStatusState | null {
         modules,
         timestamp: parseNumber(payload.timestamp) ?? Date.now(),
     };
+}
+
+function parseSilentCatchContext(
+    input: unknown,
+): Record<string, SilentCatchContextValue> {
+    if (!input || typeof input !== 'object') {
+        return {};
+    }
+    const parsed: Record<string, SilentCatchContextValue> = {};
+    for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+        if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+            parsed[key] = value;
+            continue;
+        }
+        parsed[key] = String(value);
+    }
+    return parsed;
+}
+
+function parseSilentCatchTelemetry(
+    input: unknown,
+): SilentCatchTelemetryState {
+    if (!input || typeof input !== 'object') {
+        return {};
+    }
+    const parsed: SilentCatchTelemetryState = {};
+    for (const [scope, value] of Object.entries(input as Record<string, unknown>)) {
+        if (!value || typeof value !== 'object') {
+            continue;
+        }
+        const raw = value as Partial<SilentCatchTelemetryEntryState>;
+        parsed[scope] = {
+            count: parseNumber(raw.count) ?? 0,
+            first_seen: parseNumber(raw.first_seen) ?? 0,
+            last_seen: parseNumber(raw.last_seen) ?? 0,
+            last_message: typeof raw.last_message === 'string' ? raw.last_message : '',
+            last_context: parseSilentCatchContext(raw.last_context),
+        };
+    }
+    return parsed;
 }
 
 function parseQualityMap(input: unknown): Record<string, StrategyQualityEntry> {
@@ -1621,6 +1673,14 @@ function formatAgeMs(timestamp: number, now: number): string {
     return `${Math.max(0, now - timestamp)}ms`;
 }
 
+function formatSilentCatchContext(context: Record<string, SilentCatchContextValue>): string {
+    const entries = Object.entries(context).slice(0, 4);
+    if (entries.length === 0) {
+        return '';
+    }
+    return entries.map(([key, value]) => `${key}=${String(value)}`).join(' | ');
+}
+
 function toExecutionLog(input: unknown): ExecutionLog {
     if (!input || typeof input !== 'object') {
         return {
@@ -1828,6 +1888,7 @@ export const PolymarketPage: React.FC = () => {
         modules: [],
         timestamp: 0,
     });
+    const [silentCatchTelemetry, setSilentCatchTelemetry] = React.useState<SilentCatchTelemetryState>({});
     const [resetError, setResetError] = React.useState<string | null>(null);
     const [showResetConfirm, setShowResetConfirm] = React.useState(false);
     const [resetText, setResetText] = React.useState('');
@@ -1920,6 +1981,13 @@ export const PolymarketPage: React.FC = () => {
             modules: runtimeStatus.modules.filter((module) => module.phase === phase),
         }));
     }, [runtimeStatus.modules]);
+    const silentCatchRows = React.useMemo(
+        () => Object.entries(silentCatchTelemetry)
+            .map(([scope, entry]) => ({ scope, ...entry }))
+            .sort((a, b) => b.last_seen - a.last_seen)
+            .slice(0, 6),
+        [silentCatchTelemetry],
+    );
     const lowestPassRateRows = React.useMemo(
         () => Object.entries(strategyQuality)
             .filter(([, entry]) => entry.total_scans > 0)
@@ -2074,6 +2142,7 @@ export const PolymarketPage: React.FC = () => {
                     trading_mode?: TradingMode;
                     live_order_posting_enabled?: boolean;
                     build_runtime?: unknown;
+                    silent_catch_telemetry?: unknown;
                 };
 
                 const bankroll = parseNumber(data.bankroll);
@@ -2108,6 +2177,7 @@ export const PolymarketPage: React.FC = () => {
                 const parsedModelGateCalibration = parseModelGateCalibrationState(data.model_gate_calibration);
                 const parsedRejectedSignalsSummary = parseRejectedSignalSummary(data.rejected_signals);
                 const runtime = parseRuntimeStatus(data.build_runtime);
+                const parsedSilentCatchTelemetry = parseSilentCatchTelemetry(data.silent_catch_telemetry);
 
                 setStats((prev) => ({
                     ...prev,
@@ -2136,6 +2206,7 @@ export const PolymarketPage: React.FC = () => {
                 setModelDrift(parsedModelDrift);
                 setModelGateCalibration(parsedModelGateCalibration);
                 setRejectedSignalSummary(parsedRejectedSignalsSummary);
+                setSilentCatchTelemetry(parsedSilentCatchTelemetry);
                 if (runtime) {
                     setRuntimeStatus(runtime);
                 }
@@ -2376,6 +2447,29 @@ export const PolymarketPage: React.FC = () => {
             }
             setRuntimeStatus(parsed);
         };
+        const handleSilentCatchTelemetrySnapshot = (payload: unknown) => {
+            setSilentCatchTelemetry(parseSilentCatchTelemetry(payload));
+        };
+        const handleSilentCatchTelemetryUpdate = (payload: unknown) => {
+            if (!payload || typeof payload !== 'object') {
+                return;
+            }
+            const raw = payload as Record<string, unknown>;
+            const scope = typeof raw.scope === 'string' && raw.scope.trim().length > 0
+                ? raw.scope
+                : null;
+            if (!scope) {
+                return;
+            }
+            const parsed = parseSilentCatchTelemetry({ [scope]: raw });
+            if (!parsed[scope]) {
+                return;
+            }
+            setSilentCatchTelemetry((prev) => ({
+                ...prev,
+                [scope]: parsed[scope],
+            }));
+        };
         const handleDataIntegrityUpdate = (payload: unknown) => {
             if (!payload || typeof payload !== 'object') {
                 return;
@@ -2587,6 +2681,8 @@ export const PolymarketPage: React.FC = () => {
         socket.on('simulation_reset', handleSimulationReset);
         socket.on('simulation_reset_error', handleSimulationResetError);
         socket.on('runtime_status_update', handleRuntimeStatus);
+        socket.on('silent_catch_telemetry_snapshot', handleSilentCatchTelemetrySnapshot);
+        socket.on('silent_catch_telemetry_update', handleSilentCatchTelemetryUpdate);
 
         const requestAllState = () => {
             socket.emit('request_trading_mode');
@@ -2636,6 +2732,8 @@ export const PolymarketPage: React.FC = () => {
             socket.off('simulation_reset', handleSimulationReset);
             socket.off('simulation_reset_error', handleSimulationResetError);
             socket.off('runtime_status_update', handleRuntimeStatus);
+            socket.off('silent_catch_telemetry_snapshot', handleSilentCatchTelemetrySnapshot);
+            socket.off('silent_catch_telemetry_update', handleSilentCatchTelemetryUpdate);
             socket.off('connect', requestAllState);
         };
     }, [socket]);
@@ -3343,6 +3441,43 @@ export const PolymarketPage: React.FC = () => {
                                         ))}
                                     </div>
                                 ))}
+                            </div>
+                            <div>
+                                <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-2">
+                                    Silent Catch Telemetry
+                                </div>
+                                <div className="space-y-1 max-h-[170px] overflow-y-auto pr-1">
+                                    {silentCatchRows.length === 0 && (
+                                        <div className="text-[11px] text-gray-500 font-mono border border-white/10 rounded p-2 bg-black/20">
+                                            No suppressed error loops observed
+                                        </div>
+                                    )}
+                                    {silentCatchRows.map((entry) => {
+                                        const contextSummary = formatSilentCatchContext(entry.last_context);
+                                        return (
+                                            <div key={entry.scope} className="border border-white/10 rounded p-2 bg-black/20">
+                                                <div className="flex items-center justify-between text-[11px] font-mono">
+                                                    <span className="text-gray-200 truncate pr-2">{entry.scope}</span>
+                                                    <span className={`${entry.count > 25 ? 'text-rose-300' : entry.count > 5 ? 'text-amber-300' : 'text-gray-300'}`}>
+                                                        x{entry.count}
+                                                    </span>
+                                                </div>
+                                                <div className="flex items-center justify-between text-[10px] text-gray-500 font-mono mt-1">
+                                                    <span>last {formatAgeMs(entry.last_seen, Date.now())}</span>
+                                                    <span>first {formatAgeMs(entry.first_seen, Date.now())}</span>
+                                                </div>
+                                                <div className="text-[10px] text-amber-300 truncate mt-1" title={entry.last_message}>
+                                                    {entry.last_message || 'no message'}
+                                                </div>
+                                                {contextSummary && (
+                                                    <div className="text-[10px] text-gray-400 truncate" title={contextSummary}>
+                                                        {contextSummary}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
                             </div>
                             <div>
                                 <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-2">
