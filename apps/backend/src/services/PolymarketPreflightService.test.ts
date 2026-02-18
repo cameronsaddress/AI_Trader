@@ -45,6 +45,16 @@ class MockDedupeStore {
     }
 }
 
+class ThrowingDedupeStore {
+    async set(
+        _key: string,
+        _value: string,
+        _options?: { NX?: boolean; PX?: number },
+    ): Promise<never> {
+        throw new Error('redis unavailable');
+    }
+}
+
 const ORIGINAL_ENV = { ...process.env };
 
 function buildExecutionPayload(strategy = 'BTC_5M'): Record<string, unknown> {
@@ -110,5 +120,14 @@ describe('PolymarketPreflightService redis dedupe', () => {
         const restarted = new PolymarketPreflightService(dedupe);
         const secondResult = await restarted.executeFromExecution(payload, 'LIVE');
         expect(secondResult).toBeNull();
+    });
+
+    it('continues when redis dedupe store throws (degrades open)', async () => {
+        const dedupe = new ThrowingDedupeStore();
+        const payload = buildExecutionPayload('ATOMIC_ARB');
+        const service = new PolymarketPreflightService(dedupe);
+
+        await expect(service.preflightFromExecution(payload)).resolves.not.toBeNull();
+        await expect(service.executeFromExecution(payload, 'LIVE')).resolves.not.toBeNull();
     });
 });

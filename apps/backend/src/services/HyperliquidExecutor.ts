@@ -10,20 +10,26 @@ export class HyperliquidExecutor {
     private wallet: ethers.Wallet | null = null;
     private apiUrl: string;
     private liveTradingEnabled: boolean;
+    private legacyPathEnabled: boolean;
 
     constructor() {
         this.apiUrl = process.env.HYPERLIQUID_API_URL || 'https://api.hyperliquid.xyz';
         this.liveTradingEnabled = process.env.LIVE_ORDER_POSTING_ENABLED === 'true'
             || process.env.LIVE_TRADING_ENABLED === 'true';
+        this.legacyPathEnabled = process.env.LEGACY_HYPERLIQUID_EXECUTOR_ENABLED === 'true';
         const privateKey = process.env.HYPERLIQUID_PRIVATE_KEY;
 
-        if (privateKey) {
+        if (!this.legacyPathEnabled) {
+            logger.warn('[Executor] legacy Hyperliquid executor path is disabled; use production execution pipeline.');
+        }
+
+        if (privateKey && this.legacyPathEnabled) {
             this.wallet = new ethers.Wallet(privateKey);
             logger.info(`Initialized Hyperliquid Wallet: ${this.wallet.address}`);
             if (!this.liveTradingEnabled) {
                 logger.warn('Wallet loaded but LIVE_TRADING_ENABLED=false, keeping execution in simulation mode.');
             }
-        } else if (this.liveTradingEnabled) {
+        } else if (this.liveTradingEnabled && this.legacyPathEnabled) {
             throw new Error('LIVE_TRADING_ENABLED=true requires HYPERLIQUID_PRIVATE_KEY.');
         } else {
             logger.warn('No Hyperliquid Private Key found. Execution will be SIMULATED.');
@@ -41,6 +47,11 @@ export class HyperliquidExecutor {
         if (mode !== 'LIVE') {
             logger.info(`[Executor] PAPER MODE: Simulated ${isBuy ? 'BUY' : 'SELL'} order for ${size} ${symbol}`);
             return 'PAPER_SIMULATED_ORDER_ID_' + Date.now();
+        }
+
+        if (!this.legacyPathEnabled) {
+            logger.error('[Executor] Blocking live order: legacy executor path disabled.');
+            return 'LIVE_BLOCKED_LEGACY_PATH_DISABLED_' + Date.now();
         }
 
         if (!this.liveTradingEnabled) {

@@ -4,9 +4,14 @@ import { Account, Trade, Position } from '../models';
 
 export class ExecutionService {
     private mode: 'simulation' | 'live' = 'simulation';
+    private readonly legacyLivePathEnabled: boolean;
 
     constructor(mode: 'simulation' | 'live' = 'simulation') {
         this.mode = mode;
+        this.legacyLivePathEnabled = process.env.LEGACY_EXECUTION_SERVICE_LIVE_ENABLED === 'true';
+        if (mode === 'live' && !this.legacyLivePathEnabled) {
+            logger.error('ExecutionService live mode requested but legacy live path is disabled.');
+        }
     }
 
     public async execute(agentName: string, decision: AgentResponse, symbol: string) {
@@ -15,6 +20,10 @@ export class ExecutionService {
         if (this.mode === 'simulation') {
             await this.executeSimulation(agentName, decision, symbol);
         } else {
+            if (!this.legacyLivePathEnabled) {
+                logger.error('ExecutionService live execution blocked: LEGACY_EXECUTION_SERVICE_LIVE_ENABLED is not set.');
+                return;
+            }
             await this.executeLive(agentName, decision, symbol);
         }
     }
@@ -29,10 +38,12 @@ export class ExecutionService {
     }
 
     private async executeLive(agentName: string, decision: AgentResponse, symbol: string) {
+        logger.error(
+            `ExecutionService legacy live path invoked for ${agentName} ${decision.decision} ${symbol}; this path is deprecated.`,
+        );
         // 1. Validate Live Arm Latch
         // 2. Send Order to Coinbase
         // 3. Record Trade
-        logger.warn(`Live execution not yet fully implemented for safety.`);
     }
 
     public setMode(mode: 'simulation' | 'live') {

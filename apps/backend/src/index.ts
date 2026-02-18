@@ -27,6 +27,12 @@ import { connectRedis, redisClient, subscriber as redisSubscriber } from './conf
 import { createRiskGuardModule } from './modules/risk/riskGuardModule';
 import { decideBootResumeAction, shouldResumeFromBootTimer } from './modules/risk/bootResumeDecider';
 import {
+    normalizeTradingMode,
+    validateSimulationResetRequest,
+    validateStrategyToggleRequest,
+    validateTradingModeChangeRequest,
+} from './modules/control/controlPlaneValidation';
+import {
     createLedgerHealthModule,
     type SimulationLedgerSnapshot,
     type LedgerHealthState,
@@ -1718,16 +1724,93 @@ function runtimeStatusPayload(): { phase: RuntimePhase; modules: RuntimeModuleSt
     };
 }
 
-function normalizeTradingMode(mode: unknown): TradingMode | null {
-    if (typeof mode !== 'string') {
-        return null;
-    }
+interface ExecutionHaltState {
+    halted: boolean;
+    reason: string;
+    updated_at: number;
+    source: string;
+}
 
-    const normalized = mode.trim().toUpperCase();
-    if (normalized === 'PAPER' || normalized === 'LIVE') {
-        return normalized as TradingMode;
+const EXECUTION_HALT_KEY = 'system:execution_halt';
+const EXECUTION_HALT_REASON_MAX = 240;
+let executionHaltState: ExecutionHaltState = {
+    halted: false,
+    reason: '',
+    updated_at: 0,
+    source: 'boot',
+};
+
+function sanitizeExecutionHaltReason(reason: unknown): string {
+    const text = asString(reason);
+    if (!text) {
+        return '';
     }
-    return null;
+    return text.slice(0, EXECUTION_HALT_REASON_MAX);
+}
+
+function defaultExecutionHaltState(): ExecutionHaltState {
+    return {
+        halted: false,
+        reason: '',
+        updated_at: Date.now(),
+        source: 'boot',
+    };
+}
+
+function normalizeExecutionHaltState(input: unknown): ExecutionHaltState {
+    const record = asRecord(input);
+    const halted = record?.halted === true;
+    const reason = sanitizeExecutionHaltReason(record?.reason);
+    const updatedAt = asNumber(record?.updated_at) ?? Date.now();
+    const source = asString(record?.source) || 'unknown';
+    return {
+        halted,
+        reason,
+        updated_at: updatedAt,
+        source,
+    };
+}
+
+async function loadExecutionHaltState(): Promise<ExecutionHaltState> {
+    const raw = await redisClient.get(EXECUTION_HALT_KEY);
+    if (!raw) {
+        const fallback = defaultExecutionHaltState();
+        await redisClient.set(EXECUTION_HALT_KEY, JSON.stringify(fallback));
+        executionHaltState = fallback;
+        return fallback;
+    }
+    try {
+        executionHaltState = normalizeExecutionHaltState(JSON.parse(raw));
+    } catch (error) {
+        recordSilentCatch('ExecutionHalt.Load', error, { key: EXECUTION_HALT_KEY });
+        executionHaltState = defaultExecutionHaltState();
+        await redisClient.set(EXECUTION_HALT_KEY, JSON.stringify(executionHaltState));
+    }
+    return executionHaltState;
+}
+
+async function setExecutionHaltState(
+    halted: boolean,
+    reason: string,
+    source: string,
+): Promise<ExecutionHaltState> {
+    executionHaltState = {
+        halted,
+        reason: sanitizeExecutionHaltReason(reason),
+        updated_at: Date.now(),
+        source: asString(source) || 'unknown',
+    };
+    await redisClient.set(EXECUTION_HALT_KEY, JSON.stringify(executionHaltState));
+    await redisClient.publish('system:execution_halt', JSON.stringify(executionHaltState));
+    io.emit('execution_halt_update', executionHaltState);
+    touchRuntimeModule(
+        'TRADING_MODE_GUARD',
+        executionHaltState.halted ? 'DEGRADED' : 'ONLINE',
+        executionHaltState.halted
+            ? `execution halt active: ${executionHaltState.reason || 'unspecified'}`
+            : 'execution halt cleared',
+    );
+    return executionHaltState;
 }
 
 async function getTradingMode(): Promise<TradingMode> {
@@ -1805,6 +1888,38 @@ async function isLiveReady(): Promise<LiveReadinessResult> {
     }
 
     return { ready: failures.length === 0, failures };
+}
+
+async function enforceBootTradingModeSafety(): Promise<void> {
+    const mode = await getTradingMode();
+    if (mode !== 'LIVE') {
+        touchRuntimeModule('TRADING_MODE_GUARD', 'ONLINE', `boot mode ${mode}`);
+        return;
+    }
+
+    const readiness = await isLiveReady();
+    if (readiness.ready) {
+        touchRuntimeModule('TRADING_MODE_GUARD', 'ONLINE', 'boot mode LIVE ready');
+        return;
+    }
+
+    const summary = readiness.failures.slice(0, 3).join(' | ') || 'unknown readiness failure';
+    await setTradingMode('PAPER');
+    touchRuntimeModule('TRADING_MODE_GUARD', 'DEGRADED', `boot fail-safe forced PAPER: ${summary}`);
+    io.emit('runtime_alert', {
+        severity: 'CRITICAL',
+        scope: 'TRADING_MODE_GUARD',
+        timestamp: Date.now(),
+        message: 'Forced PAPER mode at boot because LIVE readiness checks failed',
+        failures: readiness.failures,
+    });
+    recordSilentCatch(
+        'LiveReadiness.BootFailSafe',
+        new Error('Forced PAPER mode at boot because LIVE readiness checks failed'),
+        {
+            failures: summary,
+        },
+    );
 }
 
 function normalizeResetBankroll(value: unknown): number | null {
@@ -4756,6 +4871,46 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
 
         void (async () => {
             try {
+                if (executionHaltState.halted) {
+                    const mode = await getTradingMode();
+                    const reason = executionHaltState.reason || 'Execution halt active';
+                    const haltPayload = {
+                        execution_id: executionId,
+                        timestamp: Date.now(),
+                        strategy: parsedStrategy || 'UNKNOWN',
+                        market_key: parsedMarketKey,
+                        reason: `[KILL_SWITCH] ${reason}`,
+                        halted: true,
+                        source: executionHaltState.source,
+                        halted_at: executionHaltState.updated_at,
+                    };
+                    pushExecutionTraceEvent(executionId, 'INTELLIGENCE_GATE', haltPayload, {
+                        strategy: parsedStrategy,
+                        market_key: parsedMarketKey,
+                    });
+                    io.emit('execution_log', {
+                        execution_id: executionId,
+                        timestamp: haltPayload.timestamp,
+                        side: 'HALT_BLOCK',
+                        market: asString(asRecord(parsed)?.market) || 'Polymarket',
+                        price: haltPayload.reason,
+                        size: haltPayload.strategy,
+                        mode,
+                        details: haltPayload,
+                    });
+                    recordRejectedSignal({
+                        stage: 'LIVE_EXECUTION',
+                        execution_id: executionId,
+                        strategy: haltPayload.strategy,
+                        market_key: haltPayload.market_key,
+                        reason: haltPayload.reason,
+                        mode,
+                        timestamp: haltPayload.timestamp,
+                        payload: asRecord(haltPayload),
+                    });
+                    touchRuntimeModule('TRADING_MODE_GUARD', 'DEGRADED', `execution halted: ${reason}`);
+                    return;
+                }
                 await processArbitrageExecutionWorker(
                     {
                         parsed,
@@ -5083,6 +5238,26 @@ redisSubscriber.subscribe('system:trading_mode', (msg) => {
     }
 });
 
+redisSubscriber.subscribe('system:execution_halt', (msg) => {
+    try {
+        const parsed = normalizeExecutionHaltState(JSON.parse(msg));
+        executionHaltState = parsed;
+        io.emit('execution_halt_update', parsed);
+        touchRuntimeModule(
+            'TRADING_MODE_GUARD',
+            parsed.halted ? 'DEGRADED' : 'ONLINE',
+            parsed.halted
+                ? `execution halt active: ${parsed.reason || 'unspecified'}`
+                : 'execution halt cleared',
+        );
+    } catch (error) {
+        recordSilentCatch('RedisSub.ExecutionHalt', error, {
+            channel: 'system:execution_halt',
+            preview: typeof msg === 'string' ? msg.slice(0, 160) : String(msg),
+        });
+    }
+});
+
 redisSubscriber.subscribe('system:simulation_reset', (msg) => {
     try {
         const parsed = JSON.parse(msg) as { bankroll?: unknown; timestamp?: unknown };
@@ -5172,6 +5347,7 @@ io.on('connection', async (socket) => {
         timestamp: Date.now(),
         live_order_posting_enabled: isLiveOrderPostingEnabled(),
     });
+    socket.emit('execution_halt_update', executionHaltState);
     socket.emit('intelligence_gate_config', {
         enabled: INTELLIGENCE_GATE_ENABLED,
         max_staleness_ms: INTELLIGENCE_GATE_MAX_STALENESS_MS,
@@ -5302,82 +5478,96 @@ io.on('connection', async (socket) => {
         });
     });
 
+    socket.on('request_execution_halt', () => {
+        socket.emit('execution_halt_update', executionHaltState);
+    });
+
     socket.on('set_trading_mode', async (payload: Partial<TradingModePayload>) => {
         if (!enforceSocketControlAuth(socket, 'set_trading_mode', socketControlAuthorized)) {
             return;
         }
         const mode = normalizeTradingMode(payload?.mode);
-        if (!mode) {
-            socket.emit('trading_mode_error', { message: 'Invalid trading mode payload' });
+        const readiness = mode === 'LIVE' ? await isLiveReady() : null;
+        const validation = validateTradingModeChangeRequest({
+            mode: payload?.mode,
+            confirmation: payload?.confirmation,
+            execution_halted: executionHaltState.halted,
+            live_readiness: readiness,
+        });
+        if (!validation.ok) {
+            socket.emit('trading_mode_error', {
+                message: validation.message,
+                failures: validation.failures,
+            });
             return;
         }
 
-        if (mode === 'LIVE' && payload?.confirmation !== 'LIVE') {
-            socket.emit('trading_mode_error', { message: 'LIVE mode requires explicit confirmation' });
-            return;
-        }
-
-        if (mode === 'LIVE') {
-            const readiness = await isLiveReady();
-            if (!readiness.ready) {
-                socket.emit('trading_mode_error', {
-                    message: 'System not ready for LIVE mode',
-                    failures: readiness.failures,
-                });
-                return;
-            }
-        }
-
-        await setTradingMode(mode);
+        await setTradingMode(validation.value.mode);
     });
 
     socket.on('reset_simulation', async (payload: Partial<SimulationResetPayload>) => {
         if (!enforceSocketControlAuth(socket, 'reset_simulation', socketControlAuthorized)) {
             return;
         }
-        const currentMode = await getTradingMode();
-        if (currentMode !== 'PAPER') {
-            socket.emit('simulation_reset_error', { message: 'Simulation reset is only allowed in PAPER mode' });
+        const validation = validateSimulationResetRequest({
+            current_mode: await getTradingMode(),
+            confirmation: payload?.confirmation,
+            bankroll: payload?.bankroll,
+            force_defaults: payload?.force_defaults,
+            normalize_bankroll: normalizeResetBankroll,
+        });
+        if (!validation.ok) {
+            socket.emit('simulation_reset_error', { message: validation.message });
             return;
         }
 
-        if (payload?.confirmation !== 'RESET') {
-            socket.emit('simulation_reset_error', { message: 'Simulation reset requires explicit RESET confirmation' });
-            return;
-        }
-
-        const bankroll = normalizeResetBankroll(payload?.bankroll);
-        if (bankroll === null) {
-            socket.emit('simulation_reset_error', { message: 'Invalid reset bankroll value' });
-            return;
-        }
-
-        const forceDefaults = payload?.force_defaults === true;
-        await resetSimulationState(bankroll, { forceDefaults });
+        await resetSimulationState(validation.value.bankroll, {
+            forceDefaults: validation.value.force_defaults,
+        });
     });
 
     socket.on('toggle_strategy', async (payload: StrategyTogglePayload) => {
         if (!enforceSocketControlAuth(socket, 'toggle_strategy', socketControlAuthorized)) {
             return;
         }
-        if (!payload || !STRATEGY_IDS.includes(payload.id) || typeof payload.active !== 'boolean') {
+        const validation = validateStrategyToggleRequest({
+            payload,
+            strategy_ids: STRATEGY_IDS,
+        });
+        if (!validation.ok) {
             socket.emit('strategy_control_error', { message: 'Invalid strategy toggle payload' });
             return;
         }
 
-        await clearStrategyPause(payload.id);
-        clearRiskGuardBootResumeTimer(payload.id);
-        strategyStatus[payload.id] = payload.active;
+        await clearStrategyPause(validation.value.id);
+        clearRiskGuardBootResumeTimer(validation.value.id);
+        strategyStatus[validation.value.id] = validation.value.active;
 
-        await redisClient.set(`strategy:enabled:${payload.id}`, payload.active ? '1' : '0');
-        await redisClient.expire(`strategy:enabled:${payload.id}`, 86400); // 24 hours
+        await redisClient.set(`strategy:enabled:${validation.value.id}`, validation.value.active ? '1' : '0');
+        await redisClient.expire(`strategy:enabled:${validation.value.id}`, 86400); // 24 hours
         await redisClient.publish('strategy:control', JSON.stringify({
-            id: payload.id,
-            active: payload.active,
+            id: validation.value.id,
+            active: validation.value.active,
             timestamp: Date.now(),
         }));
 
         io.emit('strategy_status_update', strategyStatus);
+    });
+
+    socket.on('set_execution_halt', async (payload: { halted?: unknown; reason?: unknown }) => {
+        if (!enforceSocketControlAuth(socket, 'set_execution_halt', socketControlAuthorized)) {
+            return;
+        }
+        if (typeof payload?.halted !== 'boolean') {
+            socket.emit('execution_halt_error', { message: 'Invalid execution halt payload' });
+            return;
+        }
+        const next = await setExecutionHaltState(
+            payload.halted,
+            sanitizeExecutionHaltReason(payload.reason),
+            'socket_control',
+        );
+        socket.emit('execution_halt_update', next);
     });
 });
 
@@ -5459,6 +5649,7 @@ app.get('/api/arb/stats', async (_req, res) => {
         },
         risk: await getRiskConfig(),
         trading_mode: await getTradingMode(),
+        execution_halt: executionHaltState,
         live_order_posting_enabled: isLiveOrderPostingEnabled(),
         intelligence_gate_enabled: INTELLIGENCE_GATE_ENABLED,
         model_probability_gate: {
@@ -5992,6 +6183,7 @@ app.get('/api/system/trading-mode', async (_req, res) => {
     res.json({
         mode: await getTradingMode(),
         live_order_posting_enabled: isLiveOrderPostingEnabled(),
+        execution_halt: executionHaltState,
     });
 });
 
@@ -5999,58 +6191,72 @@ app.get('/api/system/runtime-status', async (_req, res) => {
     res.json(runtimeStatusPayload());
 });
 
+app.get('/api/system/execution-halt', (_req, res) => {
+    res.json(executionHaltState);
+});
+
 app.post('/api/system/trading-mode', requireControlPlaneAuth, async (req, res) => {
     const mode = normalizeTradingMode(req.body?.mode);
-    if (!mode) {
-        res.status(400).json({ error: 'Invalid trading mode payload' });
+    const readiness = mode === 'LIVE' ? await isLiveReady() : null;
+    const validation = validateTradingModeChangeRequest({
+        mode: req.body?.mode,
+        confirmation: req.body?.confirmation,
+        execution_halted: executionHaltState.halted,
+        live_readiness: readiness,
+    });
+    if (!validation.ok) {
+        res.status(validation.status).json({
+            error: validation.message,
+            failures: validation.failures,
+        });
         return;
     }
 
-    if (mode === 'LIVE' && req.body?.confirmation !== 'LIVE') {
-        res.status(400).json({ error: 'LIVE mode requires explicit confirmation' });
-        return;
-    }
-
-    if (mode === 'LIVE') {
-        const readiness = await isLiveReady();
-        if (!readiness.ready) {
-            res.status(412).json({
-                error: 'Live mode preconditions not met',
-                failures: readiness.failures,
-            });
-            return;
-        }
-    }
-
-    await setTradingMode(mode);
+    await setTradingMode(validation.value.mode);
     res.json({
         ok: true,
-        mode,
+        mode: validation.value.mode,
         live_order_posting_enabled: isLiveOrderPostingEnabled(),
     });
 });
 
 app.post('/api/system/reset-simulation', requireControlPlaneAuth, async (req, res) => {
-    const currentMode = await getTradingMode();
-    if (currentMode !== 'PAPER') {
-        res.status(409).json({ error: 'Simulation reset is only allowed in PAPER mode' });
+    const validation = validateSimulationResetRequest({
+        current_mode: await getTradingMode(),
+        confirmation: req.body?.confirmation,
+        bankroll: req.body?.bankroll,
+        force_defaults: req.body?.force_defaults,
+        normalize_bankroll: normalizeResetBankroll,
+    });
+    if (!validation.ok) {
+        res.status(validation.status).json({ error: validation.message });
         return;
     }
 
-    if (req.body?.confirmation !== 'RESET') {
-        res.status(400).json({ error: 'Simulation reset requires explicit RESET confirmation' });
+    await resetSimulationState(validation.value.bankroll, {
+        forceDefaults: validation.value.force_defaults,
+    });
+    res.json({
+        ok: true,
+        bankroll: validation.value.bankroll,
+        force_defaults: validation.value.force_defaults,
+    });
+});
+
+app.post('/api/system/execution-halt', requireControlPlaneAuth, async (req, res) => {
+    if (typeof req.body?.halted !== 'boolean') {
+        res.status(400).json({ error: 'Invalid execution halt payload' });
         return;
     }
-
-    const bankroll = normalizeResetBankroll(req.body?.bankroll);
-    if (bankroll === null) {
-        res.status(400).json({ error: 'Invalid reset bankroll value' });
-        return;
-    }
-
-    const forceDefaults = req.body?.force_defaults === true;
-    await resetSimulationState(bankroll, { forceDefaults });
-    res.json({ ok: true, bankroll, force_defaults: forceDefaults });
+    const state = await setExecutionHaltState(
+        req.body.halted,
+        sanitizeExecutionHaltReason(req.body?.reason),
+        'api_control',
+    );
+    res.json({
+        ok: true,
+        ...state,
+    });
 });
 
 async function runStrategyGovernanceCycle(): Promise<void> {
@@ -6123,6 +6329,15 @@ if (LEGACY_BRAIN_LOOP_ENABLED && LEGACY_BRAIN_LOOP_UNSAFE_OK) {
             }
 
             if (!riskGuard.validate(validDecision, context)) {
+                return;
+            }
+
+            if (executionHaltState.halted) {
+                touchRuntimeModule(
+                    'TRADING_MODE_GUARD',
+                    'DEGRADED',
+                    `legacy brain execution halted: ${executionHaltState.reason || 'unspecified'}`,
+                );
                 return;
             }
 
@@ -6280,6 +6495,15 @@ async function bootstrap() {
     await redisClient.setNX(SIM_LEDGER_RESERVED_KEY, '0');
     await redisClient.setNX(SIM_LEDGER_REALIZED_PNL_KEY, '0');
     await redisClient.setNX('system:simulation_reset_ts', '0');
+    await redisClient.setNX(EXECUTION_HALT_KEY, JSON.stringify(defaultExecutionHaltState()));
+    await loadExecutionHaltState();
+    if (executionHaltState.halted) {
+        touchRuntimeModule(
+            'TRADING_MODE_GUARD',
+            'DEGRADED',
+            `execution halt active at boot: ${executionHaltState.reason || 'unspecified'}`,
+        );
+    }
     if (SIM_RESET_ON_BOOT) {
         await resetSimulationState(DEFAULT_SIM_BANKROLL, { forceDefaults: true });
     } else {
@@ -6290,7 +6514,7 @@ async function bootstrap() {
     await reconcileSimulationLedgerWithStrategyMetrics();
     await getRiskConfig();
     await redisClient.setNX('system:trading_mode', 'PAPER');
-    touchRuntimeModule('TRADING_MODE_GUARD', 'ONLINE', `boot mode ${(await getTradingMode())}`);
+    await enforceBootTradingModeSafety();
     await applyDefaultStrategyStates(false);
     await bootstrapStrategyMultipliers();
     await loadRiskGuardStates();
