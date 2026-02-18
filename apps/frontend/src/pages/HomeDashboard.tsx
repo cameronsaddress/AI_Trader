@@ -635,6 +635,8 @@ export function HomeDashboard() {
 
   useEffect(() => {
     let active = true;
+    let inFlight = false;
+    let rerunRequested = false;
     const refreshOpsSnapshot = async () => {
       try {
         const res = await fetch(apiUrl('/api/arb/stats'));
@@ -657,12 +659,32 @@ export function HomeDashboard() {
         // keep last known ops snapshot on transient errors
       }
     };
-    void refreshOpsSnapshot();
+    const runRefreshOpsSnapshot = async () => {
+      if (!active) {
+        return;
+      }
+      if (inFlight) {
+        rerunRequested = true;
+        return;
+      }
+      inFlight = true;
+      try {
+        await refreshOpsSnapshot();
+      } finally {
+        inFlight = false;
+        if (active && rerunRequested) {
+          rerunRequested = false;
+          void runRefreshOpsSnapshot();
+        }
+      }
+    };
+    void runRefreshOpsSnapshot();
     const timer = window.setInterval(() => {
-      void refreshOpsSnapshot();
+      void runRefreshOpsSnapshot();
     }, 4000);
     return () => {
       active = false;
+      rerunRequested = false;
       window.clearInterval(timer);
     };
   }, []);

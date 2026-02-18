@@ -1014,6 +1014,8 @@ export const Btc5mEnginePage: React.FC = () => {
 
   useEffect(() => {
     let active = true;
+    let inFlight = false;
+    let rerunRequested = false;
     const fetchStats = async () => {
       try {
         const res = await fetch(apiUrl('/api/arb/stats'));
@@ -1052,10 +1054,32 @@ export const Btc5mEnginePage: React.FC = () => {
         // ignore
       }
     };
-    fetchStats();
-    const timer = window.setInterval(fetchStats, 1500);
+    const runFetchStats = async () => {
+      if (!active) {
+        return;
+      }
+      if (inFlight) {
+        rerunRequested = true;
+        return;
+      }
+      inFlight = true;
+      try {
+        await fetchStats();
+      } finally {
+        inFlight = false;
+        if (active && rerunRequested) {
+          rerunRequested = false;
+          void runFetchStats();
+        }
+      }
+    };
+    void runFetchStats();
+    const timer = window.setInterval(() => {
+      void runFetchStats();
+    }, 1500);
     return () => {
       active = false;
+      rerunRequested = false;
       window.clearInterval(timer);
     };
   }, []);
