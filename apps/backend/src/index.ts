@@ -2609,6 +2609,7 @@ async function maybeApplyGovernanceDecision(
         perf.multiplier = promotedMultiplier;
         perf.updated_at = now;
         await clearStrategyPause(decision.strategy);
+        clearRiskGuardBootResumeTimer(decision.strategy);
         strategyStatus[decision.strategy] = true;
         await publishStrategyMultiplier(decision.strategy, promotedMultiplier);
         await redisClient.set(`strategy:enabled:${decision.strategy}`, '1');
@@ -2643,6 +2644,7 @@ async function maybeApplyGovernanceDecision(
         perf.multiplier = 0;
         perf.updated_at = now;
         await clearStrategyPause(decision.strategy);
+        clearRiskGuardBootResumeTimer(decision.strategy);
         strategyStatus[decision.strategy] = false;
         await publishStrategyMultiplier(decision.strategy, 0);
         await redisClient.set(`strategy:enabled:${decision.strategy}`, '0');
@@ -4525,6 +4527,9 @@ async function applyDefaultStrategyStates(force = false): Promise<void> {
                             const latestPause = asNumber(await redisClient.get(pauseUntilKey));
                             const latestLegacyCooldown = asNumber(await redisClient.get(cooldownKey));
                             const latestPauseUntil = latestPause ?? latestLegacyCooldown;
+                            if (latestPauseUntil === null) {
+                                return;
+                            }
                             if (latestPauseUntil && latestPauseUntil > Date.now()) {
                                 return;
                             }
@@ -5357,6 +5362,7 @@ io.on('connection', async (socket) => {
         }
 
         await clearStrategyPause(payload.id);
+        clearRiskGuardBootResumeTimer(payload.id);
         strategyStatus[payload.id] = payload.active;
 
         await redisClient.set(`strategy:enabled:${payload.id}`, payload.active ? '1' : '0');
