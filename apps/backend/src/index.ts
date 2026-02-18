@@ -4989,7 +4989,7 @@ redisSubscriber.subscribe('arbitrage:scan', (message) => {
             lastScannerParseErrorLogMs = now;
             const preview = typeof message === 'string' ? message.slice(0, 160) : String(message);
             recordSilentCatch('RedisSub.ScannerUpdate', error, {
-                channel: 'scanner_update',
+                channel: 'arbitrage:scan',
                 preview,
             });
         }
