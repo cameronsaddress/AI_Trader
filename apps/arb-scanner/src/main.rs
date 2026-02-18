@@ -45,7 +45,9 @@ fn canonical_strategy_id(input: &str) -> &'static str {
     match input {
         "BTC_5M" => "BTC_5M",
         "BTC_15M" => "BTC_15M",
+        "ETH_5M" => "ETH_5M",
         "ETH_15M" => "ETH_15M",
+        "SOL_5M" => "SOL_5M",
         "SOL_15M" => "SOL_15M",
         "CEX_ARB" | "CEX_SNIPER" => "CEX_SNIPER",
         "COPY_BOT" | "SYNDICATE" => "SYNDICATE",
@@ -249,7 +251,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let strategy: Box<dyn Strategy + Send + Sync> = match strategy_type.as_str() {
         "BTC_5M" => Box::new(Btc5mLagStrategy::new()),
         "BTC_15M" => Box::new(MarketNeutralStrategy::new("BTC".to_string())),
+        "ETH_5M" => Box::new(MarketNeutralStrategy::new_with_window("ETH".to_string(), 300)),
         "ETH_15M" => Box::new(MarketNeutralStrategy::new("ETH".to_string())),
+        "SOL_5M" => Box::new(MarketNeutralStrategy::new_with_window("SOL".to_string(), 300)),
         "SOL_15M" => Box::new(MarketNeutralStrategy::new("SOL".to_string())),
         "CEX_ARB" | "CEX_SNIPER" => Box::new(CexArbStrategy::new()),
         "COPY_BOT" | "SYNDICATE" => Box::new(SyndicateStrategy::new()),

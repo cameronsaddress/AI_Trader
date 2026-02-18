@@ -147,6 +147,9 @@ import {
     STRATEGY_RISK_MULTIPLIER_PREFIX, STRATEGY_WEIGHT_FLOOR, STRATEGY_WEIGHT_CAP,
     STRATEGY_ALLOCATOR_EPSILON, STRATEGY_ALLOCATOR_MIN_SAMPLES,
     STRATEGY_ALLOCATOR_TARGET_SHARPE, DEFAULT_DISABLED_STRATEGIES,
+    META_ALLOCATOR_ENABLED, META_ALLOCATOR_META_BLEND,
+    META_ALLOCATOR_MIN_OVERLAY, META_ALLOCATOR_MAX_OVERLAY,
+    META_ALLOCATOR_FAMILY_CONCENTRATION_SOFT_CAP, META_ALLOCATOR_COST_DRAG_PENALTY_BPS,
     VAULT_ENABLED, VAULT_BANKROLL_CEILING, VAULT_REDIS_KEY,
     RISK_GUARD_TRAILING_STOP, RISK_GUARD_CONSEC_LOSS_LIMIT,
     RISK_GUARD_CONSEC_LOSS_COOLDOWN_MS, RISK_GUARD_POST_LOSS_COOLDOWN_MS,
@@ -160,6 +163,11 @@ import {
     INTELLIGENCE_GATE_MIN_MARGIN, INTELLIGENCE_GATE_CONFIRMATION_WINDOW_MS,
     INTELLIGENCE_GATE_REQUIRE_PEER_CONFIRMATION, INTELLIGENCE_GATE_STRONG_MARGIN,
     INTELLIGENCE_GATE_CONFIRMATION_STRATEGIES, INTELLIGENCE_SCAN_RETENTION_MS,
+    EXECUTION_SHORTFALL_OPTIMIZER_ENABLED, EXECUTION_SHORTFALL_TARGET_RETAIN_BPS,
+    EXECUTION_SHORTFALL_MIN_RETAIN_BPS, EXECUTION_SHORTFALL_MAX_SIZE_REDUCTION_PCT,
+    EXECUTION_SHORTFALL_MIN_SIGNAL_NOTIONAL_USD,
+    EXECUTION_NETTING_ENABLED, EXECUTION_NETTING_TTL_MS,
+    EXECUTION_NETTING_MARKET_CAP_USD, EXECUTION_NETTING_OPPOSING_BLOCK_RATIO,
     DATA_INTEGRITY_ALERT_COOLDOWN_MS, DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_WARN,
     DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_CRITICAL, DATA_INTEGRITY_ALERT_RING_LIMIT,
     STRATEGY_SAMPLE_RETENTION,
@@ -390,6 +398,8 @@ const strategyPerformance: Record<string, StrategyPerformance> = Object.fromEntr
         ema_return: 0,
         downside_ema: 0,
         return_var_ema: 0,
+        base_multiplier: DEFAULT_DISABLED_STRATEGIES.has(id) ? 0 : 1,
+        meta_overlay: 1,
         multiplier: DEFAULT_DISABLED_STRATEGIES.has(id) ? 0 : 1,
         updated_at: 0,
     }]),
@@ -718,8 +728,27 @@ type CrossHorizonRouterState = {
     updated_at: number;
     reason: string;
 };
+type ExecutionNettingMarketState = {
+    market_key: string;
+    net_directional_notional: number;
+    long_notional: number;
+    short_notional: number;
+    strategy_directional_notional: Record<string, number>;
+    updated_at: number;
+};
+type ExecutionPreparationStage = 'SHORTFALL' | 'NETTING';
+type ExecutionPreparationResult = {
+    ok: boolean;
+    payload: unknown;
+    adjusted: boolean;
+    stage?: ExecutionPreparationStage;
+    reason?: string;
+    details?: Record<string, unknown>;
+};
 const DEFAULT_CROSS_HORIZON_STRATEGY_PAIRS: Array<{ asset: string; fast: string; slow: string }> = [
     { asset: 'BTC', fast: 'BTC_5M', slow: 'BTC_15M' },
+    { asset: 'ETH', fast: 'ETH_5M', slow: 'ETH_15M' },
+    { asset: 'SOL', fast: 'SOL_5M', slow: 'SOL_15M' },
 ];
 function parseCrossHorizonStrategyPairs(raw: string | null | undefined): Array<{ asset: string; fast: string; slow: string }> {
     const fallback = DEFAULT_CROSS_HORIZON_STRATEGY_PAIRS.filter((pair) => (
@@ -773,6 +802,7 @@ let crossHorizonRouterState: CrossHorizonRouterState = {
     updated_at: 0,
     reason: 'cross-horizon router not initialized',
 };
+const executionNettingByMarket = new Map<string, ExecutionNettingMarketState>();
 const runtimeModules: Record<string, RuntimeModuleState> = Object.fromEntries(
     RUNTIME_MODULE_CATALOG.map((module) => [module.id, {
         ...module,
@@ -948,7 +978,14 @@ function parseMetricDirection(input: unknown): MetricDirection | null {
 
 function strategyFamily(strategyRaw: string): string {
     const strategy = strategyRaw.trim().toUpperCase();
-    if (strategy === 'BTC_5M' || strategy === 'BTC_15M' || strategy === 'ETH_15M' || strategy === 'SOL_15M') {
+    if (
+        strategy === 'BTC_5M'
+        || strategy === 'BTC_15M'
+        || strategy === 'ETH_5M'
+        || strategy === 'ETH_15M'
+        || strategy === 'SOL_5M'
+        || strategy === 'SOL_15M'
+    ) {
         return 'FAIR_VALUE';
     }
     if (strategy === 'ATOMIC_ARB' || strategy === 'GRAPH_ARB') {
@@ -1546,6 +1583,634 @@ function ensureExecutionId(payload: unknown): string {
         }
     }
     return id;
+}
+
+type ParsedPreflightOrder = {
+    index: number;
+    side: 'BUY' | 'SELL';
+    price: number;
+    size: number;
+    sizeUnit: 'USD_NOTIONAL' | 'SHARES';
+    notionalUsd: number;
+    conditionId: string | null;
+};
+
+type ExecutionIntentSnapshot = {
+    strategy: string | null;
+    family: string;
+    marketKey: string | null;
+    direction: number;
+    notionalUsd: number;
+    edgeBps: number | null;
+    requiredEdgeBps: number | null;
+    frictionBps: number | null;
+    retainedBps: number | null;
+};
+
+function parseExecutionPreflightOrders(payload: unknown): ParsedPreflightOrder[] {
+    const record = asRecord(payload);
+    if (!record) {
+        return [];
+    }
+    const details = asRecord(record.details);
+    const preflight = details ? asRecord(details.preflight) : null;
+    const rawOrders = Array.isArray(preflight?.orders) ? preflight.orders : [];
+    const rows: ParsedPreflightOrder[] = [];
+    for (let index = 0; index < rawOrders.length; index += 1) {
+        const order = asRecord(rawOrders[index]);
+        if (!order) {
+            continue;
+        }
+        const price = asNumber(order.price);
+        const size = asNumber(order.size);
+        if (price === null || size === null || price <= 0 || size <= 0) {
+            continue;
+        }
+        const sideRaw = (asString(order.side) || 'BUY').toUpperCase();
+        const side: 'BUY' | 'SELL' = sideRaw === 'SELL' ? 'SELL' : 'BUY';
+        const unitRaw = (
+            asString(order.size_unit)
+            || asString(order.sizeUnit)
+            || 'USD_NOTIONAL'
+        ).toUpperCase();
+        const sizeUnit: 'USD_NOTIONAL' | 'SHARES' = unitRaw === 'SHARES' ? 'SHARES' : 'USD_NOTIONAL';
+        const notionalUsd = sizeUnit === 'SHARES' ? size * price : size;
+        if (!Number.isFinite(notionalUsd) || notionalUsd <= 0) {
+            continue;
+        }
+        rows.push({
+            index,
+            side,
+            price,
+            size,
+            sizeUnit,
+            notionalUsd,
+            conditionId: normalizeMarketKey(order.condition_id || order.conditionId),
+        });
+    }
+    return rows;
+}
+
+function executionSignalNotionalUsd(payload: unknown): number {
+    const orderRows = parseExecutionPreflightOrders(payload);
+    if (orderRows.length > 0) {
+        return orderRows.reduce((sum, row) => sum + row.notionalUsd, 0);
+    }
+    const direct = asNumber(asRecord(payload)?.size);
+    return direct && direct > 0 ? direct : 0;
+}
+
+function cloneExecutionPayload(payload: unknown): Record<string, unknown> | null {
+    try {
+        const cloned = JSON.parse(JSON.stringify(payload)) as unknown;
+        return asRecord(cloned);
+    } catch {
+        return null;
+    }
+}
+
+function scaleExecutionPayloadNotional(
+    payload: unknown,
+    scale: number,
+): { payload: unknown; notionalUsd: number } | null {
+    if (!(scale > 0 && scale < 1)) {
+        return {
+            payload,
+            notionalUsd: executionSignalNotionalUsd(payload),
+        };
+    }
+
+    const cloned = cloneExecutionPayload(payload);
+    if (!cloned) {
+        return null;
+    }
+    const details = asRecord(cloned.details);
+    const preflight = details ? asRecord(details.preflight) : null;
+    if (!preflight || !Array.isArray(preflight.orders)) {
+        return null;
+    }
+    const rawOrders = preflight.orders;
+
+    const scaledOrders: Record<string, unknown>[] = [];
+    let totalNotionalUsd = 0;
+    for (const rawOrder of rawOrders) {
+        const order = asRecord(rawOrder);
+        if (!order) {
+            continue;
+        }
+        const price = asNumber(order.price);
+        const size = asNumber(order.size);
+        if (price === null || size === null || price <= 0 || size <= 0) {
+            continue;
+        }
+        const unitRaw = (
+            asString(order.size_unit)
+            || asString(order.sizeUnit)
+            || 'USD_NOTIONAL'
+        ).toUpperCase();
+        const sizeUnit: 'USD_NOTIONAL' | 'SHARES' = unitRaw === 'SHARES' ? 'SHARES' : 'USD_NOTIONAL';
+        const scaledSize = size * scale;
+        if (!Number.isFinite(scaledSize) || scaledSize <= 0) {
+            continue;
+        }
+        const next = { ...order };
+        next.size = Number(scaledSize.toFixed(8));
+        scaledOrders.push(next);
+        const notionalUsd = sizeUnit === 'SHARES' ? scaledSize * price : scaledSize;
+        totalNotionalUsd += notionalUsd;
+    }
+
+    if (scaledOrders.length === 0 || totalNotionalUsd <= 0) {
+        return null;
+    }
+
+    preflight.orders = scaledOrders;
+    if (asNumber(cloned.size) !== null) {
+        const topSize = asNumber(cloned.size) || 0;
+        if (topSize > 0) {
+            cloned.size = Number((topSize * scale).toFixed(8));
+        }
+    }
+
+    return {
+        payload: cloned,
+        notionalUsd: totalNotionalUsd,
+    };
+}
+
+function inferDirectionalHint(raw: string | null): number {
+    if (!raw) {
+        return 0;
+    }
+    const normalized = raw.trim().toUpperCase();
+    if (!normalized) {
+        return 0;
+    }
+    if (
+        normalized.includes('LONG')
+        || normalized.includes('BUY')
+        || normalized.includes('YES')
+        || normalized.includes('UP')
+    ) {
+        return 1;
+    }
+    if (
+        normalized.includes('SHORT')
+        || normalized.includes('SELL')
+        || normalized.includes('NO')
+        || normalized.includes('DOWN')
+    ) {
+        return -1;
+    }
+    return 0;
+}
+
+function inferExecutionDirection(payload: unknown, strategyHint: string | null): number {
+    const record = asRecord(payload);
+    if (!record) {
+        return 0;
+    }
+    const details = asRecord(record.details);
+    const candidateHints: Array<string | null> = [
+        asString(details?.direction),
+        asString(details?.position_side),
+        asString(details?.side),
+        asString(record.side),
+        asString(record.action),
+    ];
+    for (const hint of candidateHints) {
+        const sign = inferDirectionalHint(hint);
+        if (sign !== 0) {
+            return sign;
+        }
+    }
+
+    const marketLabel = (asString(record.market) || '').toLowerCase();
+    if (marketLabel.includes(' long ') || marketLabel.startsWith('long ') || marketLabel.includes('long-')) {
+        return 1;
+    }
+    if (marketLabel.includes(' short ') || marketLabel.startsWith('short ') || marketLabel.includes('short-')) {
+        return -1;
+    }
+
+    if (strategyHint && strategyFamily(strategyHint) === 'FAIR_VALUE') {
+        return 1;
+    }
+
+    const orderRows = parseExecutionPreflightOrders(payload);
+    if (orderRows.length === 2) {
+        const conditionIds = new Set(
+            orderRows
+                .map((row) => row.conditionId)
+                .filter((value): value is string => typeof value === 'string' && value.length > 0),
+        );
+        if (conditionIds.size === 1) {
+            return 0;
+        }
+    }
+
+    return 0;
+}
+
+function extractExecutionEdgeTelemetry(payload: unknown): {
+    edgeBps: number | null;
+    requiredEdgeBps: number | null;
+    frictionBps: number | null;
+    retainedBps: number | null;
+} {
+    const record = asRecord(payload);
+    const details = record ? asRecord(record.details) : null;
+
+    const edgeRaw = asNumber(details?.net_edge)
+        ?? asNumber(details?.edge)
+        ?? asNumber(details?.margin);
+    const requiredRaw = asNumber(details?.required_edge)
+        ?? asNumber(details?.adaptive_entry_edge)
+        ?? asNumber(details?.threshold);
+    const roundTripCostRate = asNumber(details?.round_trip_cost_rate);
+    const spread = Math.max(
+        0,
+        asNumber(details?.spread) ?? 0,
+        asNumber(details?.yes_spread) ?? 0,
+        asNumber(details?.no_spread) ?? 0,
+    );
+
+    const edgeBps = edgeRaw === null
+        ? null
+        : ((requiredRaw === null ? edgeRaw : edgeRaw - requiredRaw) * 10_000);
+    const requiredEdgeBps = requiredRaw === null ? null : (requiredRaw * 10_000);
+    const hasFrictionInputs = roundTripCostRate !== null || spread > 0;
+    const frictionBps = hasFrictionInputs
+        ? ((roundTripCostRate || 0) * 10_000) + (spread * 5_000)
+        : null;
+    const retainedBps = edgeBps === null
+        ? null
+        : edgeBps - (frictionBps || 0);
+
+    return {
+        edgeBps,
+        requiredEdgeBps,
+        frictionBps,
+        retainedBps,
+    };
+}
+
+function buildExecutionIntentSnapshot(
+    payload: unknown,
+    strategyHint: string | null,
+    marketKeyHint: string | null,
+): ExecutionIntentSnapshot {
+    const strategy = strategyHint || extractExecutionStrategy(payload);
+    const family = strategy ? strategyFamily(strategy) : 'GENERIC';
+    const marketKey = marketKeyHint || extractExecutionMarketKey(payload);
+    const direction = inferExecutionDirection(payload, strategy);
+    const notionalUsd = executionSignalNotionalUsd(payload);
+    const edgeTelemetry = extractExecutionEdgeTelemetry(payload);
+    return {
+        strategy,
+        family,
+        marketKey,
+        direction,
+        notionalUsd,
+        edgeBps: edgeTelemetry.edgeBps,
+        requiredEdgeBps: edgeTelemetry.requiredEdgeBps,
+        frictionBps: edgeTelemetry.frictionBps,
+        retainedBps: edgeTelemetry.retainedBps,
+    };
+}
+
+function applyNettingDecay(state: ExecutionNettingMarketState, now = Date.now()): void {
+    const elapsed = Math.max(0, now - state.updated_at);
+    if (elapsed <= 0 || EXECUTION_NETTING_TTL_MS <= 0) {
+        return;
+    }
+    const decay = Math.exp(-elapsed / EXECUTION_NETTING_TTL_MS);
+    state.net_directional_notional *= decay;
+    state.long_notional *= decay;
+    state.short_notional *= decay;
+    for (const strategy of Object.keys(state.strategy_directional_notional)) {
+        const next = state.strategy_directional_notional[strategy] * decay;
+        if (Math.abs(next) < 1e-6) {
+            delete state.strategy_directional_notional[strategy];
+        } else {
+            state.strategy_directional_notional[strategy] = next;
+        }
+    }
+    state.updated_at = now;
+}
+
+function pruneExecutionNettingState(now = Date.now()): void {
+    if (!EXECUTION_NETTING_ENABLED) {
+        executionNettingByMarket.clear();
+        return;
+    }
+    for (const [marketKey, state] of executionNettingByMarket.entries()) {
+        if (now - state.updated_at > EXECUTION_NETTING_TTL_MS) {
+            executionNettingByMarket.delete(marketKey);
+            continue;
+        }
+        applyNettingDecay(state, now);
+        if (Math.abs(state.net_directional_notional) < 1e-6 && Object.keys(state.strategy_directional_notional).length === 0) {
+            executionNettingByMarket.delete(marketKey);
+        }
+    }
+}
+
+function evaluateExecutionShortfall(
+    payload: unknown,
+    intent: ExecutionIntentSnapshot,
+): ExecutionPreparationResult {
+    if (!EXECUTION_SHORTFALL_OPTIMIZER_ENABLED) {
+        return { ok: true, payload, adjusted: false };
+    }
+    const orderRows = parseExecutionPreflightOrders(payload);
+    if (orderRows.length === 0 || intent.notionalUsd <= 0) {
+        return { ok: true, payload, adjusted: false };
+    }
+    if (intent.retainedBps === null) {
+        return { ok: true, payload, adjusted: false };
+    }
+
+    if (intent.retainedBps >= EXECUTION_SHORTFALL_TARGET_RETAIN_BPS) {
+        return { ok: true, payload, adjusted: false };
+    }
+
+    const minScale = Math.max(0.01, 1 - EXECUTION_SHORTFALL_MAX_SIZE_REDUCTION_PCT);
+    let scale = minScale;
+    if (intent.retainedBps > EXECUTION_SHORTFALL_MIN_RETAIN_BPS) {
+        const denominator = Math.max(1e-6, EXECUTION_SHORTFALL_TARGET_RETAIN_BPS - EXECUTION_SHORTFALL_MIN_RETAIN_BPS);
+        const normalized = (intent.retainedBps - EXECUTION_SHORTFALL_MIN_RETAIN_BPS) / denominator;
+        scale = minScale + (Math.max(0, Math.min(1, normalized)) * (1 - minScale));
+    }
+
+    if (!(scale > 0 && scale < 0.999)) {
+        return { ok: true, payload, adjusted: false };
+    }
+
+    const scaled = scaleExecutionPayloadNotional(payload, scale);
+    if (!scaled || scaled.notionalUsd < EXECUTION_SHORTFALL_MIN_SIGNAL_NOTIONAL_USD) {
+        return {
+            ok: false,
+            payload,
+            adjusted: false,
+            stage: 'SHORTFALL',
+            reason: `retained edge ${intent.retainedBps.toFixed(2)}bps too low after costs`,
+            details: {
+                strategy: intent.strategy,
+                market_key: intent.marketKey,
+                retained_bps: intent.retainedBps,
+                edge_bps: intent.edgeBps,
+                required_edge_bps: intent.requiredEdgeBps,
+                friction_bps: intent.frictionBps,
+                notional_usd: intent.notionalUsd,
+                min_notional_usd: EXECUTION_SHORTFALL_MIN_SIGNAL_NOTIONAL_USD,
+            },
+        };
+    }
+
+    return {
+        ok: true,
+        payload: scaled.payload,
+        adjusted: true,
+        stage: 'SHORTFALL',
+        details: {
+            strategy: intent.strategy,
+            market_key: intent.marketKey,
+            retained_bps: intent.retainedBps,
+            edge_bps: intent.edgeBps,
+            friction_bps: intent.frictionBps,
+            scale,
+            notional_before: intent.notionalUsd,
+            notional_after: scaled.notionalUsd,
+        },
+    };
+}
+
+function evaluateExecutionNetting(
+    payload: unknown,
+    intent: ExecutionIntentSnapshot,
+): ExecutionPreparationResult {
+    if (!EXECUTION_NETTING_ENABLED) {
+        return { ok: true, payload, adjusted: false };
+    }
+    if (!intent.marketKey || intent.direction === 0 || intent.notionalUsd <= 0) {
+        return { ok: true, payload, adjusted: false };
+    }
+
+    pruneExecutionNettingState();
+    const state = executionNettingByMarket.get(intent.marketKey);
+    if (!state) {
+        return { ok: true, payload, adjusted: false };
+    }
+
+    const now = Date.now();
+    applyNettingDecay(state, now);
+    const currentNet = state.net_directional_notional;
+    const sameDirection = currentNet === 0 || Math.sign(currentNet) === intent.direction;
+    let scale = 1;
+
+    if (!sameDirection) {
+        const opposingNotional = Math.abs(currentNet);
+        const blockThreshold = intent.notionalUsd * EXECUTION_NETTING_OPPOSING_BLOCK_RATIO;
+        if (opposingNotional >= blockThreshold) {
+            return {
+                ok: false,
+                payload,
+                adjusted: false,
+                stage: 'NETTING',
+                reason: `opposing active exposure ${opposingNotional.toFixed(2)} blocks new signal`,
+                details: {
+                    strategy: intent.strategy,
+                    market_key: intent.marketKey,
+                    opposing_notional_usd: opposingNotional,
+                    candidate_notional_usd: intent.notionalUsd,
+                    block_ratio: EXECUTION_NETTING_OPPOSING_BLOCK_RATIO,
+                },
+            };
+        }
+        const reliefRatio = Math.min(1, opposingNotional / intent.notionalUsd);
+        scale = Math.min(scale, Math.max(0.25, 1 - reliefRatio));
+    } else {
+        const currentAbs = Math.abs(currentNet);
+        const headroom = Math.max(0, EXECUTION_NETTING_MARKET_CAP_USD - currentAbs);
+        if (headroom <= 0) {
+            return {
+                ok: false,
+                payload,
+                adjusted: false,
+                stage: 'NETTING',
+                reason: `market directional cap ${EXECUTION_NETTING_MARKET_CAP_USD.toFixed(2)} reached`,
+                details: {
+                    strategy: intent.strategy,
+                    market_key: intent.marketKey,
+                    current_net_notional_usd: currentAbs,
+                    candidate_notional_usd: intent.notionalUsd,
+                    cap_usd: EXECUTION_NETTING_MARKET_CAP_USD,
+                },
+            };
+        }
+        if (intent.notionalUsd > headroom) {
+            scale = Math.min(scale, headroom / intent.notionalUsd);
+        }
+    }
+
+    if (!(scale > 0 && scale < 0.999)) {
+        return { ok: true, payload, adjusted: false };
+    }
+
+    const scaled = scaleExecutionPayloadNotional(payload, scale);
+    if (!scaled || scaled.notionalUsd < EXECUTION_SHORTFALL_MIN_SIGNAL_NOTIONAL_USD) {
+        return {
+            ok: false,
+            payload,
+            adjusted: false,
+            stage: 'NETTING',
+            reason: 'scaled netting-adjusted notional too small',
+            details: {
+                strategy: intent.strategy,
+                market_key: intent.marketKey,
+                scale,
+                candidate_notional_usd: intent.notionalUsd,
+                min_notional_usd: EXECUTION_SHORTFALL_MIN_SIGNAL_NOTIONAL_USD,
+            },
+        };
+    }
+
+    return {
+        ok: true,
+        payload: scaled.payload,
+        adjusted: true,
+        stage: 'NETTING',
+        details: {
+            strategy: intent.strategy,
+            market_key: intent.marketKey,
+            scale,
+            notional_before: intent.notionalUsd,
+            notional_after: scaled.notionalUsd,
+            existing_net_notional_usd: currentNet,
+            cap_usd: EXECUTION_NETTING_MARKET_CAP_USD,
+        },
+    };
+}
+
+function prepareExecutionPayloadForDispatch(
+    payload: unknown,
+    strategyHint: string | null,
+    marketKeyHint: string | null,
+): ExecutionPreparationResult {
+    let workingPayload = payload;
+    const prepDetails: Record<string, unknown> = {};
+    let adjusted = false;
+
+    const initialIntent = buildExecutionIntentSnapshot(workingPayload, strategyHint, marketKeyHint);
+    const shortfall = evaluateExecutionShortfall(workingPayload, initialIntent);
+    if (!shortfall.ok) {
+        return shortfall;
+    }
+    if (shortfall.adjusted) {
+        adjusted = true;
+        workingPayload = shortfall.payload;
+        prepDetails.shortfall = shortfall.details || {};
+    }
+
+    const intentAfterShortfall = buildExecutionIntentSnapshot(workingPayload, initialIntent.strategy, initialIntent.marketKey);
+    const netting = evaluateExecutionNetting(workingPayload, intentAfterShortfall);
+    if (!netting.ok) {
+        if (Object.prototype.hasOwnProperty.call(prepDetails, 'shortfall')) {
+            netting.details = {
+                ...(netting.details || {}),
+                shortfall: prepDetails.shortfall,
+            };
+        }
+        return netting;
+    }
+    if (netting.adjusted) {
+        adjusted = true;
+        workingPayload = netting.payload;
+        prepDetails.netting = netting.details || {};
+    }
+
+    if (!adjusted) {
+        return {
+            ok: true,
+            payload: workingPayload,
+            adjusted: false,
+        };
+    }
+
+    const finalIntent = buildExecutionIntentSnapshot(workingPayload, initialIntent.strategy, initialIntent.marketKey);
+    return {
+        ok: true,
+        payload: workingPayload,
+        adjusted: true,
+        details: {
+            strategy: finalIntent.strategy,
+            market_key: finalIntent.marketKey,
+            notional_before: initialIntent.notionalUsd,
+            notional_after: finalIntent.notionalUsd,
+            shortfall: prepDetails.shortfall || null,
+            netting: prepDetails.netting || null,
+        },
+    };
+}
+
+function upsertExecutionNettingStateFromAcceptedPayload(
+    payload: unknown,
+    strategyHint: string | null,
+    marketKeyHint: string | null,
+): void {
+    if (!EXECUTION_NETTING_ENABLED) {
+        return;
+    }
+    const intent = buildExecutionIntentSnapshot(payload, strategyHint, marketKeyHint);
+    if (!intent.marketKey || intent.direction === 0 || intent.notionalUsd <= 0) {
+        return;
+    }
+    const now = Date.now();
+    pruneExecutionNettingState(now);
+    const strategy = intent.strategy || 'UNKNOWN';
+    const existing = executionNettingByMarket.get(intent.marketKey);
+    const state: ExecutionNettingMarketState = existing || {
+        market_key: intent.marketKey,
+        net_directional_notional: 0,
+        long_notional: 0,
+        short_notional: 0,
+        strategy_directional_notional: {},
+        updated_at: now,
+    };
+    applyNettingDecay(state, now);
+    if (intent.direction > 0) {
+        state.long_notional += intent.notionalUsd;
+    } else {
+        state.short_notional += intent.notionalUsd;
+    }
+    state.net_directional_notional += intent.direction * intent.notionalUsd;
+    state.strategy_directional_notional[strategy] = (
+        state.strategy_directional_notional[strategy]
+        || 0
+    ) + (intent.direction * intent.notionalUsd);
+    state.updated_at = now;
+    executionNettingByMarket.set(intent.marketKey, state);
+}
+
+function executionNettingSnapshot(limit = 30): Array<Record<string, unknown>> {
+    pruneExecutionNettingState();
+    return [...executionNettingByMarket.values()]
+        .sort((a, b) => b.updated_at - a.updated_at)
+        .slice(0, Math.max(1, limit))
+        .map((state) => ({
+            market_key: state.market_key,
+            net_directional_notional: Math.round(state.net_directional_notional * 100) / 100,
+            long_notional: Math.round(state.long_notional * 100) / 100,
+            short_notional: Math.round(state.short_notional * 100) / 100,
+            strategy_directional_notional: Object.fromEntries(
+                Object.entries(state.strategy_directional_notional).map(([strategy, notional]) => [
+                    strategy,
+                    Math.round(notional * 100) / 100,
+                ]),
+            ),
+            updated_at: state.updated_at,
+        }));
 }
 
 async function persistStrategyExecutionHistoryEntry(
@@ -2243,6 +2908,8 @@ function clearStrategyPerformance(): void {
             ema_return: 0,
             downside_ema: 0,
             return_var_ema: 0,
+            base_multiplier: DEFAULT_DISABLED_STRATEGIES.has(id) ? 0 : 1,
+            meta_overlay: 1,
             multiplier: DEFAULT_DISABLED_STRATEGIES.has(id) ? 0 : 1,
             updated_at: Date.now(),
         };
@@ -2332,11 +2999,20 @@ function ensureStrategyPerformanceEntry(strategyId: string): StrategyPerformance
             ema_return: 0,
             downside_ema: 0,
             return_var_ema: 0,
+            base_multiplier: DEFAULT_DISABLED_STRATEGIES.has(strategyId) ? 0 : 1,
+            meta_overlay: 1,
             multiplier: DEFAULT_DISABLED_STRATEGIES.has(strategyId) ? 0 : 1,
             updated_at: 0,
         };
     }
-    return strategyPerformance[strategyId];
+    const entry = strategyPerformance[strategyId];
+    if (!Number.isFinite(entry.base_multiplier)) {
+        entry.base_multiplier = Number.isFinite(entry.multiplier) ? entry.multiplier : 1;
+    }
+    if (!Number.isFinite(entry.meta_overlay) || entry.meta_overlay <= 0) {
+        entry.meta_overlay = 1;
+    }
+    return entry;
 }
 
 function ensureStrategyQualityEntry(strategyId: string): StrategyQuality {
@@ -2985,7 +3661,17 @@ async function maybeApplyGovernanceDecision(
 
     const perf = ensureStrategyPerformanceEntry(decision.strategy);
     if (decision.action === 'PROMOTE') {
-        const promotedMultiplier = Math.min(STRATEGY_WEIGHT_CAP, Math.max(perf.multiplier, 1.1 + (decision.confidence * 0.2)));
+        const promotedBaseMultiplier = Math.min(
+            STRATEGY_WEIGHT_CAP,
+            Math.max(perf.base_multiplier, perf.multiplier, 1.1 + (decision.confidence * 0.2)),
+        );
+        const promotedMetaOverlay = computePortfolioMetaAllocatorOverlay(decision.strategy, perf);
+        const promotedMultiplier = Math.min(
+            STRATEGY_WEIGHT_CAP,
+            Math.max(STRATEGY_WEIGHT_FLOOR, promotedBaseMultiplier * promotedMetaOverlay),
+        );
+        perf.base_multiplier = promotedBaseMultiplier;
+        perf.meta_overlay = promotedMetaOverlay;
         perf.multiplier = promotedMultiplier;
         perf.updated_at = now;
         await clearStrategyPause(decision.strategy);
@@ -3004,6 +3690,8 @@ async function maybeApplyGovernanceDecision(
         io.emit('strategy_risk_multiplier_update', {
             strategy: decision.strategy,
             multiplier: promotedMultiplier,
+            base_multiplier: promotedBaseMultiplier,
+            meta_overlay: promotedMetaOverlay,
             sample_count: perf.sample_count,
             ema_return: perf.ema_return,
             downside_ema: perf.downside_ema,
@@ -3021,6 +3709,8 @@ async function maybeApplyGovernanceDecision(
     }
 
     if (decision.action === 'DEMOTE_DISABLE') {
+        perf.base_multiplier = 0;
+        perf.meta_overlay = 1;
         perf.multiplier = 0;
         perf.updated_at = now;
         await clearStrategyPause(decision.strategy);
@@ -3039,6 +3729,8 @@ async function maybeApplyGovernanceDecision(
         io.emit('strategy_risk_multiplier_update', {
             strategy: decision.strategy,
             multiplier: 0,
+            base_multiplier: 0,
+            meta_overlay: 1,
             sample_count: perf.sample_count,
             ema_return: perf.ema_return,
             downside_ema: perf.downside_ema,
@@ -3408,6 +4100,11 @@ async function refreshMetaController(): Promise<void> {
         }));
     } catch (error) {
         recordSilentCatch('MetaController.PersistRegime', error, { key: 'meta_controller:regime' });
+    }
+    try {
+        await refreshAllocatorMetaOverlays('meta_controller');
+    } catch (error) {
+        recordSilentCatch('MetaController.AllocatorOverlay', error);
     }
     touchRuntimeModule(
         'REGIME_ENGINE',
@@ -5295,6 +5992,151 @@ function computeStrategyMultiplier(state: StrategyPerformance): number {
     return Math.min(STRATEGY_WEIGHT_CAP, Math.max(STRATEGY_WEIGHT_FLOOR, raw));
 }
 
+function computeFamilyAllocatorStats(family: string): {
+    meanReturn: number;
+    meanDownside: number;
+    concentration: number;
+} {
+    let weightedReturn = 0;
+    let weightedDownside = 0;
+    let weightTotal = 0;
+    let familyWeight = 0;
+    let totalWeight = 0;
+
+    for (const strategyId of STRATEGY_IDS) {
+        const perf = ensureStrategyPerformanceEntry(strategyId);
+        const weight = Math.max(0.25, perf.sample_count > 0 ? Math.min(2.0, perf.sample_count / 20) : 0.25);
+        const effectiveBase = Number.isFinite(perf.base_multiplier) && perf.base_multiplier > 0
+            ? perf.base_multiplier
+            : Math.max(0, perf.multiplier);
+        totalWeight += effectiveBase;
+        if (strategyFamily(strategyId) !== family) {
+            continue;
+        }
+        familyWeight += effectiveBase;
+        weightedReturn += perf.ema_return * weight;
+        weightedDownside += perf.downside_ema * weight;
+        weightTotal += weight;
+    }
+
+    return {
+        meanReturn: weightTotal > 0 ? weightedReturn / weightTotal : 0,
+        meanDownside: weightTotal > 0 ? weightedDownside / weightTotal : 0,
+        concentration: totalWeight > 0 ? familyWeight / totalWeight : 0,
+    };
+}
+
+function computePortfolioMetaAllocatorOverlay(strategyId: string, state: StrategyPerformance): number {
+    if (!META_ALLOCATOR_ENABLED) {
+        return 1;
+    }
+
+    const family = strategyFamily(strategyId);
+    const familyStats = computeFamilyAllocatorStats(family);
+    const diagnostics = ensureStrategyCostDiagnosticsEntry(strategyId);
+    const confidence = Math.min(1, state.sample_count / Math.max(STRATEGY_ALLOCATOR_MIN_SAMPLES, 24));
+
+    let overlay = 1;
+
+    const override = metaControllerState.strategy_overrides[strategyId]?.recommended_multiplier;
+    if (Number.isFinite(override)) {
+        const regimeConfidence = Math.max(0.20, Math.min(1, metaControllerState.confidence));
+        overlay *= 1 + (((override || 1) - 1) * META_ALLOCATOR_META_BLEND * regimeConfidence);
+    }
+
+    const familyMomentum = Math.max(-1, Math.min(1, familyStats.meanReturn / 0.06));
+    overlay *= 1 + (familyMomentum * 0.18 * Math.max(0.25, confidence));
+
+    const downsidePenalty = Math.min(
+        0.28,
+        Math.max(0, Math.max(state.downside_ema, familyStats.meanDownside)) * (0.8 + ((1 - confidence) * 0.4)),
+    );
+    overlay *= (1 - downsidePenalty);
+
+    if (familyStats.concentration > META_ALLOCATOR_FAMILY_CONCENTRATION_SOFT_CAP) {
+        const room = Math.max(1e-6, 1 - META_ALLOCATOR_FAMILY_CONCENTRATION_SOFT_CAP);
+        const concentrationOver = (familyStats.concentration - META_ALLOCATOR_FAMILY_CONCENTRATION_SOFT_CAP) / room;
+        overlay *= 1 - Math.min(0.25, concentrationOver * 0.25);
+    }
+
+    if (diagnostics.cost_drag_samples >= 6) {
+        const excessCostDrag = Math.max(0, diagnostics.avg_cost_drag_bps - META_ALLOCATOR_COST_DRAG_PENALTY_BPS);
+        overlay *= 1 - Math.min(0.20, excessCostDrag / 220);
+    }
+
+    if (!Number.isFinite(overlay) || overlay <= 0) {
+        return META_ALLOCATOR_MIN_OVERLAY;
+    }
+
+    return Math.min(META_ALLOCATOR_MAX_OVERLAY, Math.max(META_ALLOCATOR_MIN_OVERLAY, overlay));
+}
+
+function computeEffectiveStrategyMultiplier(strategyId: string, state: StrategyPerformance): {
+    baseMultiplier: number;
+    metaOverlay: number;
+    multiplier: number;
+} {
+    const baseMultiplier = computeStrategyMultiplier(state);
+    const metaOverlay = computePortfolioMetaAllocatorOverlay(strategyId, state);
+    const combined = baseMultiplier * metaOverlay;
+    const multiplier = combined <= 0
+        ? 0
+        : Math.min(STRATEGY_WEIGHT_CAP, Math.max(STRATEGY_WEIGHT_FLOOR, combined));
+    return {
+        baseMultiplier,
+        metaOverlay,
+        multiplier,
+    };
+}
+
+async function refreshAllocatorMetaOverlays(source: string): Promise<void> {
+    if (!META_ALLOCATOR_ENABLED) {
+        return;
+    }
+    let updated = 0;
+    const now = Date.now();
+    for (const strategyId of STRATEGY_IDS) {
+        const state = ensureStrategyPerformanceEntry(strategyId);
+        if (state.sample_count <= 0) {
+            continue;
+        }
+        const baseMultiplier = Number.isFinite(state.base_multiplier) && state.base_multiplier > 0
+            ? state.base_multiplier
+            : computeStrategyMultiplier(state);
+        const metaOverlay = computePortfolioMetaAllocatorOverlay(strategyId, state);
+        const nextMultiplier = Math.min(
+            STRATEGY_WEIGHT_CAP,
+            Math.max(STRATEGY_WEIGHT_FLOOR, baseMultiplier * metaOverlay),
+        );
+        const changed = Math.abs(nextMultiplier - state.multiplier) >= 0.01
+            || Math.abs(metaOverlay - state.meta_overlay) >= 0.01;
+        if (!changed) {
+            continue;
+        }
+        state.base_multiplier = baseMultiplier;
+        state.meta_overlay = metaOverlay;
+        state.multiplier = nextMultiplier;
+        state.updated_at = now;
+        await publishStrategyMultiplier(strategyId, nextMultiplier);
+        io.emit('strategy_risk_multiplier_update', {
+            strategy: strategyId,
+            multiplier: nextMultiplier,
+            base_multiplier: baseMultiplier,
+            meta_overlay: metaOverlay,
+            sample_count: state.sample_count,
+            ema_return: state.ema_return,
+            downside_ema: state.downside_ema,
+            return_var_ema: state.return_var_ema,
+            timestamp: now,
+            source,
+        });
+        updated += 1;
+    }
+    if (updated > 0) {
+        touchRuntimeModule('RISK_ALLOCATOR', 'ONLINE', `meta allocator refreshed ${updated} strategies (${source})`);
+    }
+}
+
 async function publishStrategyMultiplier(strategyId: string, multiplier: number): Promise<void> {
     const bounded = multiplier <= 0
         ? 0
@@ -5412,13 +6254,18 @@ async function updateStrategyAllocator(strategyId: string, pnl: number, notional
     } else {
         state.loss_count += 1;
     }
-    state.multiplier = computeStrategyMultiplier(state);
+    const effective = computeEffectiveStrategyMultiplier(strategyId, state);
+    state.base_multiplier = effective.baseMultiplier;
+    state.meta_overlay = effective.metaOverlay;
+    state.multiplier = effective.multiplier;
     state.updated_at = Date.now();
 
     await publishStrategyMultiplier(strategyId, state.multiplier);
     io.emit('strategy_risk_multiplier_update', {
         strategy: strategyId,
         multiplier: state.multiplier,
+        base_multiplier: state.base_multiplier,
+        meta_overlay: state.meta_overlay,
         sample_count: state.sample_count,
         ema_return: state.ema_return,
         downside_ema: state.downside_ema,
@@ -5442,8 +6289,10 @@ async function bootstrapStrategyMultipliers(resetToNeutral = false): Promise<voi
         await redisClient.expire(key, 86400); // 24 hours
         const raw = asNumber(await redisClient.get(key));
         const multiplier = Number.isFinite(raw) && raw !== null
-            ? Math.min(STRATEGY_WEIGHT_CAP, Math.max(STRATEGY_WEIGHT_FLOOR, raw))
+            ? (raw <= 0 ? 0 : Math.min(STRATEGY_WEIGHT_CAP, Math.max(STRATEGY_WEIGHT_FLOOR, raw)))
             : baseline;
+        state.base_multiplier = multiplier;
+        state.meta_overlay = 1;
         state.multiplier = multiplier;
         state.updated_at = Date.now();
         await publishStrategyMultiplier(strategyId, multiplier);
@@ -5516,6 +6365,7 @@ async function resetSimulationState(
     clearFeatureRegistry();
     clearModelInferenceState();
     clearModelDriftState();
+    executionNettingByMarket.clear();
     await resetRiskGuardStates();
     // Preserve any operator-enabled/disabled strategy toggles by default.
     // For deterministic benchmark runs, callers can force defaults.
@@ -5697,19 +6547,106 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                     touchRuntimeModule('INTELLIGENCE_GATE', 'DEGRADED', `${parsedStrategy} disabled`);
                     return;
                 }
+
+                const preparation = prepareExecutionPayloadForDispatch(parsed, parsedStrategy, parsedMarketKey);
+                if (!preparation.ok) {
+                    const mode = await getTradingMode();
+                    const stage = preparation.stage || 'SHORTFALL';
+                    const strategy = parsedStrategy || extractExecutionStrategy(parsed) || 'UNKNOWN';
+                    const marketKey = parsedMarketKey || extractExecutionMarketKey(parsed);
+                    const reason = `[${stage}] ${preparation.reason || 'execution blocked by preparation engine'}`;
+                    const prepBlockPayload = {
+                        execution_id: executionId,
+                        timestamp: Date.now(),
+                        strategy,
+                        market_key: marketKey,
+                        reason,
+                        mode,
+                        details: preparation.details || null,
+                    };
+                    pushExecutionTraceEvent(executionId, 'INTELLIGENCE_GATE', prepBlockPayload, {
+                        strategy,
+                        market_key: marketKey,
+                    });
+                    io.emit('execution_log', {
+                        execution_id: executionId,
+                        timestamp: prepBlockPayload.timestamp,
+                        side: `${stage}_BLOCK`,
+                        market: asString(asRecord(parsed)?.market) || 'Polymarket',
+                        price: prepBlockPayload.reason,
+                        size: prepBlockPayload.strategy,
+                        mode,
+                        details: prepBlockPayload,
+                    });
+                    recordRejectedSignal({
+                        stage: 'INTELLIGENCE_GATE',
+                        execution_id: executionId,
+                        strategy: prepBlockPayload.strategy,
+                        market_key: prepBlockPayload.market_key,
+                        reason: prepBlockPayload.reason,
+                        mode,
+                        timestamp: prepBlockPayload.timestamp,
+                        payload: asRecord(prepBlockPayload),
+                    });
+                    touchRuntimeModule('EXECUTION_PREFLIGHT', 'DEGRADED', `${stage} blocked ${strategy}`);
+                    return;
+                }
+
+                const dispatchPayload = preparation.payload;
+                const dispatchStrategy = parsedStrategy || extractExecutionStrategy(dispatchPayload);
+                const dispatchMarketKey = parsedMarketKey || extractExecutionMarketKey(dispatchPayload);
+                if (preparation.adjusted) {
+                    const prepAdjustedPayload = {
+                        execution_id: executionId,
+                        timestamp: Date.now(),
+                        strategy: dispatchStrategy || 'UNKNOWN',
+                        market_key: dispatchMarketKey,
+                        reason: '[EXECUTION_PREP] payload adjusted by shortfall/netting engine',
+                        details: preparation.details || {},
+                    };
+                    pushExecutionTraceEvent(executionId, 'INTELLIGENCE_GATE', prepAdjustedPayload, {
+                        strategy: dispatchStrategy,
+                        market_key: dispatchMarketKey,
+                    });
+                    io.emit('execution_log', {
+                        execution_id: executionId,
+                        timestamp: prepAdjustedPayload.timestamp,
+                        side: 'EXECUTION_PREP',
+                        market: asString(asRecord(dispatchPayload)?.market) || 'Polymarket',
+                        price: prepAdjustedPayload.reason,
+                        size: prepAdjustedPayload.strategy,
+                        mode: 'LIVE_GUARD',
+                        details: prepAdjustedPayload,
+                    });
+                    touchRuntimeModule(
+                        'EXECUTION_PREFLIGHT',
+                        'ONLINE',
+                        `execution prep adjusted ${dispatchStrategy || 'UNKNOWN'}`,
+                    );
+                }
                 await processArbitrageExecutionWorker(
                     {
-                        parsed,
+                        parsed: dispatchPayload,
                         executionId,
-                        parsedStrategy,
-                        parsedMarketKey,
+                        parsedStrategy: dispatchStrategy,
+                        parsedMarketKey: dispatchMarketKey,
                     },
                     {
                         getTradingMode,
                         evaluateIntelligenceGate,
                         evaluateModelProbabilityGate,
                         preflightFromExecution: polymarketPreflight.preflightFromExecution.bind(polymarketPreflight),
-                        executeFromExecution: polymarketPreflight.executeFromExecution.bind(polymarketPreflight),
+                        executeFromExecution: async (payload, tradingMode) => {
+                            const live = await polymarketPreflight.executeFromExecution(payload, tradingMode);
+                            if (live && live.ok && tradingMode === 'LIVE') {
+                                upsertExecutionNettingStateFromAcceptedPayload(
+                                    payload,
+                                    dispatchStrategy || extractExecutionStrategy(payload),
+                                    dispatchMarketKey || extractExecutionMarketKey(payload),
+                                );
+                            }
+                            return live;
+                        },
                         registerAtomicExecution: settlementService.registerAtomicExecution.bind(settlementService),
                         emitSettlementEvents,
                         pushExecutionTraceEvent,
@@ -6080,6 +7017,7 @@ redisSubscriber.subscribe('system:simulation_reset', (msg) => {
         clearFeatureRegistry();
         clearModelInferenceState();
         clearModelDriftState();
+        executionNettingByMarket.clear();
         fireAndForget('RiskGuard.ResetState', resetRiskGuardStates(), {
             source: 'system:simulation_reset',
         });
@@ -6488,11 +7426,19 @@ app.get('/api/arb/stats', async (_req, res) => {
         model_drift: modelDriftPayload(),
         model_gate_calibration: modelGateCalibrationPayload(),
         cross_horizon_router: crossHorizonRouterState,
+        execution_netting: {
+            enabled: EXECUTION_NETTING_ENABLED,
+            ttl_ms: EXECUTION_NETTING_TTL_MS,
+            market_cap_usd: EXECUTION_NETTING_MARKET_CAP_USD,
+            entries: executionNettingSnapshot(),
+        },
         strategy_allocator: Object.fromEntries(
             STRATEGY_IDS.map((strategyId) => {
                 const perf = ensureStrategyPerformanceEntry(strategyId);
                 return [strategyId, {
                     multiplier: Math.round(perf.multiplier * 1000) / 1000,
+                    base_multiplier: Math.round(perf.base_multiplier * 1000) / 1000,
+                    meta_overlay: Math.round(perf.meta_overlay * 1000) / 1000,
                     sample_count: perf.sample_count,
                     ema_return: Math.round(perf.ema_return * 10000) / 10000,
                     updated_at: perf.updated_at,

@@ -41,7 +41,7 @@ function App() {
             />
             <Route
               path="/fair-value"
-              element={<StrategyPage title="Fair Value Engine" description="Cross-asset fair-value windows with directional policy and threshold controls." strategyIds={['BTC_15M', 'ETH_15M', 'SOL_15M']} />}
+              element={<StrategyPage title="Fair Value Engine" description="Cross-asset fair-value windows with directional policy and threshold controls." strategyIds={['BTC_5M', 'BTC_15M', 'ETH_5M', 'ETH_15M', 'SOL_5M', 'SOL_15M']} />}
             />
             <Route
               path="/syndicate"
@@ -63,7 +63,7 @@ function App() {
             <Route path="/intelligence" element={<HftDashboardPage />} />
             <Route
               path="/strategies"
-              element={<StrategyPage title="Strategy Coverage" description="Unified execution and PnL telemetry across all active production strategies." strategyIds={['BTC_5M', 'BTC_15M', 'ETH_15M', 'SOL_15M', 'CEX_SNIPER', 'SYNDICATE', 'ATOMIC_ARB', 'OBI_SCALPER', 'GRAPH_ARB', 'CONVERGENCE_CARRY', 'MAKER_MM', 'AS_MARKET_MAKER', 'LONGSHOT_BIAS']} />}
+              element={<StrategyPage title="Strategy Coverage" description="Unified execution and PnL telemetry across all active production strategies." strategyIds={['BTC_5M', 'BTC_15M', 'ETH_5M', 'ETH_15M', 'SOL_5M', 'SOL_15M', 'CEX_SNIPER', 'SYNDICATE', 'ATOMIC_ARB', 'OBI_SCALPER', 'GRAPH_ARB', 'CONVERGENCE_CARRY', 'MAKER_MM', 'AS_MARKET_MAKER', 'LONGSHOT_BIAS']} />}
             />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

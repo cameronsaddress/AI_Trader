@@ -268,7 +268,7 @@ fn global_utilization_cap_pct() -> f64 {
 
 pub fn strategy_family(strategy_id: &str) -> &'static str {
     match strategy_id.trim().to_uppercase().as_str() {
-        "BTC_5M" | "BTC_15M" | "ETH_15M" | "SOL_15M" => "FAIR_VALUE",
+        "BTC_5M" | "BTC_15M" | "ETH_5M" | "ETH_15M" | "SOL_5M" | "SOL_15M" => "FAIR_VALUE",
         "ATOMIC_ARB" | "GRAPH_ARB" => "ARBITRAGE",
         "CEX_SNIPER" => "CEX_MICROSTRUCTURE",
         "OBI_SCALPER" => "ORDER_FLOW",
@@ -284,8 +284,8 @@ pub fn strategy_family(strategy_id: &str) -> &'static str {
 pub fn strategy_underlying(strategy_id: &str) -> &'static str {
     match strategy_id.trim().to_uppercase().as_str() {
         "BTC_5M" | "BTC_15M" => "BTC",
-        "ETH_15M" => "ETH",
-        "SOL_15M" => "SOL",
+        "ETH_5M" | "ETH_15M" => "ETH",
+        "SOL_5M" | "SOL_15M" => "SOL",
         "CEX_SNIPER" | "OBI_SCALPER" | "SYNDICATE" => "BTC",
         "ATOMIC_ARB" | "GRAPH_ARB" | "CONVERGENCE_CARRY" | "MAKER_MM"
             | "AS_MARKET_MAKER" | "LONGSHOT_BIAS" => "POLY_EVENT",

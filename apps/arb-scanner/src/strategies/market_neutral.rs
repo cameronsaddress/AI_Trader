@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::{Timelike, Utc};
+use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde_json::Value;
@@ -233,6 +233,7 @@ struct Position {
 pub struct MarketNeutralStrategy {
     client: PolymarketClient,
     asset: String,
+    horizon_seconds: i64,
     latest_spot_price: Arc<RwLock<(f64, i64)>>,
     spot_history: Arc<RwLock<VecDeque<(i64, f64)>>>,
     open_position: Arc<RwLock<Option<Position>>>,
@@ -240,21 +241,45 @@ pub struct MarketNeutralStrategy {
 
 impl MarketNeutralStrategy {
     pub fn new(asset: String) -> Self {
+        Self::new_with_window(asset, 900)
+    }
+
+    pub fn new_with_window(asset: String, horizon_seconds: i64) -> Self {
+        let window = horizon_seconds.clamp(60, 24 * 60 * 60);
         Self {
             client: PolymarketClient::new(),
             asset,
+            horizon_seconds: window,
             latest_spot_price: Arc::new(RwLock::new((0.0, 0))),
             spot_history: Arc::new(RwLock::new(VecDeque::new())),
             open_position: Arc::new(RwLock::new(None)),
         }
     }
 
+    fn window_seconds(&self) -> i64 {
+        self.horizon_seconds.clamp(60, 24 * 60 * 60)
+    }
+
+    fn window_minutes(&self) -> i64 {
+        (self.window_seconds() / 60).max(1)
+    }
+
     fn strategy_id(&self) -> String {
-        format!("{}_15M", self.asset)
+        format!("{}_{}M", self.asset, self.window_minutes())
     }
 
     fn heartbeat_id(&self) -> String {
-        format!("{}_15m", self.asset.to_lowercase())
+        format!("{}_{}m", self.asset.to_lowercase(), self.window_minutes())
+    }
+
+    fn entry_expiry_cutoff_secs(&self) -> i64 {
+        let default_cutoff = if self.window_seconds() <= 300 { 20 } else { ENTRY_EXPIRY_CUTOFF_SECS };
+        let env_key = format!("{}_{}M_ENTRY_EXPIRY_CUTOFF_SECS", self.asset, self.window_minutes());
+        std::env::var(&env_key)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .unwrap_or(default_cutoff)
+            .clamp(5, self.window_seconds().saturating_sub(5))
     }
 
     fn calculate_fair_value(&self, spot: f64, strike: f64, time_to_expiry_years: f64, sigma: f64) -> f64 {
@@ -274,26 +299,14 @@ impl MarketNeutralStrategy {
     }
 
     fn parse_window_start_ts(slug: &str) -> Option<i64> {
-        slug
-            .split("-15m-")
-            .nth(1)
-            .and_then(|s| s.parse::<i64>().ok())
+        slug.rsplit('-').next().and_then(|s| s.parse::<i64>().ok())
     }
 
     fn current_window_slug(&self) -> String {
-        let now = Utc::now();
-        let minute = now.minute();
-        let window_start_minute = minute - (minute % 15);
-        let window_start = match now
-            .with_minute(window_start_minute)
-            .and_then(|x| x.with_second(0))
-            .and_then(|x| x.with_nanosecond(0))
-        {
-            Some(ts) => ts,
-            None => now,
-        };
-
-        format!("{}-updown-15m-{}", self.asset.to_lowercase(), window_start.timestamp())
+        let window = self.window_seconds();
+        let now_ts = Utc::now().timestamp();
+        let window_start = now_ts - now_ts.rem_euclid(window);
+        format!("{}-updown-{}m-{}", self.asset.to_lowercase(), self.window_minutes(), window_start)
     }
 
     fn spot_at_window_start(history: &VecDeque<(i64, f64)>, window_start_ms: i64) -> Option<f64> {
@@ -466,7 +479,7 @@ impl Strategy for MarketNeutralStrategy {
 
         loop {
             let target_market = loop {
-                if let Some(m) = self.client.fetch_current_market(&self.asset).await {
+                if let Some(m) = self.client.fetch_current_market_window(&self.asset, self.window_seconds()).await {
                     break m;
                 }
                 sleep(Duration::from_secs(5)).await;
@@ -511,9 +524,9 @@ impl Strategy for MarketNeutralStrategy {
             let mut interval = tokio::time::interval(Duration::from_millis(250));
             let window_start_ts = Self::parse_window_start_ts(&target_market.slug).unwrap_or_else(|| {
                 let now_ts = Utc::now().timestamp();
-                now_ts - now_ts.rem_euclid(900)
+                now_ts - now_ts.rem_euclid(self.window_seconds())
             });
-            let expiry_ts = window_start_ts + 900;
+            let expiry_ts = window_start_ts + self.window_seconds();
 
             let mut book = BinaryBook::default();
             let mut last_live_preview_ms = 0_i64;
@@ -549,6 +562,7 @@ impl Strategy for MarketNeutralStrategy {
                     _ = interval.tick() => {
                         let strategy_id = self.strategy_id();
                         let heartbeat_id = self.heartbeat_id();
+                        let entry_expiry_cutoff_secs = self.entry_expiry_cutoff_secs();
 
                         if !is_strategy_enabled(&mut conn, &strategy_id).await {
                             let released_notional = {
@@ -872,7 +886,7 @@ impl Strategy for MarketNeutralStrategy {
                             if passes_threshold
                                 && book.yes.best_ask > 0.0
                                 && yes_spread <= params.max_entry_spread
-                                && remaining_seconds > ENTRY_EXPIRY_CUTOFF_SECS
+                                && remaining_seconds > entry_expiry_cutoff_secs
                                 && now_ms - last_entry_ms >= ENTRY_COOLDOWN_MS
                                 && now_ms - last_live_preview_ms >= LIVE_PREVIEW_COOLDOWN_MS
                             {
@@ -1004,7 +1018,7 @@ impl Strategy for MarketNeutralStrategy {
                             // Skip if already positioned in this market (duplicate market guard)
                             if pos_lock.is_none()
                                 && passes_threshold
-                                && remaining_seconds > ENTRY_EXPIRY_CUTOFF_SECS
+                                && remaining_seconds > entry_expiry_cutoff_secs
                                 && now_ms - last_entry_ms >= ENTRY_COOLDOWN_MS
                             {
                                 entry_signal_price = Some(book.yes.best_ask);

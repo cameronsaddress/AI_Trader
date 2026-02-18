@@ -10,7 +10,9 @@ import type { RuntimePhase, RuntimeModuleState } from '../types/backend-types';
 export const STRATEGY_IDS = [
     'BTC_5M',
     'BTC_15M',
+    'ETH_5M',
     'ETH_15M',
+    'SOL_5M',
     'SOL_15M',
     'CEX_SNIPER',
     'SYNDICATE',
@@ -27,7 +29,9 @@ export const SCANNER_HEARTBEAT_IDS = [
     'scanner_swarms',
     'btc_5m',
     'btc_15m',
+    'eth_5m',
     'eth_15m',
+    'sol_5m',
     'sol_15m',
     'cex_arb',
     'SYNDICATE',
@@ -85,6 +89,27 @@ export const STRATEGY_WEIGHT_CAP = Math.min(3.0, Math.max(1.0, Number(process.en
 export const STRATEGY_ALLOCATOR_EPSILON = 1e-6;
 export const STRATEGY_ALLOCATOR_MIN_SAMPLES = Math.max(4, Number(process.env.STRATEGY_ALLOCATOR_MIN_SAMPLES || '30'));
 export const STRATEGY_ALLOCATOR_TARGET_SHARPE = Number(process.env.STRATEGY_ALLOCATOR_TARGET_SHARPE || '0.55');
+export const META_ALLOCATOR_ENABLED = process.env.META_ALLOCATOR_ENABLED !== 'false';
+export const META_ALLOCATOR_META_BLEND = Math.min(
+    1,
+    Math.max(0, Number(process.env.META_ALLOCATOR_META_BLEND || '0.65')),
+);
+export const META_ALLOCATOR_MIN_OVERLAY = Math.max(
+    0.25,
+    Number(process.env.META_ALLOCATOR_MIN_OVERLAY || '0.55'),
+);
+export const META_ALLOCATOR_MAX_OVERLAY = Math.max(
+    META_ALLOCATOR_MIN_OVERLAY,
+    Number(process.env.META_ALLOCATOR_MAX_OVERLAY || '1.45'),
+);
+export const META_ALLOCATOR_FAMILY_CONCENTRATION_SOFT_CAP = Math.min(
+    0.95,
+    Math.max(0.15, Number(process.env.META_ALLOCATOR_FAMILY_CONCENTRATION_SOFT_CAP || '0.45')),
+);
+export const META_ALLOCATOR_COST_DRAG_PENALTY_BPS = Math.max(
+    0,
+    Number(process.env.META_ALLOCATOR_COST_DRAG_PENALTY_BPS || '25'),
+);
 export const DEFAULT_DISABLED_STRATEGIES = new Set(
     (process.env.DEFAULT_DISABLED_STRATEGIES || 'SOL_15M,SYNDICATE')
         .split(',')
@@ -131,7 +156,9 @@ export const INTELLIGENCE_GATE_STRONG_MARGIN = Math.max(0, Number(process.env.IN
 export const INTELLIGENCE_GATE_CONFIRMATION_STRATEGIES = new Set([
     'BTC_5M',
     'BTC_15M',
+    'ETH_5M',
     'ETH_15M',
+    'SOL_5M',
     'SOL_15M',
     'CEX_SNIPER',
     'OBI_SCALPER',
@@ -139,6 +166,33 @@ export const INTELLIGENCE_GATE_CONFIRMATION_STRATEGIES = new Set([
     'MAKER_MM',
 ]);
 export const INTELLIGENCE_SCAN_RETENTION_MS = Math.max(60_000, INTELLIGENCE_GATE_CONFIRMATION_WINDOW_MS * 20);
+export const EXECUTION_SHORTFALL_OPTIMIZER_ENABLED = process.env.EXECUTION_SHORTFALL_OPTIMIZER_ENABLED !== 'false';
+export const EXECUTION_SHORTFALL_TARGET_RETAIN_BPS = Math.max(
+    1,
+    Number(process.env.EXECUTION_SHORTFALL_TARGET_RETAIN_BPS || '18'),
+);
+export const EXECUTION_SHORTFALL_MIN_RETAIN_BPS = Number(process.env.EXECUTION_SHORTFALL_MIN_RETAIN_BPS || '2');
+export const EXECUTION_SHORTFALL_MAX_SIZE_REDUCTION_PCT = Math.min(
+    0.95,
+    Math.max(0, Number(process.env.EXECUTION_SHORTFALL_MAX_SIZE_REDUCTION_PCT || '0.75')),
+);
+export const EXECUTION_SHORTFALL_MIN_SIGNAL_NOTIONAL_USD = Math.max(
+    1,
+    Number(process.env.EXECUTION_SHORTFALL_MIN_SIGNAL_NOTIONAL_USD || '10'),
+);
+export const EXECUTION_NETTING_ENABLED = process.env.EXECUTION_NETTING_ENABLED !== 'false';
+export const EXECUTION_NETTING_TTL_MS = Math.max(
+    60_000,
+    Number(process.env.EXECUTION_NETTING_TTL_MS || '1200000'),
+);
+export const EXECUTION_NETTING_MARKET_CAP_USD = Math.max(
+    50,
+    Number(process.env.EXECUTION_NETTING_MARKET_CAP_USD || '1200'),
+);
+export const EXECUTION_NETTING_OPPOSING_BLOCK_RATIO = Math.min(
+    2.5,
+    Math.max(0.25, Number(process.env.EXECUTION_NETTING_OPPOSING_BLOCK_RATIO || '0.85')),
+);
 
 // ── Data Integrity ──────────────────────────────────────────────────
 export const DATA_INTEGRITY_ALERT_COOLDOWN_MS = Math.max(10_000, Number(process.env.DATA_INTEGRITY_ALERT_COOLDOWN_MS || '60000'));

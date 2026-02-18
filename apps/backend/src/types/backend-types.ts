@@ -59,6 +59,8 @@ export type StrategyPerformance = {
     ema_return: number;
     downside_ema: number;
     return_var_ema: number;
+    base_multiplier: number;
+    meta_overlay: number;
     multiplier: number;
     updated_at: number;
 };
