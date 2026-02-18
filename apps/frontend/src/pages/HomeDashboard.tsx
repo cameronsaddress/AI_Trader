@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useSocket } from '../context/SocketContext';
 import { DashboardLayout } from '../components/layout/DashboardLayout';
+import { apiUrl } from '../lib/api';
 import type {
   ScannerUpdateEvent,
   ExecutionLogEvent,
@@ -49,6 +50,69 @@ type RiskGuardState = {
   cooldown_active: boolean;
   open_notional: number;
   drawdown_pct: number;
+};
+
+type EntryFreshnessViolationCategory = 'MISSING_TELEMETRY' | 'STALE_SOURCE' | 'STALE_GATE' | 'OTHER';
+
+type EntryFreshnessSloAlert = {
+  execution_id: string;
+  strategy: string;
+  market_key: string | null;
+  category: EntryFreshnessViolationCategory;
+  reason: string;
+  timestamp: number;
+};
+
+type EntryFreshnessSloStrategy = {
+  strategy: string;
+  total: number;
+  missing_telemetry: number;
+  stale_source: number;
+  stale_gate: number;
+  other: number;
+  last_violation_at: number;
+  last_reason: string;
+};
+
+type EntryFreshnessSloState = {
+  totals: {
+    total: number;
+    missing_telemetry: number;
+    stale_source: number;
+    stale_gate: number;
+    other: number;
+  };
+  strategies: Record<string, EntryFreshnessSloStrategy>;
+  recent_alerts: EntryFreshnessSloAlert[];
+  updated_at: number;
+};
+
+type SilentCatchContextValue = string | number | boolean | null;
+
+type SilentCatchTelemetryEntry = {
+  count: number;
+  first_seen: number;
+  last_seen: number;
+  last_message: string;
+  last_context: Record<string, SilentCatchContextValue>;
+};
+
+type SilentCatchTelemetryState = Record<string, SilentCatchTelemetryEntry>;
+
+type RuntimeHealth = 'ONLINE' | 'DEGRADED' | 'OFFLINE' | 'STANDBY';
+
+type RuntimeModuleState = {
+  id: string;
+  label: string;
+  health: RuntimeHealth;
+  heartbeat_ms: number;
+  events: number;
+  last_detail: string;
+};
+
+type RuntimeStatusState = {
+  modules: RuntimeModuleState[];
+  timestamp: number;
 };
 
 const ALL_STRATEGIES = [
@@ -132,6 +196,161 @@ function parseNumber(value: unknown): number | null {
   return null;
 }
 
+function parseText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function emptyEntryFreshnessSloState(updatedAt = 0): EntryFreshnessSloState {
+  return {
+    totals: {
+      total: 0,
+      missing_telemetry: 0,
+      stale_source: 0,
+      stale_gate: 0,
+      other: 0,
+    },
+    strategies: {},
+    recent_alerts: [],
+    updated_at: updatedAt,
+  };
+}
+
+function parseEntryFreshnessCategory(value: unknown): EntryFreshnessViolationCategory {
+  if (value === 'MISSING_TELEMETRY') return value;
+  if (value === 'STALE_SOURCE') return value;
+  if (value === 'STALE_GATE') return value;
+  return 'OTHER';
+}
+
+function parseEntryFreshnessSloAlert(input: unknown): EntryFreshnessSloAlert | null {
+  const row = asRecord(input);
+  if (!row) return null;
+  const strategy = (parseText(row.strategy) || 'UNKNOWN').toUpperCase();
+  const executionId = parseText(row.execution_id) || `${strategy}:${Date.now()}`;
+  return {
+    execution_id: executionId,
+    strategy,
+    market_key: parseText(row.market_key),
+    category: parseEntryFreshnessCategory(row.category),
+    reason: parseText(row.reason) || '',
+    timestamp: parseNumber(row.timestamp) ?? Date.now(),
+  };
+}
+
+function parseEntryFreshnessSloState(input: unknown): EntryFreshnessSloState {
+  const row = asRecord(input);
+  if (!row) return emptyEntryFreshnessSloState();
+  const totals = asRecord(row.totals) || {};
+  const strategiesRaw = asRecord(row.strategies) || {};
+  const strategies: Record<string, EntryFreshnessSloStrategy> = {};
+  Object.entries(strategiesRaw).forEach(([strategy, value]) => {
+    const entry = asRecord(value);
+    if (!entry) return;
+    const normalized = (parseText(entry.strategy) || strategy).toUpperCase();
+    strategies[normalized] = {
+      strategy: normalized,
+      total: parseNumber(entry.total) ?? 0,
+      missing_telemetry: parseNumber(entry.missing_telemetry) ?? 0,
+      stale_source: parseNumber(entry.stale_source) ?? 0,
+      stale_gate: parseNumber(entry.stale_gate) ?? 0,
+      other: parseNumber(entry.other) ?? 0,
+      last_violation_at: parseNumber(entry.last_violation_at) ?? 0,
+      last_reason: parseText(entry.last_reason) || '',
+    };
+  });
+  const recentAlerts = Array.isArray(row.recent_alerts)
+    ? row.recent_alerts
+      .map((entry) => parseEntryFreshnessSloAlert(entry))
+      .filter((entry): entry is EntryFreshnessSloAlert => entry !== null)
+    : [];
+  return {
+    totals: {
+      total: parseNumber(totals.total) ?? 0,
+      missing_telemetry: parseNumber(totals.missing_telemetry) ?? 0,
+      stale_source: parseNumber(totals.stale_source) ?? 0,
+      stale_gate: parseNumber(totals.stale_gate) ?? 0,
+      other: parseNumber(totals.other) ?? 0,
+    },
+    strategies,
+    recent_alerts: recentAlerts,
+    updated_at: parseNumber(row.updated_at) ?? 0,
+  };
+}
+
+function parseSilentCatchTelemetry(input: unknown): SilentCatchTelemetryState {
+  const row = asRecord(input);
+  if (!row) return {};
+  const parsed: SilentCatchTelemetryState = {};
+  Object.entries(row).forEach(([scope, value]) => {
+    const entry = asRecord(value);
+    if (!entry) return;
+    const contextRaw = asRecord(entry.last_context) || {};
+    const context: Record<string, SilentCatchContextValue> = {};
+    Object.entries(contextRaw).forEach(([key, raw]) => {
+      if (raw === null || typeof raw === 'string' || typeof raw === 'number' || typeof raw === 'boolean') {
+        context[key] = raw;
+      } else {
+        context[key] = String(raw);
+      }
+    });
+    parsed[scope] = {
+      count: parseNumber(entry.count) ?? 0,
+      first_seen: parseNumber(entry.first_seen) ?? 0,
+      last_seen: parseNumber(entry.last_seen) ?? 0,
+      last_message: parseText(entry.last_message) || '',
+      last_context: context,
+    };
+  });
+  return parsed;
+}
+
+function parseRuntimeStatus(input: unknown): RuntimeStatusState {
+  const row = asRecord(input);
+  if (!row) {
+    return { modules: [], timestamp: 0 };
+  }
+  const modules = Array.isArray(row.modules)
+    ? row.modules
+      .map((entry) => {
+        const module = asRecord(entry);
+        if (!module) return null;
+        const healthRaw = parseText(module.health)?.toUpperCase();
+        const health: RuntimeHealth = healthRaw === 'DEGRADED'
+          ? 'DEGRADED'
+          : healthRaw === 'OFFLINE'
+            ? 'OFFLINE'
+            : healthRaw === 'STANDBY'
+              ? 'STANDBY'
+              : 'ONLINE';
+        const id = parseText(module.id);
+        const label = parseText(module.label);
+        if (!id || !label) return null;
+        return {
+          id,
+          label,
+          health,
+          heartbeat_ms: parseNumber(module.heartbeat_ms) ?? 0,
+          events: parseNumber(module.events) ?? 0,
+          last_detail: parseText(module.last_detail) || '',
+        } as RuntimeModuleState;
+      })
+      .filter((entry): entry is RuntimeModuleState => entry !== null)
+    : [];
+  return {
+    modules,
+    timestamp: parseNumber(row.timestamp) ?? Date.now(),
+  };
+}
+
 export function HomeDashboard() {
   const { socket } = useSocket();
   const navigate = useNavigate();
@@ -149,6 +368,10 @@ export function HomeDashboard() {
   const [tradingMode, setTradingMode] = useState<'PAPER' | 'LIVE'>('PAPER');
   const [lastDataUpdate, setLastDataUpdate] = useState(Date.now());
   const [now, setNow] = useState(Date.now());
+  const [entryFreshnessSlo, setEntryFreshnessSlo] = useState<EntryFreshnessSloState>(emptyEntryFreshnessSloState());
+  const [silentCatchTelemetry, setSilentCatchTelemetry] = useState<SilentCatchTelemetryState>({});
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatusState>({ modules: [], timestamp: 0 });
+  const [dataIntegrityTotalScans, setDataIntegrityTotalScans] = useState(0);
 
   useEffect(() => {
     if (!socket) return;
@@ -293,6 +516,46 @@ export function HomeDashboard() {
         setTradingMode(data.mode);
       }
     };
+    const handleEntryFreshnessSloUpdate = (payload: unknown) => {
+      touchData();
+      setEntryFreshnessSlo(parseEntryFreshnessSloState(payload));
+    };
+    const handleEntryFreshnessAlert = (payload: unknown) => {
+      const alert = parseEntryFreshnessSloAlert(payload);
+      if (!alert) return;
+      touchData();
+      setEntryFreshnessSlo((prev) => ({
+        ...prev,
+        recent_alerts: [
+          alert,
+          ...prev.recent_alerts.filter((entry) => !(
+            entry.execution_id === alert.execution_id
+            && entry.timestamp === alert.timestamp
+          )),
+        ].slice(0, 150),
+        updated_at: alert.timestamp,
+      }));
+    };
+    const handleSilentCatchSnapshot = (payload: unknown) => {
+      touchData();
+      setSilentCatchTelemetry(parseSilentCatchTelemetry(payload));
+    };
+    const handleSilentCatchUpdate = (payload: unknown) => {
+      const row = asRecord(payload);
+      const scope = parseText(row?.scope);
+      if (!scope || !row) return;
+      touchData();
+      const parsed = parseSilentCatchTelemetry({ [scope]: row });
+      if (!parsed[scope]) return;
+      setSilentCatchTelemetry((prev) => ({
+        ...prev,
+        [scope]: parsed[scope],
+      }));
+    };
+    const handleRuntimeStatus = (payload: unknown) => {
+      touchData();
+      setRuntimeStatus(parseRuntimeStatus(payload));
+    };
     const handleSimulationReset = (payload: { bankroll?: number }) => {
       touchData();
       const resetBankroll = parseNumber(payload?.bankroll) ?? 1000;
@@ -301,6 +564,10 @@ export function HomeDashboard() {
       setExecutions([]);
       setBankroll(resetBankroll);
       setVaultBalance(0);
+      setEntryFreshnessSlo(emptyEntryFreshnessSloState(Date.now()));
+      setSilentCatchTelemetry({});
+      setRuntimeStatus({ modules: [], timestamp: Date.now() });
+      setDataIntegrityTotalScans(0);
       setRiskGuard((prev) => ({
         ...prev,
         daily_pnl: 0,
@@ -329,6 +596,11 @@ export function HomeDashboard() {
     socket.on('heartbeat', handleHeartbeat);
     socket.on('risk_guard_update', handleRiskGuard);
     socket.on('trading_mode_update', handleMode);
+    socket.on('entry_freshness_alert', handleEntryFreshnessAlert);
+    socket.on('entry_freshness_slo_update', handleEntryFreshnessSloUpdate);
+    socket.on('silent_catch_telemetry_snapshot', handleSilentCatchSnapshot);
+    socket.on('silent_catch_telemetry_update', handleSilentCatchUpdate);
+    socket.on('runtime_status_update', handleRuntimeStatus);
     socket.on('simulation_reset', handleSimulationReset);
     socket.on('connect', requestAllState);
 
@@ -345,6 +617,11 @@ export function HomeDashboard() {
       socket.off('heartbeat', handleHeartbeat);
       socket.off('risk_guard_update', handleRiskGuard);
       socket.off('trading_mode_update', handleMode);
+      socket.off('entry_freshness_alert', handleEntryFreshnessAlert);
+      socket.off('entry_freshness_slo_update', handleEntryFreshnessSloUpdate);
+      socket.off('silent_catch_telemetry_snapshot', handleSilentCatchSnapshot);
+      socket.off('silent_catch_telemetry_update', handleSilentCatchUpdate);
+      socket.off('runtime_status_update', handleRuntimeStatus);
       socket.off('simulation_reset', handleSimulationReset);
       socket.off('connect', requestAllState);
     };
@@ -356,6 +633,40 @@ export function HomeDashboard() {
     return () => window.clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    const refreshOpsSnapshot = async () => {
+      try {
+        const res = await fetch(apiUrl('/api/arb/stats'));
+        if (!res.ok || !active) return;
+        const payload = await res.json() as {
+          entry_freshness_slo?: unknown;
+          silent_catch_telemetry?: unknown;
+          build_runtime?: unknown;
+          data_integrity?: { totals?: { total_scans?: unknown } };
+        };
+        if (!active) return;
+        setEntryFreshnessSlo(parseEntryFreshnessSloState(payload.entry_freshness_slo));
+        setSilentCatchTelemetry(parseSilentCatchTelemetry(payload.silent_catch_telemetry));
+        setRuntimeStatus(parseRuntimeStatus(payload.build_runtime));
+        const totalScans = parseNumber(payload.data_integrity?.totals?.total_scans);
+        if (totalScans !== null) {
+          setDataIntegrityTotalScans(totalScans);
+        }
+      } catch {
+        // keep last known ops snapshot on transient errors
+      }
+    };
+    void refreshOpsSnapshot();
+    const timer = window.setInterval(() => {
+      void refreshOpsSnapshot();
+    }, 4000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   // Computed stats
   const totalPnl = useMemo(() => Object.values(metrics).reduce((sum, m) => sum + m.pnl, 0), [metrics]);
   const totalTrades = useMemo(() => Object.values(metrics).reduce((sum, m) => sum + m.daily_trades, 0), [metrics]);
@@ -365,6 +676,32 @@ export function HomeDashboard() {
   );
   const liveScans = useMemo(() => scans.filter((s) => s.passes_threshold).length, [scans]);
   const netWorth = bankroll + vaultBalance;
+  const freshnessRatePct = dataIntegrityTotalScans > 0
+    ? (entryFreshnessSlo.totals.total / dataIntegrityTotalScans) * 100
+    : 0;
+  const freshnessSeverity = freshnessRatePct >= 2
+    ? 'CRITICAL'
+    : freshnessRatePct >= 0.5
+      ? 'WARN'
+      : 'HEALTHY';
+  const latestFreshnessAlert = entryFreshnessSlo.recent_alerts
+    .slice()
+    .sort((a, b) => b.timestamp - a.timestamp)[0] || null;
+  const silentCatchRows = Object.entries(silentCatchTelemetry)
+    .map(([scope, entry]) => ({ scope, ...entry }))
+    .sort((a, b) => b.last_seen - a.last_seen)
+    .slice(0, 3);
+  const silentCatchTotal = silentCatchRows.reduce((sum, row) => sum + row.count, 0);
+  const runtimeCounts = runtimeStatus.modules.reduce(
+    (acc, module) => {
+      if (module.health === 'ONLINE') acc.online += 1;
+      if (module.health === 'DEGRADED') acc.degraded += 1;
+      if (module.health === 'OFFLINE') acc.offline += 1;
+      if (module.health === 'STANDBY') acc.standby += 1;
+      return acc;
+    },
+    { online: 0, degraded: 0, offline: 0, standby: 0 },
+  );
 
   // Group strategies by family
   const familyGroups = useMemo(() => {
@@ -473,6 +810,79 @@ export function HomeDashboard() {
 
           {/* ── Right Column: Live Scans + Quick Links ── */}
           <div className="col-span-4 space-y-4">
+            <div className="bg-white/5 border border-white/10 rounded-xl p-4">
+              <h3 className="text-xs font-bold text-gray-400 uppercase mb-3">Ops Health</h3>
+              <div className="space-y-2 text-[10px] font-mono">
+                <div className="flex items-center justify-between">
+                  <span className="text-gray-500">Entry Freshness</span>
+                  <span className={`font-bold ${
+                    freshnessSeverity === 'CRITICAL'
+                      ? 'text-red-400'
+                      : freshnessSeverity === 'WARN'
+                        ? 'text-amber-300'
+                        : 'text-emerald-400'
+                  }`}>
+                    {freshnessSeverity}
+                  </span>
+                </div>
+                <div className="text-gray-400">
+                  rate <span className={`${
+                    freshnessSeverity === 'CRITICAL'
+                      ? 'text-red-400'
+                      : freshnessSeverity === 'WARN'
+                        ? 'text-amber-300'
+                        : 'text-emerald-400'
+                  }`}>{freshnessRatePct.toFixed(2)}%</span>
+                  {' '}({entryFreshnessSlo.totals.total}/{Math.max(0, dataIntegrityTotalScans)})
+                </div>
+                <div className="text-gray-500">
+                  miss {entryFreshnessSlo.totals.missing_telemetry}
+                  {' '}| src {entryFreshnessSlo.totals.stale_source}
+                  {' '}| gate {entryFreshnessSlo.totals.stale_gate}
+                </div>
+                {latestFreshnessAlert && (
+                  <div className="text-gray-500 truncate" title={latestFreshnessAlert.reason}>
+                    last {latestFreshnessAlert.category} · {Math.max(0, Math.round((now - latestFreshnessAlert.timestamp) / 1000))}s
+                  </div>
+                )}
+                <div className="pt-1 border-t border-white/10">
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-500">Silent Catches</span>
+                    <span className={`font-bold ${
+                      silentCatchTotal > 25
+                        ? 'text-red-400'
+                        : silentCatchTotal > 5
+                          ? 'text-amber-300'
+                          : 'text-emerald-400'
+                    }`}>
+                      {silentCatchTotal}
+                    </span>
+                  </div>
+                  {silentCatchRows.length === 0 ? (
+                    <div className="text-gray-600 mt-1">none</div>
+                  ) : (
+                    <div className="space-y-1 mt-1">
+                      {silentCatchRows.map((row) => (
+                        <div key={row.scope} className="flex items-center justify-between gap-2">
+                          <span className="text-gray-500 truncate">{row.scope}</span>
+                          <span className="text-gray-400">x{row.count}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="pt-1 border-t border-white/10">
+                  <div className="text-gray-500 mb-1">Runtime</div>
+                  <div className="grid grid-cols-4 gap-1 text-center">
+                    <div className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 rounded px-1 py-0.5">ON {runtimeCounts.online}</div>
+                    <div className="bg-amber-500/10 border border-amber-500/20 text-amber-300 rounded px-1 py-0.5">DEG {runtimeCounts.degraded}</div>
+                    <div className="bg-red-500/10 border border-red-500/20 text-red-400 rounded px-1 py-0.5">OFF {runtimeCounts.offline}</div>
+                    <div className="bg-white/5 border border-white/10 text-gray-300 rounded px-1 py-0.5">STB {runtimeCounts.standby}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             {/* Active Signals */}
             <div className="bg-white/5 border border-white/10 rounded-xl p-4">
               <h3 className="text-xs font-bold text-gray-400 uppercase mb-3">
