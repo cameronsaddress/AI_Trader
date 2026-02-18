@@ -60,6 +60,20 @@ function asRecord(input: unknown): ParsedRecord | null {
 
 export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
     const riskGuardState: Record<string, RiskGuardState> = {};
+    const resumeTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+
+    function clearResumeTimer(strategyId: string): void {
+        const timer = resumeTimers[strategyId];
+        if (timer) {
+            clearTimeout(timer);
+            delete resumeTimers[strategyId];
+        }
+    }
+
+    async function persistRiskGuardState(strategyId: string, state: RiskGuardState): Promise<void> {
+        await deps.redis.set(`risk_guard:state:${strategyId}`, JSON.stringify(state));
+        await deps.redis.expire(`risk_guard:state:${strategyId}`, 72 * 60 * 60);
+    }
 
     function computeDayStartMs(): number {
         const now = new Date();
@@ -203,6 +217,8 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
         }
 
         if (shouldPause && now < state.pausedUntil) {
+            deps.emitRiskGuardUpdate({ strategy: strategyId, ...state });
+            await persistRiskGuardState(strategyId, state);
             return;
         }
 
@@ -215,9 +231,18 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
             logger.info(`[RiskGuard] paused ${strategyId}: ${pauseReason} | resume at ${new Date(state.pausedUntil).toISOString()}`);
 
             if (pauseDurationMs > 0 && pauseDurationMs < 86_400_000) {
-                setTimeout(async () => {
+                clearResumeTimer(strategyId);
+                const expectedPausedUntil = state.pausedUntil;
+                resumeTimers[strategyId] = setTimeout(async () => {
                     try {
-                        const current = ensureRiskGuardState(strategyId);
+                        delete resumeTimers[strategyId];
+                        const current = riskGuardState[strategyId];
+                        if (!current) {
+                            return;
+                        }
+                        if (current.pausedUntil !== expectedPausedUntil) {
+                            return;
+                        }
                         if (current.pausedUntil <= Date.now()) {
                             await deps.redis.set(`strategy:enabled:${strategyId}`, '1');
                             await deps.redis.expire(`strategy:enabled:${strategyId}`, 86400);
@@ -233,8 +258,7 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
         }
 
         deps.emitRiskGuardUpdate({ strategy: strategyId, ...state });
-        await deps.redis.set(`risk_guard:state:${strategyId}`, JSON.stringify(state));
-        await deps.redis.expire(`risk_guard:state:${strategyId}`, 72 * 60 * 60);
+        await persistRiskGuardState(strategyId, state);
     }
 
     async function sweepProfitsToVault(): Promise<void> {
@@ -295,6 +319,7 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
     async function resetRiskGuardStates(): Promise<void> {
         for (const id of deps.config.strategies) {
             try {
+                clearResumeTimer(id);
                 delete riskGuardState[id];
                 await deps.redis.del(`risk_guard:state:${id}`);
                 await deps.redis.del(`risk_guard:cooldown:${id}`);
