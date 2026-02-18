@@ -85,6 +85,19 @@ const FAMILY_COLORS: Record<string, string> = {
 const MAX_SCAN_ROWS = 50;
 const MAX_EXEC_ROWS = 30;
 
+function parseNumber(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
 function normalizeStrategyFromMarketLabel(market?: string): string | null {
   const raw = typeof market === 'string' ? market.toLowerCase() : '';
   if (!raw) return null;
@@ -122,14 +135,27 @@ export function HftDashboardPage() {
   const [feeCurve, setFeeCurve] = useState<{ rate: number; prices: number[] } | null>(null);
   const [vaultBalance, setVaultBalance] = useState(0);
   const [_bankroll, setBankroll] = useState(1000);
+  const [now, setNow] = useState(Date.now());
+  const [lastDataUpdate, setLastDataUpdate] = useState(Date.now());
   const statsRef = useRef(stats);
   statsRef.current = stats;
 
   useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 5000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     if (!socket) return;
+
+    const touchData = () => {
+      const stamp = Date.now();
+      setLastDataUpdate((prev) => (stamp - prev >= 250 ? stamp : prev));
+    };
 
     const handleScan = (data: ScannerUpdateEvent) => {
       if (!data?.strategy || !HFT_STRATEGIES.includes(data.strategy)) return;
+      touchData();
       const entry: ScanEntry = {
         strategy: data.strategy,
         market_id: data.market_id || '',
@@ -159,9 +185,9 @@ export function HftDashboardPage() {
           ...prev,
           [entry.strategy]: {
             ...s,
-            active_scans: entry.passes_threshold ? s.active_scans + 1 : s.active_scans,
+            active_scans: parseNumber(entry.meta.active_scans) ?? (entry.passes_threshold ? 1 : 0),
             last_scan_ts: entry.timestamp,
-            positions: Number(entry.meta.positions_count) || s.positions,
+            positions: parseNumber(entry.meta.positions_count) ?? s.positions,
           },
         };
       });
@@ -170,6 +196,7 @@ export function HftDashboardPage() {
     const handleExec = (data: ExecutionLogEvent) => {
       const strategy = extractExecutionStrategy(data);
       if (!strategy || !HFT_STRATEGIES.includes(strategy)) return;
+      touchData();
 
       const executionType = typeof data.type === 'string' && data.type.trim().length > 0
         ? data.type
@@ -179,31 +206,33 @@ export function HftDashboardPage() {
       const executionId = typeof data.execution_id === 'string' && data.execution_id.trim().length > 0
         ? data.execution_id
         : `exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const pnl = typeof data.pnl === 'number' ? data.pnl : undefined;
+      const pnl = parseNumber(data.pnl) ?? undefined;
       const entry: ExecEntry = {
         market_id: typeof data.market_id === 'string' ? data.market_id : undefined,
         question: typeof data.question === 'string' ? data.question : undefined,
         side: typeof data.side === 'string' ? data.side : undefined,
         entry_side: typeof data.entry_side === 'string' ? data.entry_side : undefined,
-        entry_price: typeof data.entry_price === 'number'
-          ? data.entry_price
-          : typeof data.price === 'number'
-            ? data.price
-            : undefined,
-        exit_price: typeof data.exit_price === 'number' ? data.exit_price : undefined,
-        size: typeof data.size === 'number' ? data.size : undefined,
+        entry_price: parseNumber(data.entry_price) ?? parseNumber(data.price) ?? undefined,
+        exit_price: parseNumber(data.exit_price) ?? undefined,
+        size: parseNumber(data.size) ?? undefined,
         pnl,
-        net_edge_bps: typeof data.net_edge_bps === 'number' ? data.net_edge_bps : undefined,
-        bias_edge_pct: typeof data.bias_edge_pct === 'number' ? data.bias_edge_pct : undefined,
-        net_edge_pct: typeof data.net_edge_pct === 'number' ? data.net_edge_pct : undefined,
+        net_edge_bps: parseNumber(data.net_edge_bps) ?? undefined,
+        bias_edge_pct: parseNumber(data.bias_edge_pct) ?? undefined,
+        net_edge_pct: parseNumber(data.net_edge_pct) ?? undefined,
         strategy,
         type: executionType,
         execution_id: executionId,
-        timestamp: typeof data.timestamp === 'number' ? data.timestamp : Date.now(),
+        timestamp: parseNumber(data.timestamp) ?? Date.now(),
       };
       setExecutions((prev) => [entry, ...prev].slice(0, MAX_EXEC_ROWS));
 
-      if (executionType === 'EXIT' && pnl !== undefined) {
+      const normalizedType = executionType.toUpperCase();
+      const isCloseEvent = normalizedType === 'EXIT'
+        || normalizedType === 'WIN'
+        || normalizedType === 'LOSS'
+        || normalizedType === 'SETTLEMENT'
+        || normalizedType === 'CLOSE';
+      if (isCloseEvent && pnl !== undefined) {
         setStats((prev) => {
           const s = prev[strategy] || { pnl: 0, trades: 0, wins: 0, active_scans: 0, last_scan_ts: 0, positions: 0 };
           return {
@@ -220,15 +249,22 @@ export function HftDashboardPage() {
     };
 
     const handleVault = (data: VaultUpdateEvent) => {
-      if (typeof data?.vault === 'number') setVaultBalance(data.vault);
+      if (typeof data?.vault === 'number') {
+        touchData();
+        setVaultBalance(data.vault);
+      }
     };
 
     const handleBankroll = (data: BankrollUpdateEvent) => {
-      if (typeof data?.available_cash === 'number') setBankroll(data.available_cash);
+      if (typeof data?.available_cash === 'number') {
+        touchData();
+        setBankroll(data.available_cash);
+      }
     };
 
     const handleMetrics = (data: StrategyMetricsEvent) => {
       if (!data) return;
+      touchData();
       setStats((prev) => {
         const next = { ...prev };
         for (const id of HFT_STRATEGIES) {
@@ -246,6 +282,16 @@ export function HftDashboardPage() {
         return next;
       });
     };
+    const handleSimulationReset = (payload: { bankroll?: number }) => {
+      touchData();
+      const resetBankroll = parseNumber(payload?.bankroll) ?? 1000;
+      setScans([]);
+      setExecutions([]);
+      setStats({});
+      setFeeCurve(null);
+      setVaultBalance(0);
+      setBankroll(resetBankroll);
+    };
 
     const requestAllState = () => {
       socket.emit('request_vault');
@@ -258,6 +304,7 @@ export function HftDashboardPage() {
     socket.on('vault_update', handleVault);
     socket.on('sim_ledger_update', handleBankroll);
     socket.on('strategy_metrics_update', handleMetrics);
+    socket.on('simulation_reset', handleSimulationReset);
     socket.on('connect', requestAllState);
 
     requestAllState();
@@ -268,6 +315,7 @@ export function HftDashboardPage() {
       socket.off('vault_update', handleVault);
       socket.off('sim_ledger_update', handleBankroll);
       socket.off('strategy_metrics_update', handleMetrics);
+      socket.off('simulation_reset', handleSimulationReset);
       socket.off('connect', requestAllState);
     };
   }, [socket]);
@@ -298,6 +346,11 @@ export function HftDashboardPage() {
             <p className="text-xs text-gray-500 font-mono mt-1">
               A-S Market Maker + Longshot Bias Fade + Maker Micro-MM + Arbitrage
             </p>
+            {now - lastDataUpdate > 30000 && (
+              <div className="text-yellow-400 text-[10px] font-mono mt-1">
+                DATA STALE ({Math.round((now - lastDataUpdate) / 1000)}s)
+              </div>
+            )}
           </div>
           <div className="flex gap-3">
             <div className={`px-4 py-2 rounded-lg border ${totalPnl >= 0 ? 'border-emerald-500/30 bg-emerald-500/10' : 'border-red-500/30 bg-red-500/10'}`}>
@@ -328,7 +381,7 @@ export function HftDashboardPage() {
             const family = STRATEGY_FAMILIES[id] || 'GENERIC';
             const colorClass = FAMILY_COLORS[family] || 'text-gray-400 border-white/10 bg-white/5';
             const wr = s.trades > 0 ? ((s.wins / s.trades) * 100).toFixed(0) : '--';
-            const alive = Date.now() - s.last_scan_ts < 10000;
+            const alive = now - s.last_scan_ts < 10000;
             return (
               <div key={id} className="bg-white/5 border border-white/10 rounded-xl p-4 space-y-3">
                 <div className="flex items-center justify-between">
