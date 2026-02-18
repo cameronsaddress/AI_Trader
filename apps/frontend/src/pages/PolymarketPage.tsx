@@ -2104,10 +2104,13 @@ export const PolymarketPage: React.FC = () => {
         let mounted = true;
         let inFlight = false;
         let rerunRequested = false;
+        let activeController: AbortController | null = null;
 
         const fetchStats = async () => {
+            const controller = new AbortController();
+            activeController = controller;
             try {
-                const response = await fetch(apiUrl('/api/arb/stats'));
+                const response = await fetch(apiUrl('/api/arb/stats'), { signal: controller.signal });
                 if (!response.ok || !mounted) {
                     return;
                 }
@@ -2219,8 +2222,15 @@ export const PolymarketPage: React.FC = () => {
                 if (typeof data.live_order_posting_enabled === 'boolean') {
                     setLiveOrderPostingEnabled(data.live_order_posting_enabled);
                 }
-            } catch {
+            } catch (error) {
+                if (error instanceof DOMException && error.name === 'AbortError') {
+                    return;
+                }
                 // keep last known stats on transient network errors
+            } finally {
+                if (activeController === controller) {
+                    activeController = null;
+                }
             }
         };
 
@@ -2252,6 +2262,8 @@ export const PolymarketPage: React.FC = () => {
         return () => {
             mounted = false;
             rerunRequested = false;
+            activeController?.abort();
+            activeController = null;
             window.clearInterval(intervalId);
         };
     }, []);

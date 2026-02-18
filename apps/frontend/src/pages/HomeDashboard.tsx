@@ -637,9 +637,12 @@ export function HomeDashboard() {
     let active = true;
     let inFlight = false;
     let rerunRequested = false;
+    let activeController: AbortController | null = null;
     const refreshOpsSnapshot = async () => {
+      const controller = new AbortController();
+      activeController = controller;
       try {
-        const res = await fetch(apiUrl('/api/arb/stats'));
+        const res = await fetch(apiUrl('/api/arb/stats'), { signal: controller.signal });
         if (!res.ok || !active) return;
         const payload = await res.json() as {
           entry_freshness_slo?: unknown;
@@ -655,8 +658,15 @@ export function HomeDashboard() {
         if (totalScans !== null) {
           setDataIntegrityTotalScans(totalScans);
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          return;
+        }
         // keep last known ops snapshot on transient errors
+      } finally {
+        if (activeController === controller) {
+          activeController = null;
+        }
       }
     };
     const runRefreshOpsSnapshot = async () => {
@@ -685,6 +695,8 @@ export function HomeDashboard() {
     return () => {
       active = false;
       rerunRequested = false;
+      activeController?.abort();
+      activeController = null;
       window.clearInterval(timer);
     };
   }, []);

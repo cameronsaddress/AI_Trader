@@ -245,12 +245,15 @@ export const StrategyPage: React.FC<StrategyPageProps> = ({ title, description, 
         let active = true;
         let inFlight = false;
         let rerunRequested = false;
+        let activeController: AbortController | null = null;
 
         const load = async () => {
+            const controller = new AbortController();
+            activeController = controller;
             try {
                 const [statsRes, intelligenceRes] = await Promise.all([
-                    fetch(apiUrl('/api/arb/stats')),
-                    fetch(apiUrl('/api/arb/intelligence')),
+                    fetch(apiUrl('/api/arb/stats'), { signal: controller.signal }),
+                    fetch(apiUrl('/api/arb/intelligence'), { signal: controller.signal }),
                 ]);
                 if (!statsRes.ok || !intelligenceRes.ok) {
                     throw new Error(`HTTP ${statsRes.status}/${intelligenceRes.status}`);
@@ -318,11 +321,17 @@ export const StrategyPage: React.FC<StrategyPageProps> = ({ title, description, 
                 setTrades(mergedTrades);
                 setError(null);
             } catch (loadError) {
+                if (loadError instanceof DOMException && loadError.name === 'AbortError') {
+                    return;
+                }
                 if (!active) {
                     return;
                 }
                 setError(loadError instanceof Error ? loadError.message : String(loadError));
             } finally {
+                if (activeController === controller) {
+                    activeController = null;
+                }
                 if (active) {
                     setLoading(false);
                 }
@@ -357,6 +366,8 @@ export const StrategyPage: React.FC<StrategyPageProps> = ({ title, description, 
         return () => {
             active = false;
             rerunRequested = false;
+            activeController?.abort();
+            activeController = null;
             window.clearInterval(intervalId);
         };
     }, [strategyIds]);

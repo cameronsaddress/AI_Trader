@@ -1016,9 +1016,12 @@ export const Btc5mEnginePage: React.FC = () => {
     let active = true;
     let inFlight = false;
     let rerunRequested = false;
+    let activeController: AbortController | null = null;
     const fetchStats = async () => {
+      const controller = new AbortController();
+      activeController = controller;
       try {
-        const res = await fetch(apiUrl('/api/arb/stats'));
+        const res = await fetch(apiUrl('/api/arb/stats'), { signal: controller.signal });
         if (!res.ok) return;
         const json = await res.json() as {
           trading_mode?: TradingMode;
@@ -1050,8 +1053,15 @@ export const Btc5mEnginePage: React.FC = () => {
         if (fallbackTs !== null && fallbackTs > 0) {
           setLastScannerUpdate((prev) => Math.max(prev, fallbackTs));
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          return;
+        }
         // ignore
+      } finally {
+        if (activeController === controller) {
+          activeController = null;
+        }
       }
     };
     const runFetchStats = async () => {
@@ -1080,6 +1090,8 @@ export const Btc5mEnginePage: React.FC = () => {
     return () => {
       active = false;
       rerunRequested = false;
+      activeController?.abort();
+      activeController = null;
       window.clearInterval(timer);
     };
   }, []);
