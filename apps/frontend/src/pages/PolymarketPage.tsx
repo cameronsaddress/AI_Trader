@@ -1732,6 +1732,8 @@ export const PolymarketPage: React.FC = () => {
     const [executionTrace, setExecutionTrace] = React.useState<ExecutionTrace | null>(null);
     const [executionTraceError, setExecutionTraceError] = React.useState<string | null>(null);
     const [executionTraceLoading, setExecutionTraceLoading] = React.useState(false);
+    const traceAbortRef = React.useRef<AbortController | null>(null);
+    const traceRequestSeqRef = React.useRef(0);
     const [strategySignals, setStrategySignals] = React.useState<StrategySignalState[]>([]);
     const [comparableGroups, setComparableGroups] = React.useState<ComparableGroupState[]>([]);
     const [strategyAllocator, setStrategyAllocator] = React.useState<Record<string, StrategyAllocatorEntry>>({});
@@ -2784,6 +2786,9 @@ export const PolymarketPage: React.FC = () => {
     };
 
     const closeExecutionTrace = React.useCallback(() => {
+        traceRequestSeqRef.current += 1;
+        traceAbortRef.current?.abort();
+        traceAbortRef.current = null;
         setTraceExecutionId(null);
         setExecutionTrace(null);
         setExecutionTraceError(null);
@@ -2794,24 +2799,53 @@ export const PolymarketPage: React.FC = () => {
         if (!executionId) {
             return;
         }
+        const requestSeq = traceRequestSeqRef.current + 1;
+        traceRequestSeqRef.current = requestSeq;
+        traceAbortRef.current?.abort();
+        const controller = new AbortController();
+        traceAbortRef.current = controller;
         setTraceExecutionId(executionId);
         setExecutionTrace(null);
         setExecutionTraceError(null);
         setExecutionTraceLoading(true);
         try {
-            const response = await fetch(apiUrl(`/api/arb/execution-trace/${encodeURIComponent(executionId)}`));
+            const response = await fetch(
+                apiUrl(`/api/arb/execution-trace/${encodeURIComponent(executionId)}`),
+                { signal: controller.signal },
+            );
             if (!response.ok) {
                 const payload = await response.json().catch(() => null) as { error?: string } | null;
+                if (requestSeq !== traceRequestSeqRef.current) {
+                    return;
+                }
                 setExecutionTraceError(payload?.error || `Trace lookup failed (${response.status})`);
                 return;
             }
             const data = await response.json() as ExecutionTrace;
+            if (requestSeq !== traceRequestSeqRef.current) {
+                return;
+            }
             setExecutionTrace(data);
         } catch (error) {
+            if (error instanceof DOMException && error.name === 'AbortError') {
+                return;
+            }
+            if (requestSeq !== traceRequestSeqRef.current) {
+                return;
+            }
             setExecutionTraceError(error instanceof Error ? error.message : String(error));
         } finally {
-            setExecutionTraceLoading(false);
+            if (requestSeq === traceRequestSeqRef.current) {
+                traceAbortRef.current = null;
+                setExecutionTraceLoading(false);
+            }
         }
+    }, []);
+
+    React.useEffect(() => () => {
+        traceRequestSeqRef.current += 1;
+        traceAbortRef.current?.abort();
+        traceAbortRef.current = null;
     }, []);
 
     return (
