@@ -26,19 +26,50 @@ type ExecutionLog = {
   price?: unknown;
   size?: unknown;
   mode?: string;
-  details?: any;
+  details?: Record<string, unknown> | null;
 };
 
 type StrategyPnlPayload = {
   execution_id?: string;
+  executionId?: string;
   strategy?: string;
+  side?: string;
   pnl?: number;
   notional?: number;
   timestamp?: number;
-  details?: any;
+  details?: Record<string, unknown> | null;
 };
 
 type StrategyMetrics = Record<string, { pnl?: number; daily_trades?: number; updated_at?: number }>;
+
+type MlFeatureUpdate = {
+  symbol?: string;
+  timestamp?: number;
+  ml_prob_up?: number | null;
+  ml_prob_down?: number | null;
+  ml_signal_edge?: number | null;
+  ml_signal_confidence?: number | null;
+  ml_model?: string | null;
+  ml_model_ready?: boolean | null;
+  [key: string]: unknown;
+};
+
+type ModelGateCalibrationState = {
+  enabled: boolean;
+  advisory_only: boolean;
+  active_gate: number;
+  recommended_gate: number;
+  sample_count: number;
+  delta_expected_pnl: number;
+  updated_at: number;
+  reason: string;
+};
+
+type RejectedSignalSummaryState = {
+  tracked: number;
+  persisted_rows: number;
+  by_stage: Record<string, number>;
+};
 
 type TradeStatus = 'OPEN' | 'RESOLVED' | 'STOPPED';
 
@@ -114,6 +145,49 @@ function parseText(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function parseModelGateCalibration(input: unknown): ModelGateCalibrationState {
+  const row = asRecord(input);
+  if (!row) {
+    return {
+      enabled: false,
+      advisory_only: true,
+      active_gate: 0.55,
+      recommended_gate: 0.55,
+      sample_count: 0,
+      delta_expected_pnl: 0,
+      updated_at: 0,
+      reason: '',
+    };
+  }
+  return {
+    enabled: row.enabled === true,
+    advisory_only: row.advisory_only !== false,
+    active_gate: parseNumber(row.active_gate) ?? 0.55,
+    recommended_gate: parseNumber(row.recommended_gate) ?? 0.55,
+    sample_count: parseNumber(row.sample_count) ?? 0,
+    delta_expected_pnl: parseNumber(row.delta_expected_pnl) ?? 0,
+    updated_at: parseNumber(row.updated_at) ?? 0,
+    reason: parseText(row.reason) || '',
+  };
+}
+
+function rejectedSignalStrategy(input: unknown): string | null {
+  const row = asRecord(input);
+  if (!row) return null;
+  const direct = parseText(row.strategy);
+  if (direct) return direct.toUpperCase();
+  const payload = asRecord(row.payload);
+  const nested = parseText(payload?.strategy) || parseText(asRecord(payload?.preflight)?.strategy);
+  return nested ? nested.toUpperCase() : null;
 }
 
 function formatIntSpaces(value: number): string {
@@ -269,7 +343,8 @@ export const Btc5mEnginePage: React.FC = () => {
   const [liveOrderPostingEnabled, setLiveOrderPostingEnabled] = useState(false);
 
   const [strategyMetrics, setStrategyMetrics] = useState<StrategyMetrics>({});
-  const [latestScanMeta, setLatestScanMeta] = useState<any>(null);
+  const [latestScanMeta, setLatestScanMeta] = useState<Record<string, unknown> | null>(null);
+  const [latestMlFeatures, setLatestMlFeatures] = useState<Record<string, unknown> | null>(null);
   const [latestScanPasses, setLatestScanPasses] = useState(false);
 
   const [spotSeries, setSpotSeries] = useState<Array<{ timestamp: number; value: number }>>([]);
@@ -310,6 +385,21 @@ export const Btc5mEnginePage: React.FC = () => {
   } | null>(null);
   const [strategyStatuses, setStrategyStatuses] = useState<Record<string, boolean>>({});
   const [vaultBalance, setVaultBalance] = useState(0);
+  const [modelGateCalibration, setModelGateCalibration] = useState<ModelGateCalibrationState>({
+    enabled: false,
+    advisory_only: true,
+    active_gate: 0.55,
+    recommended_gate: 0.55,
+    sample_count: 0,
+    delta_expected_pnl: 0,
+    updated_at: 0,
+    reason: '',
+  });
+  const [rejectedSignalSummary, setRejectedSignalSummary] = useState<RejectedSignalSummaryState>({
+    tracked: 0,
+    persisted_rows: 0,
+    by_stage: {},
+  });
 
   const closeTrace = React.useCallback(() => {
     setTraceExecutionId(null);
@@ -361,15 +451,16 @@ export const Btc5mEnginePage: React.FC = () => {
       if (!payload || typeof payload !== 'object') return;
       const log = payload as ExecutionLog;
 
-      const details = log?.details && typeof log.details === 'object' ? log.details : null;
-      const detailsStrategy = details?.preflight?.strategy || details?.strategy;
+      const details = asRecord(log?.details);
+      const detailsPreflight = asRecord(details?.preflight);
+      const detailsStrategy = parseText(detailsPreflight?.strategy) || parseText(details?.strategy);
       const isBtc5m = detailsStrategy === STRATEGY_ID || log?.market === 'BTC 5m Engine';
       if (!isBtc5m) return;
 
       const ts = typeof log.timestamp === 'number' ? log.timestamp : Date.now();
       const executionId = parseText(log.execution_id)
-        || parseText((details as any)?.execution_id)
-        || parseText((details as any)?.executionId)
+        || parseText(details?.execution_id)
+        || parseText(details?.executionId)
         || undefined;
 
       const side = (log.side || '').toUpperCase();
@@ -418,24 +509,25 @@ export const Btc5mEnginePage: React.FC = () => {
       if (!payload || typeof payload !== 'object') return;
       const parsed = payload as StrategyPnlPayload;
       if (parsed?.strategy !== STRATEGY_ID) return;
+      const details = asRecord(parsed?.details);
 
-      const executionId = parseText((parsed as any).execution_id)
-        || parseText((parsed as any).executionId)
-        || parseText(parsed?.details?.execution_id)
-        || parseText(parsed?.details?.executionId)
+      const executionId = parseText(parsed.execution_id)
+        || parseText(parsed.executionId)
+        || parseText(details?.execution_id)
+        || parseText(details?.executionId)
         || null;
       if (!executionId) return;
 
       const ts = parseNumber(parsed.timestamp) ?? Date.now();
       const pnl = parseNumber(parsed.pnl);
-      const notional = parseNumber((parsed as any).notional) ?? parseNumber(parsed?.details?.notional) ?? null;
-      const direction = safeDirection((parsed as any).side)
-        ?? safeDirection(parsed?.details?.side)
-        ?? safeDirection(parsed?.details?.position_side)
+      const notional = parseNumber(parsed.notional) ?? parseNumber(details?.notional) ?? null;
+      const direction = safeDirection(parsed.side)
+        ?? safeDirection(details?.side)
+        ?? safeDirection(details?.position_side)
         ?? null;
-      const entryPrice = parseNumber(parsed?.details?.entry_price);
-      const windowStartTs = parseNumber(parsed?.details?.window_start_ts);
-      const holdMs = parseNumber(parsed?.details?.hold_ms);
+      const entryPrice = parseNumber(details?.entry_price);
+      const windowStartTs = parseNumber(details?.window_start_ts);
+      const holdMs = parseNumber(details?.hold_ms);
 
       setTradeBlotter((prev) => {
         const existing = prev[executionId];
@@ -509,15 +601,16 @@ export const Btc5mEnginePage: React.FC = () => {
       // Hydrate the currently open position from scanner telemetry, so a page refresh mid-window
       // doesn't leave the POSITIONS rail empty until the next ENTRY/SETTLEMENT execution event.
       const openPos = meta?.open_position;
-      if (openPos && typeof openPos === 'object' && !Array.isArray(openPos)) {
-        const execId = parseText((openPos as any).execution_id)
-          || parseText((openPos as any).executionId)
-          || parseText((openPos as any).id);
-        const dir = safeDirection((openPos as any).side);
-        const entryPrice = parseNumber((openPos as any).entry_price);
-        const notional = parseNumber((openPos as any).notional) ?? parseNumber((openPos as any).size) ?? 0;
-        const entryTs = parseNumber((openPos as any).entry_ts_ms) ?? ts;
-        const windowStartTs = parseNumber((openPos as any).window_start_ts);
+      const openPosRecord = asRecord(openPos);
+      if (openPosRecord) {
+        const execId = parseText(openPosRecord.execution_id)
+          || parseText(openPosRecord.executionId)
+          || parseText(openPosRecord.id);
+        const dir = safeDirection(openPosRecord.side);
+        const entryPrice = parseNumber(openPosRecord.entry_price);
+        const notional = parseNumber(openPosRecord.notional) ?? parseNumber(openPosRecord.size) ?? 0;
+        const entryTs = parseNumber(openPosRecord.entry_ts_ms) ?? ts;
+        const windowStartTs = parseNumber(openPosRecord.window_start_ts);
         const label = windowStartTs !== null ? formatEtWindow(windowStartTs, windowStartTs + 300) : windowLabelForTs(entryTs).label;
         if (execId) {
           setTradeBlotter((prev) => {
@@ -564,6 +657,12 @@ export const Btc5mEnginePage: React.FC = () => {
       lastCexSnapshotRef.current = parsedCexPrices;
     };
 
+    const handleMlFeaturesUpdate = (payload: MlFeatureUpdate) => {
+      if (!payload || typeof payload !== 'object') return;
+      if (payload.symbol !== 'BTC-USD') return;
+      setLatestMlFeatures(payload as Record<string, unknown>);
+    };
+
     // Engine Tuning panel listeners
     const handleRiskConfig = (cfg: RiskConfigEvent) => {
       if (cfg?.model === 'FIXED' || cfg?.model === 'PERCENT') setRiskModel(cfg.model);
@@ -601,16 +700,54 @@ export const Btc5mEnginePage: React.FC = () => {
     socket.on('strategy_risk_multiplier_update', handleMultiplierUpdate);
     socket.on('strategy_risk_multiplier_snapshot', handleMultiplierSnapshot);
     socket.on('strategy_status_update', handleStrategyStatus);
+    socket.on('ml_features_update', handleMlFeaturesUpdate);
     const handleVault = (data: VaultUpdateEvent) => {
       if (typeof data?.vault === 'number') setVaultBalance(data.vault);
     };
+    const handleModelGateCalibration = (payload: unknown) => {
+      setModelGateCalibration(parseModelGateCalibration(payload));
+    };
+    const handleRejectedSignal = (payload: unknown) => {
+      const row = asRecord(payload);
+      const stage = parseText(row?.stage)?.toUpperCase();
+      if (!stage || rejectedSignalStrategy(row) !== STRATEGY_ID) return;
+      setRejectedSignalSummary((prev) => ({
+        ...prev,
+        tracked: prev.tracked + 1,
+        by_stage: {
+          ...prev.by_stage,
+          [stage]: (prev.by_stage[stage] ?? 0) + 1,
+        },
+      }));
+    };
+    const handleRejectedSignalSnapshot = (payload: unknown) => {
+      if (!Array.isArray(payload)) return;
+      const byStage: Record<string, number> = {};
+      payload.forEach((entry) => {
+        const row = asRecord(entry);
+        const stage = parseText(row?.stage)?.toUpperCase();
+        if (!stage || rejectedSignalStrategy(row) !== STRATEGY_ID) return;
+        byStage[stage] = (byStage[stage] ?? 0) + 1;
+      });
+      const tracked = Object.values(byStage).reduce((sum, value) => sum + value, 0);
+      setRejectedSignalSummary((prev) => ({
+        ...prev,
+        tracked,
+        by_stage: byStage,
+      }));
+    };
     socket.on('vault_update', handleVault);
+    socket.on('model_gate_calibration_update', handleModelGateCalibration);
+    socket.on('rejected_signal', handleRejectedSignal);
+    socket.on('rejected_signal_snapshot', handleRejectedSignalSnapshot);
 
     const requestAllState = () => {
       socket.emit('request_trading_mode');
       socket.emit('request_risk_config');
       socket.emit('request_vault');
       socket.emit('request_strategy_metrics');
+      socket.emit('request_model_gate_calibration');
+      socket.emit('request_rejected_signals', { limit: 200, strategy: STRATEGY_ID });
     };
     socket.on('connect', requestAllState);
     requestAllState();
@@ -625,7 +762,11 @@ export const Btc5mEnginePage: React.FC = () => {
       socket.off('strategy_risk_multiplier_update', handleMultiplierUpdate);
       socket.off('strategy_risk_multiplier_snapshot', handleMultiplierSnapshot);
       socket.off('strategy_status_update', handleStrategyStatus);
+      socket.off('ml_features_update', handleMlFeaturesUpdate);
       socket.off('vault_update', handleVault);
+      socket.off('model_gate_calibration_update', handleModelGateCalibration);
+      socket.off('rejected_signal', handleRejectedSignal);
+      socket.off('rejected_signal_snapshot', handleRejectedSignalSnapshot);
       socket.off('connect', requestAllState);
     };
   }, [socket]);
@@ -645,6 +786,7 @@ export const Btc5mEnginePage: React.FC = () => {
         if (typeof json?.live_order_posting_enabled === 'boolean') {
           setLiveOrderPostingEnabled(json.live_order_posting_enabled);
         }
+        setModelGateCalibration(parseModelGateCalibration(json?.model_gate_calibration));
         const strategyUpdatedAt = parseNumber(json?.strategy_quality?.[STRATEGY_ID]?.updated_at);
         const scannerHeartbeat = parseNumber(json?.scanner_last_heartbeat_ms);
         const fallbackTs = strategyUpdatedAt ?? scannerHeartbeat;
@@ -669,23 +811,27 @@ export const Btc5mEnginePage: React.FC = () => {
       try {
         const res = await fetch(apiUrl(`/api/arb/strategy-trades?strategy=${encodeURIComponent(STRATEGY_ID)}&limit=600`));
         if (!res.ok) return;
-        const payload = await res.json() as { trades?: any[] };
+        const payload = await res.json() as { trades?: unknown[] };
         const rows = Array.isArray(payload?.trades) ? payload.trades : [];
         if (cancelled || rows.length === 0) return;
         setTradeBlotter((prev) => {
           const next = { ...prev };
           rows.forEach((row, idx) => {
-            const ts = parseNumber(row?.timestamp) ?? Date.now();
-            const pnl = parseNumber(row?.pnl);
-            const notional = parseNumber(row?.notional) ?? 0;
-            const executionId = parseText(row?.execution_id) || `hist-${ts}-${idx}`;
+            const parsed = asRecord(row);
+            if (!parsed) {
+              return;
+            }
+            const ts = parseNumber(parsed.timestamp) ?? Date.now();
+            const pnl = parseNumber(parsed.pnl);
+            const notional = parseNumber(parsed.notional) ?? 0;
+            const executionId = parseText(parsed.execution_id) || `hist-${ts}-${idx}`;
             const resolvedWindow = windowLabelForResolvedTs(ts);
             next[executionId] = {
               execution_id: executionId,
-              direction: safeDirection(row?.side) ?? null,
+              direction: safeDirection(parsed.side) ?? null,
               window_label: resolvedWindow.label,
               entry_ts: resolvedWindow.start * 1000,
-              entry_price: parseNumber(row?.entry_price),
+              entry_price: parseNumber(parsed.entry_price),
               notional,
               exit_ts: ts,
               pnl: pnl ?? null,
@@ -726,6 +872,31 @@ export const Btc5mEnginePage: React.FC = () => {
   const bestNetExpected = parseNumber(latestScanMeta?.best_net_expected_roi);
   const kelly = parseNumber(latestScanMeta?.kelly_fraction);
   const sigma = parseNumber(latestScanMeta?.sigma_annualized);
+  const mlProbUp = parseNumber(latestScanMeta?.ml_prob_up ?? latestMlFeatures?.ml_prob_up);
+  const mlSignalSideProb = parseNumber(latestScanMeta?.model_signal_side_prob);
+  const mlSignalConfidence = parseNumber(latestScanMeta?.model_signal_confidence)
+    ?? parseNumber(latestScanMeta?.ml_signal_confidence_raw)
+    ?? parseNumber(latestScanMeta?.ml_signal_confidence)
+    ?? parseNumber(latestMlFeatures?.ml_signal_confidence);
+  const mlSignalEdge = parseNumber(latestScanMeta?.model_signal_edge)
+    ?? parseNumber(latestScanMeta?.ml_signal_edge_raw)
+    ?? parseNumber(latestScanMeta?.ml_signal_edge)
+    ?? parseNumber(latestMlFeatures?.ml_signal_edge);
+  const mlModelName = parseText(latestScanMeta?.model_signal_model)
+    || parseText(latestScanMeta?.ml_model)
+    || parseText(latestMlFeatures?.ml_model)
+    || 'NONE';
+  const mlModelReady = typeof latestScanMeta?.model_signal_ready === 'boolean'
+    ? latestScanMeta.model_signal_ready
+    : typeof latestScanMeta?.ml_model_ready === 'boolean'
+      ? latestScanMeta.ml_model_ready
+      : typeof latestMlFeatures?.ml_model_ready === 'boolean'
+        ? latestMlFeatures.ml_model_ready
+      : false;
+  const mlSignalLabel = parseText(latestScanMeta?.model_signal_label)
+    || (mlModelReady ? 'MODEL_READY' : mlModelName !== 'NONE' ? 'MODEL_WARMUP' : 'NONE');
+  const mlSignalBonusBps = parseNumber(latestScanMeta?.model_signal_bonus_bps);
+  const mlSignalPenaltyBps = parseNumber(latestScanMeta?.model_signal_penalty_bps);
   const ddLimitPct = parseNumber(latestScanMeta?.max_drawdown_pct) ?? -5.0;
 
   const corr = useMemo(() => {
@@ -809,6 +980,9 @@ export const Btc5mEnginePage: React.FC = () => {
   const execDecision = latestScanPasses && bestNetExpected !== null && bestNetExpected > 0
     ? 'PASS'
     : 'HOLD';
+  const modelGateDeltaBps = (modelGateCalibration.recommended_gate - modelGateCalibration.active_gate) * 10_000;
+  const modelGateBlocks = rejectedSignalSummary.by_stage.MODEL_GATE ?? 0;
+  const liveExecBlocks = rejectedSignalSummary.by_stage.LIVE_EXECUTION ?? 0;
 
   const orderFeed = allTradesSorted.slice(0, ORDER_FEED_ROWS);
   const positions = allTradesSorted.slice(0, POSITIONS_ROWS);
@@ -827,7 +1001,7 @@ export const Btc5mEnginePage: React.FC = () => {
     bottom: useRef<HTMLDivElement | null>(null),
     right: useRef<HTMLDivElement | null>(null),
   };
-  const [layoutDebugInfo, setLayoutDebugInfo] = useState<Record<string, any> | null>(null);
+  const [layoutDebugInfo, setLayoutDebugInfo] = useState<Record<string, unknown> | null>(null);
 
   useEffect(() => {
     if (!layoutDebugEnabled) return;
@@ -999,9 +1173,27 @@ export const Btc5mEnginePage: React.FC = () => {
                     bestProb={bestProb}
                     bestNetExpected={bestNetExpected}
                     kelly={kelly}
+                    mlProbUp={mlProbUp}
+                    mlSignalSideProb={mlSignalSideProb}
+                    mlSignalConfidence={mlSignalConfidence}
+                    mlSignalEdge={mlSignalEdge}
+                    mlModelName={mlModelName}
+                    mlModelReady={mlModelReady}
+                    mlSignalLabel={mlSignalLabel}
+                    mlSignalBonusBps={mlSignalBonusBps}
+                    mlSignalPenaltyBps={mlSignalPenaltyBps}
                     execDecision={execDecision}
                     liveModeLabel={mode === 'PAPER' ? 'PAPER' : liveOrderPostingEnabled ? 'LIVE' : 'DRY-RUN'}
                     notionalHint={openNotional > 0 ? openNotional : lastNotional}
+                    modelGateEnabled={modelGateCalibration.enabled}
+                    modelGateAdvisory={modelGateCalibration.advisory_only}
+                    modelGateActive={modelGateCalibration.active_gate}
+                    modelGateRecommended={modelGateCalibration.recommended_gate}
+                    modelGateDeltaBps={modelGateDeltaBps}
+                    modelGateSamples={modelGateCalibration.sample_count}
+                    modelGateDeltaPnl={modelGateCalibration.delta_expected_pnl}
+                    modelGateBlocks={modelGateBlocks}
+                    liveExecBlocks={liveExecBlocks}
                   />
                 </PanelCell>
               </div>
@@ -1490,9 +1682,27 @@ function ExecutionPipelinePanel(props: {
   bestProb: number | null;
   bestNetExpected: number | null;
   kelly: number | null;
+  mlProbUp: number | null;
+  mlSignalSideProb: number | null;
+  mlSignalConfidence: number | null;
+  mlSignalEdge: number | null;
+  mlModelName: string;
+  mlModelReady: boolean;
+  mlSignalLabel: string;
+  mlSignalBonusBps: number | null;
+  mlSignalPenaltyBps: number | null;
   execDecision: 'PASS' | 'HOLD';
   liveModeLabel: string;
   notionalHint: number;
+  modelGateEnabled: boolean;
+  modelGateAdvisory: boolean;
+  modelGateActive: number;
+  modelGateRecommended: number;
+  modelGateDeltaBps: number;
+  modelGateSamples: number;
+  modelGateDeltaPnl: number;
+  modelGateBlocks: number;
+  liveExecBlocks: number;
 }) {
   const impliedYes = props.yesAsk;
   const cexProb = props.fairYes;
@@ -1500,6 +1710,42 @@ function ExecutionPipelinePanel(props: {
   const evUsd = props.bestNetExpected !== null && Number.isFinite(props.notionalHint) && props.notionalHint > 0
     ? props.notionalHint * props.bestNetExpected
     : null;
+  const mlUpProb = props.mlProbUp !== null ? Math.max(0, Math.min(1, props.mlProbUp)) : null;
+  const mlSideProb = props.mlSignalSideProb !== null
+    ? Math.max(0, Math.min(1, props.mlSignalSideProb))
+    : (() => {
+      if (mlUpProb === null) return null;
+      if (props.bestSide === 'DOWN') return 1 - mlUpProb;
+      return mlUpProb;
+    })();
+  const mlConfidence = props.mlSignalConfidence !== null
+    ? Math.max(0, Math.min(1, props.mlSignalConfidence))
+    : (mlSideProb !== null ? Math.abs(mlSideProb - 0.5) * 2 : null);
+  const mlEdgePct = props.mlSignalEdge !== null
+    ? props.mlSignalEdge * 100
+    : (mlUpProb !== null ? (mlUpProb - 0.5) * 200 : null);
+  const modelImpactBps = props.mlSignalBonusBps !== null || props.mlSignalPenaltyBps !== null
+    ? (props.mlSignalBonusBps ?? 0) - (props.mlSignalPenaltyBps ?? 0)
+    : null;
+  const modelLabelClass = props.mlSignalLabel.includes('ALIGNED')
+    ? 'text-emerald-300'
+    : props.mlSignalLabel.includes('DISAGREE')
+      ? 'text-rose-300'
+      : props.mlSignalLabel.includes('LOW_CONF')
+        || props.mlSignalLabel.includes('QUALITY_LOW')
+        || props.mlSignalLabel.includes('WARMUP')
+        || props.mlSignalLabel.includes('NOT_READY')
+        || props.mlSignalLabel.includes('STALE')
+        ? 'text-amber-300'
+        : 'text-gray-400';
+  const modelGateDeltaClass = props.modelGateDeltaBps > 0.1
+    ? 'text-amber-300'
+    : props.modelGateDeltaBps < -0.1
+      ? 'text-emerald-300'
+      : 'text-gray-400';
+  const modelGateModeLabel = props.modelGateEnabled
+    ? (props.modelGateAdvisory ? 'ADVISORY' : 'ACTIVE')
+    : 'DISABLED';
   const sweep = usePipelineSweep(5, 200);
   const px = (key: string): string => {
     const value = props.cexPrices?.[key];
@@ -1539,6 +1785,16 @@ function ExecutionPipelinePanel(props: {
               v={edgePct === null ? '--' : `${edgePct >= 0 ? '+' : ''}${edgePct.toFixed(1)}%`}
               vClass={edgePct !== null && edgePct >= 0 ? 'text-emerald-300' : 'text-rose-300'}
             />
+            <PipeRow
+              k="ml up"
+              v={mlUpProb === null ? '--' : `${(mlUpProb * 100).toFixed(1)}%`}
+              vClass={mlUpProb === null ? 'text-gray-500' : 'text-cyan-300'}
+            />
+            <PipeRow
+              k="ml conf"
+              v={mlConfidence === null ? '--' : `${(mlConfidence * 100).toFixed(0)}%`}
+              vClass={mlConfidence === null ? 'text-gray-500' : mlConfidence >= 0.55 ? 'text-emerald-300' : 'text-amber-300'}
+            />
             <div className="mt-3 text-[11px] font-mono text-gray-500">
               σ <span className="text-gray-200">{props.sigma === null ? '--' : props.sigma.toFixed(1)}</span>
             </div>
@@ -1562,6 +1818,21 @@ function ExecutionPipelinePanel(props: {
               v={props.execDecision}
               vClass={props.execDecision === 'PASS' ? 'text-emerald-300' : 'text-gray-500'}
             />
+            <PipeRow
+              k="ml gate"
+              v={props.mlSignalLabel}
+              vClass={modelLabelClass}
+            />
+            <PipeRow
+              k="p gate"
+              v={`${(Math.max(0, Math.min(1, props.modelGateActive)) * 100).toFixed(1)}%`}
+              vClass="text-cyan-300"
+            />
+            <PipeRow
+              k="p rec"
+              v={`${(Math.max(0, Math.min(1, props.modelGateRecommended)) * 100).toFixed(1)}%`}
+              vClass={modelGateDeltaClass}
+            />
             <div className="mt-3 text-[11px] font-mono flex items-center justify-between gap-3">
               <div>
                 <span className="text-gray-500">EV </span>
@@ -1570,6 +1841,29 @@ function ExecutionPipelinePanel(props: {
                 </span>
               </div>
               <span className="text-gray-600">{props.liveModeLabel}</span>
+            </div>
+            <div className="mt-2 text-[10px] font-mono flex items-center justify-between gap-3">
+              <span className={props.mlModelReady ? 'text-cyan-300 truncate' : 'text-amber-300 truncate'}>
+                {props.mlModelReady ? 'READY' : 'WARMUP'} · {props.mlModelName}
+              </span>
+              <span className={modelImpactBps === null ? 'text-gray-600' : modelImpactBps >= 0 ? 'text-emerald-300' : 'text-rose-300'}>
+                {modelImpactBps === null ? '--' : `${modelImpactBps >= 0 ? '+' : ''}${modelImpactBps.toFixed(1)}bps`}
+              </span>
+            </div>
+            <div className="mt-1 text-[10px] font-mono text-gray-500">
+              edge <span className={mlEdgePct !== null && mlEdgePct >= 0 ? 'text-emerald-300' : 'text-rose-300'}>
+                {mlEdgePct === null ? '--' : `${mlEdgePct >= 0 ? '+' : ''}${mlEdgePct.toFixed(1)}%`}
+              </span>
+            </div>
+            <div className="mt-1 text-[10px] font-mono text-gray-500 flex items-center justify-between gap-2">
+              <span>{modelGateModeLabel} · n={props.modelGateSamples}</span>
+              <span className={modelGateDeltaClass}>
+                Δp {props.modelGateDeltaBps >= 0 ? '+' : ''}{props.modelGateDeltaBps.toFixed(1)}bps
+              </span>
+            </div>
+            <div className="mt-1 text-[10px] font-mono text-gray-500 flex items-center justify-between gap-2">
+              <span>ΔEV {props.modelGateDeltaPnl >= 0 ? '+' : '-'}${Math.abs(props.modelGateDeltaPnl).toFixed(2)}</span>
+              <span>rej {props.modelGateBlocks} | live {props.liveExecBlocks}</span>
             </div>
           </PipeCard>
         </div>

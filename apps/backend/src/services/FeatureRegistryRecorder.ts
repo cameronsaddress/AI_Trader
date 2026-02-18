@@ -173,7 +173,8 @@ export class FeatureRegistryRecorder {
         await fs.mkdir(path.dirname(this.filePath), { recursive: true });
         try {
             await fs.access(this.filePath);
-        } catch {
+        } catch (error) {
+            logger.warn(`[FeatureRegistryRecorder] creating missing event log file path=${this.filePath} error=${String(error)}`);
             await fs.writeFile(this.filePath, '', { encoding: 'utf8' });
         }
         try {
@@ -184,7 +185,8 @@ export class FeatureRegistryRecorder {
             if (stat.size > MAX_FILE_SIZE_BYTES) {
                 await this.rotateFile();
             }
-        } catch {
+        } catch (error) {
+            logger.warn(`[FeatureRegistryRecorder] stat/read fallback path=${this.filePath} error=${String(error)}`);
             this.rowCount = 0;
         }
         this.initialized = true;
@@ -199,10 +201,20 @@ export class FeatureRegistryRecorder {
         const oldPath = this.filePath + '.old';
         try {
             await fs.unlink(oldPath);
-        } catch { /* may not exist */ }
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException)?.code || 'UNKNOWN';
+            if (code !== 'ENOENT') {
+                logger.warn(`[FeatureRegistryRecorder] old log unlink warning path=${oldPath} code=${code} error=${String(error)}`);
+            }
+        }
         try {
             await fs.rename(this.filePath, oldPath);
-        } catch { /* may not exist */ }
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException)?.code || 'UNKNOWN';
+            if (code !== 'ENOENT') {
+                logger.warn(`[FeatureRegistryRecorder] log rename warning from=${this.filePath} to=${oldPath} code=${code} error=${String(error)}`);
+            }
+        }
         await fs.writeFile(this.filePath, '', { encoding: 'utf8' });
         this.rowCount = 0;
         this.writesSinceRotationCheck = 0;
@@ -229,7 +241,9 @@ export class FeatureRegistryRecorder {
                     if (stat.size > MAX_FILE_SIZE_BYTES) {
                         await this.rotateFile();
                     }
-                } catch { /* best-effort */ }
+                } catch (error) {
+                    logger.warn(`[FeatureRegistryRecorder] rotation size-check warning path=${this.filePath} error=${String(error)}`);
+                }
             }
         }).catch((error) => {
             logger.error(`[FeatureRegistryRecorder] failed to persist event: ${String(error)}`);

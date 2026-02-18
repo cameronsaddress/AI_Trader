@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
-use redis::AsyncCommands;
 use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -15,6 +14,7 @@ use crate::strategies::control::{
     compute_strategy_bet_size,
     is_strategy_enabled,
     publish_heartbeat,
+    publish_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -293,7 +293,7 @@ impl Strategy for AsMarketMakerStrategy {
                                             "hold_ms": age,
                                         }
                                     });
-                                    let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
                                     // Execution channel — for execution trace visibility
                                     let exec_msg = serde_json::json!({
                                         "execution_id": pos.execution_id,
@@ -316,7 +316,7 @@ impl Strategy for AsMarketMakerStrategy {
                                             "net_return": net,
                                         }
                                     });
-                                    let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
                                     info!("[AS_MM] EXIT {} pnl=${:.2} ({})", pos.question, pnl, r);
                                 } else {
                                     keep.push(pos);
@@ -363,16 +363,26 @@ impl Strategy for AsMarketMakerStrategy {
                             // YES opportunity
                             if (MIN_ENTRY_PRICE..=MAX_ENTRY_PRICE).contains(&ya) && ys <= MAX_SPREAD {
                                 let e = theo_ask_yes - ya;
-                                let ne = e - polymarket_taker_fee(ya, fee_rate) - cost_model.slippage_bps_per_side / 10_000.0;
-                                if ne > min_edge && (best.is_none() || ne > best.as_ref().unwrap().2) {
+                                let maker_entry_cost = cost_model.maker_side_cost_rate();
+                                let taker_exit_cost = polymarket_taker_fee(
+                                    theo_ask_yes.clamp(0.001, 0.999),
+                                    fee_rate,
+                                ) + (cost_model.slippage_bps_per_side / 10_000.0);
+                                let ne = e - maker_entry_cost - taker_exit_cost;
+                                if ne > min_edge && best.as_ref().is_none_or(|current| ne > current.2) {
                                     best = Some((mid.clone(), Side::Yes, ne, ya, r_yes, hs, sigma, tte));
                                 }
                             }
                             // NO opportunity
                             if (MIN_ENTRY_PRICE..=MAX_ENTRY_PRICE).contains(&na) && ns <= MAX_SPREAD {
                                 let e = theo_ask_no - na;
-                                let ne = e - polymarket_taker_fee(na, fee_rate) - cost_model.slippage_bps_per_side / 10_000.0;
-                                if ne > min_edge && (best.is_none() || ne > best.as_ref().unwrap().2) {
+                                let maker_entry_cost = cost_model.maker_side_cost_rate();
+                                let taker_exit_cost = polymarket_taker_fee(
+                                    theo_ask_no.clamp(0.001, 0.999),
+                                    fee_rate,
+                                ) + (cost_model.slippage_bps_per_side / 10_000.0);
+                                let ne = e - maker_entry_cost - taker_exit_cost;
+                                if ne > min_edge && best.as_ref().is_none_or(|current| ne > current.2) {
                                     best = Some((mid.clone(), Side::No, ne, na, r_no, hs, sigma, tte));
                                 }
                             }
@@ -392,7 +402,7 @@ impl Strategy for AsMarketMakerStrategy {
                                     "slug": market.slug, "positions_count": positions.len(),
                                 }),
                             );
-                            let _: () = conn.publish("arbitrage:scan", scan.to_string()).await.unwrap_or_default();
+                            publish_event(&mut conn, "arbitrage:scan", scan.to_string()).await;
                         }
 
                         // ── Execute best entry ──
@@ -446,7 +456,7 @@ impl Strategy for AsMarketMakerStrategy {
                                             }
                                         }
                                     });
-                                    let _: () = conn.publish("arbitrage:execution", preview_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
                                     last_entry_ts = now_ms;
                                 } else if sz >= 1.0 && reserve_sim_notional_for_strategy(&mut conn, STRATEGY_ID, sz).await {
                                     let eid = Uuid::new_v4().to_string();
@@ -478,7 +488,7 @@ impl Strategy for AsMarketMakerStrategy {
                                             "variant": variant,
                                         }
                                     });
-                                    let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
                                 }
                             }
                         }

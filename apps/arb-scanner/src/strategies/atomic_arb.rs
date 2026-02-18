@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log::{error, info};
-use redis::AsyncCommands;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
@@ -14,6 +13,7 @@ use crate::strategies::control::{
     compute_strategy_bet_size,
     is_strategy_enabled,
     publish_heartbeat,
+    publish_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -296,7 +296,7 @@ impl Strategy for AtomicArbStrategy {
                                 "seconds_to_expiry": seconds_to_expiry,
                             }),
                         );
-                        let _: () = conn.publish("arbitrage:scan", scan_msg.to_string()).await.unwrap_or_default();
+                        publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
 
                         if read_trading_mode(&mut conn).await == TradingMode::Live {
                             if !pending_settlements.is_empty() {
@@ -375,7 +375,7 @@ impl Strategy for AtomicArbStrategy {
                                             }
                                         }
                                     });
-                                    let _: () = conn.publish("arbitrage:execution", dry_run_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "arbitrage:execution", dry_run_msg.to_string()).await;
                                     last_fire_ms = now_ms;
                                 }
                             }
@@ -441,7 +441,7 @@ impl Strategy for AtomicArbStrategy {
                                     "settlement_status": "PENDING_EXPIRY",
                                 }
                             });
-                            let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                            publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
 
                             last_fire_ms = now_ms;
                         }
@@ -477,7 +477,7 @@ impl Strategy for AtomicArbStrategy {
                                     "roi": format!("{:.2}%", pending.net_edge * 100.0),
                                 }
                             });
-                            let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                            publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
 
                             let settle_msg = serde_json::json!({
                                 "execution_id": execution_id,
@@ -493,7 +493,7 @@ impl Strategy for AtomicArbStrategy {
                                     "hold_ms": settle_ts_ms - pending.entry_ts_ms,
                                 }
                             });
-                            let _: () = conn.publish("arbitrage:execution", settle_msg.to_string()).await.unwrap_or_default();
+                            publish_event(&mut conn, "arbitrage:execution", settle_msg.to_string()).await;
                         }
 
                         info!(

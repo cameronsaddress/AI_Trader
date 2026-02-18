@@ -311,7 +311,8 @@ export class StrategyTradeRecorder {
                 this.includeEntryPrice = columns.includes('entry_price');
                 this.includeClosureTaxonomy = columns.includes('closure_class') && columns.includes('label_eligible');
             }
-        } catch {
+        } catch (error) {
+            logger.warn(`[StrategyTradeRecorder] initializing new dataset file path=${this.filePath} error=${String(error)}`);
             await fs.writeFile(this.filePath, CSV_HEADER_V4, { encoding: 'utf8' });
             this.rowCount = 0;
             this.extendedCsv = true;

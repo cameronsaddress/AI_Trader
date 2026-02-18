@@ -1,4 +1,4 @@
-import { IAgent, AgentResponse } from './interfaces';
+import { IAgent, AgentContext, AgentResponse } from './interfaces';
 import { OpenAIAgent } from './OpenAIAgent';
 import { AnthropicAgent } from './AnthropicAgent';
 import { SimulatedAgent } from './SimulatedAgent';
@@ -32,7 +32,7 @@ export class AgentManager {
         }
     }
 
-    public async runAnalysis(symbol: string): Promise<{ decisions: Record<string, AgentResponse>, context: any }> {
+    public async runAnalysis(symbol: string): Promise<{ decisions: Record<string, AgentResponse>; context: AgentContext }> {
         const context = await this.contextBuilder.buildContext(symbol);
         const activeAgents = this.agents.filter((agent) => !this.disabledAgents.has(agent.name));
 

@@ -1,4 +1,5 @@
 use chrono::Utc;
+use log::warn;
 use redis::AsyncCommands;
 use serde::Deserialize;
 
@@ -38,20 +39,173 @@ pub enum TradingMode {
     Live,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortfolioRegime {
+    Trend,
+    MeanRevert,
+    LowLiquidity,
+    Chop,
+    Unknown,
+}
+
+fn regime_sizing_enabled() -> bool {
+    match std::env::var("META_REGIME_SIZING_ENABLED") {
+        Ok(raw) => {
+            let normalized = raw.trim().to_ascii_lowercase();
+            !(normalized == "0" || normalized == "false" || normalized == "no")
+        }
+        Err(_) => true,
+    }
+}
+
+fn regime_min_confidence() -> f64 {
+    std::env::var("META_REGIME_MIN_CONFIDENCE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.30)
+        .clamp(0.0, 1.0)
+}
+
+fn parse_portfolio_regime(raw: &str) -> PortfolioRegime {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "TREND" => PortfolioRegime::Trend,
+        "MEAN_REVERT" => PortfolioRegime::MeanRevert,
+        "LOW_LIQUIDITY" => PortfolioRegime::LowLiquidity,
+        "CHOP" => PortfolioRegime::Chop,
+        _ => PortfolioRegime::Unknown,
+    }
+}
+
+fn regime_family_size_multiplier(regime: PortfolioRegime, family: &str, confidence: f64) -> f64 {
+    if confidence < regime_min_confidence() {
+        return 1.0;
+    }
+
+    match regime {
+        PortfolioRegime::Trend => match family {
+            "FAIR_VALUE" | "CEX_MICROSTRUCTURE" | "ORDER_FLOW" => 1.10,
+            "ARBITRAGE" => 1.05,
+            "MARKET_MAKING" => 0.95,
+            "FLOW_PRESSURE" => 0.95,
+            "CARRY_PARITY" => 0.95,
+            "BIAS_EXPLOITATION" => 1.00,
+            _ => 1.00,
+        },
+        PortfolioRegime::MeanRevert => match family {
+            "MARKET_MAKING" | "CARRY_PARITY" | "BIAS_EXPLOITATION" => 1.10,
+            "ARBITRAGE" => 1.05,
+            "FAIR_VALUE" => 0.90,
+            "CEX_MICROSTRUCTURE" => 0.95,
+            "ORDER_FLOW" => 0.95,
+            "FLOW_PRESSURE" => 0.95,
+            _ => 1.00,
+        },
+        PortfolioRegime::LowLiquidity => match family {
+            "ARBITRAGE" => 0.90,
+            "MARKET_MAKING" => 0.80,
+            "CARRY_PARITY" => 0.80,
+            "FAIR_VALUE" => 0.75,
+            "CEX_MICROSTRUCTURE" => 0.70,
+            "ORDER_FLOW" => 0.70,
+            "FLOW_PRESSURE" => 0.70,
+            "BIAS_EXPLOITATION" => 0.80,
+            _ => 0.85,
+        },
+        PortfolioRegime::Chop => match family {
+            "MARKET_MAKING" | "CARRY_PARITY" | "BIAS_EXPLOITATION" => 1.05,
+            "ARBITRAGE" => 1.00,
+            "FAIR_VALUE" => 0.85,
+            "CEX_MICROSTRUCTURE" => 0.90,
+            "ORDER_FLOW" => 0.90,
+            "FLOW_PRESSURE" => 0.90,
+            _ => 1.00,
+        },
+        PortfolioRegime::Unknown => 1.00,
+    }
+}
+
+async fn read_portfolio_regime(
+    conn: &mut redis::aio::MultiplexedConnection,
+) -> (PortfolioRegime, f64) {
+    let raw: Option<String> = match conn.get("meta_controller:regime").await {
+        Ok(value) => value,
+        Err(error) => {
+            warn!("failed to read meta_controller:regime from redis: {}", error);
+            None
+        }
+    };
+    let Some(payload) = raw else {
+        return (PortfolioRegime::Unknown, 0.0);
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&payload) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!("failed to parse meta_controller:regime payload: {}", error);
+            return (PortfolioRegime::Unknown, 0.0);
+        }
+    };
+    let regime = parsed
+        .get("regime")
+        .and_then(|v| v.as_str())
+        .map(parse_portfolio_regime)
+        .unwrap_or(PortfolioRegime::Unknown);
+    let confidence = parsed
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    (regime, confidence)
+}
+
+async fn read_f64_or(
+    conn: &mut redis::aio::MultiplexedConnection,
+    key: &str,
+    fallback: f64,
+) -> f64 {
+    match conn.get::<_, f64>(key).await {
+        Ok(value) => value,
+        Err(error) => {
+            warn!("failed to read {} from redis; using fallback {}: {}", key, fallback, error);
+            fallback
+        }
+    }
+}
+
 pub async fn read_risk_config(conn: &mut redis::aio::MultiplexedConnection) -> RiskConfig {
-    let raw: String = conn.get("system:risk_config").await.unwrap_or_else(|_| "{}".to_string());
-    serde_json::from_str::<RiskConfig>(&raw).unwrap_or_default()
+    let raw: String = match conn.get("system:risk_config").await {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!("failed to read system:risk_config from redis: {}", error);
+            return RiskConfig::default();
+        }
+    };
+    match serde_json::from_str::<RiskConfig>(&raw) {
+        Ok(config) => config,
+        Err(error) => {
+            warn!("invalid system:risk_config payload; using default: {}", error);
+            RiskConfig::default()
+        }
+    }
 }
 
 async fn ensure_sim_ledger(conn: &mut redis::aio::MultiplexedConnection) {
-    let fallback_equity = conn
-        .get::<_, f64>(SIM_BANKROLL_KEY)
+    let fallback_equity = read_f64_or(conn, SIM_BANKROLL_KEY, DEFAULT_SIM_BANKROLL).await;
+    if let Err(error) = conn.set_nx::<_, _, bool>(SIM_BANKROLL_KEY, fallback_equity).await {
+        warn!("failed to initialize {}: {}", SIM_BANKROLL_KEY, error);
+    }
+    if let Err(error) = conn.set_nx::<_, _, bool>(SIM_LEDGER_CASH_KEY, fallback_equity).await {
+        warn!("failed to initialize {}: {}", SIM_LEDGER_CASH_KEY, error);
+    }
+    if let Err(error) = conn.set_nx::<_, _, bool>(SIM_LEDGER_RESERVED_KEY, 0.0_f64).await {
+        warn!("failed to initialize {}: {}", SIM_LEDGER_RESERVED_KEY, error);
+    }
+    if let Err(error) = conn
+        .set_nx::<_, _, bool>(SIM_LEDGER_REALIZED_PNL_KEY, 0.0_f64)
         .await
-        .unwrap_or(DEFAULT_SIM_BANKROLL);
-    let _: bool = conn.set_nx(SIM_BANKROLL_KEY, fallback_equity).await.unwrap_or(false);
-    let _: bool = conn.set_nx(SIM_LEDGER_CASH_KEY, fallback_equity).await.unwrap_or(false);
-    let _: bool = conn.set_nx(SIM_LEDGER_RESERVED_KEY, 0.0_f64).await.unwrap_or(false);
-    let _: bool = conn.set_nx(SIM_LEDGER_REALIZED_PNL_KEY, 0.0_f64).await.unwrap_or(false);
+    {
+        warn!("failed to initialize {}: {}", SIM_LEDGER_REALIZED_PNL_KEY, error);
+    }
 }
 
 fn strategy_reserved_key(strategy_id: &str) -> String {
@@ -141,33 +295,29 @@ fn underlying_concentration_cap_pct() -> f64 {
 pub async fn read_underlying_reserved_notional(conn: &mut redis::aio::MultiplexedConnection, underlying: &str) -> f64 {
     ensure_sim_ledger(conn).await;
     let key = underlying_reserved_key(underlying);
-    conn.get::<_, f64>(key).await.unwrap_or(0.0)
+    read_f64_or(conn, &key, 0.0).await
 }
 
 pub async fn read_strategy_reserved_notional(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> f64 {
     ensure_sim_ledger(conn).await;
     let key = strategy_reserved_key(strategy_id);
-    conn.get::<_, f64>(key).await.unwrap_or(0.0)
+    read_f64_or(conn, &key, 0.0).await
 }
 
 pub async fn read_family_reserved_notional(conn: &mut redis::aio::MultiplexedConnection, family_id: &str) -> f64 {
     ensure_sim_ledger(conn).await;
     let key = family_reserved_key(family_id);
-    conn.get::<_, f64>(key).await.unwrap_or(0.0)
+    read_f64_or(conn, &key, 0.0).await
 }
 
 pub async fn read_sim_available_cash(conn: &mut redis::aio::MultiplexedConnection) -> f64 {
     ensure_sim_ledger(conn).await;
-    conn.get::<_, f64>(SIM_LEDGER_CASH_KEY)
-        .await
-        .unwrap_or(DEFAULT_SIM_BANKROLL)
+    read_f64_or(conn, SIM_LEDGER_CASH_KEY, DEFAULT_SIM_BANKROLL).await
 }
 
 pub async fn read_sim_reserved_notional(conn: &mut redis::aio::MultiplexedConnection) -> f64 {
     ensure_sim_ledger(conn).await;
-    conn.get::<_, f64>(SIM_LEDGER_RESERVED_KEY)
-        .await
-        .unwrap_or(0.0)
+    read_f64_or(conn, SIM_LEDGER_RESERVED_KEY, 0.0).await
 }
 
 pub async fn read_sim_bankroll(conn: &mut redis::aio::MultiplexedConnection) -> f64 {
@@ -175,7 +325,9 @@ pub async fn read_sim_bankroll(conn: &mut redis::aio::MultiplexedConnection) -> 
     let cash = read_sim_available_cash(conn).await;
     let reserved = read_sim_reserved_notional(conn).await;
     let equity = cash + reserved;
-    let _: () = conn.set(SIM_BANKROLL_KEY, equity).await.unwrap_or_default();
+    if let Err(error) = conn.set::<_, _, ()>(SIM_BANKROLL_KEY, equity).await {
+        warn!("[Ledger] failed to persist {}: {}", SIM_BANKROLL_KEY, error);
+    }
     equity
 }
 
@@ -184,7 +336,7 @@ pub async fn read_sim_bankroll(conn: &mut redis::aio::MultiplexedConnection) -> 
 pub async fn validate_ledger_invariant(conn: &mut redis::aio::MultiplexedConnection) -> bool {
     let cash = read_sim_available_cash(conn).await;
     let reserved = read_sim_reserved_notional(conn).await;
-    let bankroll: f64 = conn.get::<_, f64>("sim_bankroll").await.unwrap_or(0.0);
+    let bankroll = read_f64_or(conn, SIM_BANKROLL_KEY, 0.0).await;
     let computed = cash + reserved;
     let diff = (computed - bankroll).abs();
     if diff > 1.0 {
@@ -192,12 +344,14 @@ pub async fn validate_ledger_invariant(conn: &mut redis::aio::MultiplexedConnect
             "LEDGER_INVARIANT_VIOLATION: cash={:.2} + reserved={:.2} = {:.2} != bankroll={:.2}, diff={:.4}",
             cash, reserved, computed, bankroll, diff
         );
-        let _: () = redis::cmd("PUBLISH")
+        if let Err(error) = redis::cmd("PUBLISH")
             .arg("system:alert")
             .arg(format!(r#"{{"level":"CRITICAL","msg":"LEDGER_DRIFT","diff":{:.4}}}"#, diff))
-            .query_async(conn)
+            .query_async::<()>(&mut *conn)
             .await
-            .unwrap_or(());
+        {
+            warn!("[Ledger] failed to publish drift alert: {}", error);
+        }
         return false;
     }
     true
@@ -207,9 +361,7 @@ const SIM_LEDGER_PEAK_EQUITY_KEY: &str = "sim_ledger:peak_equity";
 
 pub async fn read_sim_realized_pnl(conn: &mut redis::aio::MultiplexedConnection) -> f64 {
     ensure_sim_ledger(conn).await;
-    conn.get::<_, f64>(SIM_LEDGER_REALIZED_PNL_KEY)
-        .await
-        .unwrap_or(0.0)
+    read_f64_or(conn, SIM_LEDGER_REALIZED_PNL_KEY, 0.0).await
 }
 
 /// Returns true if the portfolio drawdown from peak equity exceeds the limit.
@@ -222,9 +374,11 @@ pub async fn check_drawdown_breached(conn: &mut redis::aio::MultiplexedConnectio
     if equity <= 0.0 {
         return true; // Zero equity is a breach
     }
-    let peak: f64 = conn.get::<_, f64>(SIM_LEDGER_PEAK_EQUITY_KEY).await.unwrap_or(equity);
+    let peak = read_f64_or(conn, SIM_LEDGER_PEAK_EQUITY_KEY, equity).await;
     let peak = if equity > peak || peak <= 0.0 {
-        let _: () = conn.set(SIM_LEDGER_PEAK_EQUITY_KEY, equity).await.unwrap_or_default();
+        if let Err(error) = conn.set::<_, _, ()>(SIM_LEDGER_PEAK_EQUITY_KEY, equity).await {
+            warn!("[Ledger] failed to persist {}: {}", SIM_LEDGER_PEAK_EQUITY_KEY, error);
+        }
         equity
     } else {
         peak
@@ -588,29 +742,42 @@ pub async fn read_strategy_risk_multiplier(conn: &mut redis::aio::MultiplexedCon
     }
 
     let key = format!("{}{}", STRATEGY_RISK_MULTIPLIER_PREFIX, strategy_id.trim());
-    let parsed = conn.get::<_, f64>(&key).await.ok();
-    if let Some(value) = parsed {
-        if value.is_finite() {
-            return value.clamp(0.0, 3.0);
-        }
+    match conn.get::<_, f64>(&key).await {
+        Ok(value) if value.is_finite() => return value.clamp(0.0, 3.0),
+        Ok(_) => {}
+        Err(error) => warn!("failed to read strategy risk multiplier {}: {}", key, error),
     }
 
-    let _: bool = conn.set_nx(&key, 1.0_f64).await.unwrap_or(false);
+    if let Err(error) = conn.set_nx::<_, _, bool>(&key, 1.0_f64).await {
+        warn!("failed to initialize strategy risk multiplier {}: {}", key, error);
+    }
     1.0
 }
 
 /// Read anti-martingale size factor from Redis (set by backend risk guard).
 pub async fn read_risk_guard_size_factor(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> f64 {
     let key = format!("risk_guard:size_factor:{}", strategy_id);
-    let val: Option<f64> = conn.get(&key).await.ok();
-    val.unwrap_or(1.0).clamp(0.1, 1.0)
+    match conn.get::<_, Option<f64>>(&key).await {
+        Ok(Some(value)) => value.clamp(0.1, 1.0),
+        Ok(None) => 1.0,
+        Err(error) => {
+            warn!("failed to read risk guard size factor {}: {}", key, error);
+            1.0
+        }
+    }
 }
 
 /// Read post-loss cooldown deadline from Redis (epoch ms). Returns 0 if not set.
 pub async fn read_risk_guard_cooldown(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> i64 {
     let key = format!("risk_guard:cooldown:{}", strategy_id);
-    let val: Option<i64> = conn.get(&key).await.ok();
-    val.unwrap_or(0)
+    match conn.get::<_, Option<i64>>(&key).await {
+        Ok(Some(value)) => value,
+        Ok(None) => 0,
+        Err(error) => {
+            warn!("failed to read risk guard cooldown {}: {}", key, error);
+            0
+        }
+    }
 }
 
 pub async fn compute_strategy_bet_size(
@@ -639,6 +806,16 @@ pub async fn compute_strategy_bet_size(
     let size_factor = read_risk_guard_size_factor(conn, strategy_id).await;
     if size_factor < 1.0 {
         sized *= size_factor;
+    }
+
+    if regime_sizing_enabled() {
+        let (regime, confidence) = read_portfolio_regime(conn).await;
+        let family = strategy_family(strategy_id);
+        let regime_multiplier = regime_family_size_multiplier(regime, family, confidence);
+        if regime_multiplier <= DEFAULT_NUMERIC_EPSILON {
+            return 0.0;
+        }
+        sized *= regime_multiplier;
     }
 
     // Per-strategy hard notional cap (env: {STRATEGY_ID}_NOTIONAL_CAP).
@@ -687,34 +864,6 @@ pub async fn compute_strategy_bet_size(
     sized
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{strategy_family, strategy_underlying};
-
-    #[test]
-    fn strategy_family_maps_known_ids() {
-        assert_eq!(strategy_family("BTC_5M"), "FAIR_VALUE");
-        assert_eq!(strategy_family("BTC_15M"), "FAIR_VALUE");
-        assert_eq!(strategy_family("ATOMIC_ARB"), "ARBITRAGE");
-        assert_eq!(strategy_family("OBI_SCALPER"), "ORDER_FLOW");
-        assert_eq!(strategy_family("MAKER_MM"), "MARKET_MAKING");
-        assert_eq!(strategy_family("unknown"), "GENERIC");
-    }
-
-    #[test]
-    fn strategy_underlying_maps_known_ids() {
-        assert_eq!(strategy_underlying("BTC_5M"), "BTC");
-        assert_eq!(strategy_underlying("BTC_15M"), "BTC");
-        assert_eq!(strategy_underlying("ETH_15M"), "ETH");
-        assert_eq!(strategy_underlying("SOL_15M"), "SOL");
-        assert_eq!(strategy_underlying("CEX_SNIPER"), "BTC");
-        assert_eq!(strategy_underlying("MAKER_MM"), "POLY_EVENT");
-        assert_eq!(strategy_underlying("AS_MARKET_MAKER"), "POLY_EVENT");
-        assert_eq!(strategy_underlying("LONGSHOT_BIAS"), "POLY_EVENT");
-        assert_eq!(strategy_underlying("unknown"), "UNKNOWN");
-    }
-}
-
 pub async fn is_strategy_enabled(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> bool {
     let key = format!("strategy:enabled:{}", strategy_id);
     let raw: String = conn.get(key).await.unwrap_or_else(|_| "1".to_string());
@@ -729,10 +878,18 @@ pub async fn publish_heartbeat(conn: &mut redis::aio::MultiplexedConnection, id:
         "sim_realized_pnl": realized_pnl,
     });
 
-    let _: () = conn
-        .publish("system:heartbeat", heartbeat.to_string())
-        .await
-        .unwrap_or_default();
+    publish_event(conn, "system:heartbeat", heartbeat.to_string()).await;
+}
+
+pub async fn publish_event(
+    conn: &mut redis::aio::MultiplexedConnection,
+    channel: &str,
+    payload: impl Into<String>,
+) {
+    let encoded = payload.into();
+    if let Err(error) = conn.publish::<_, _, ()>(channel, encoded).await {
+        warn!("[RedisPublish] channel={} error={}", channel, error);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -771,4 +928,32 @@ pub fn build_scan_payload(
         "metric_label": metric_label,
         "meta": meta,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{strategy_family, strategy_underlying};
+
+    #[test]
+    fn strategy_family_maps_known_ids() {
+        assert_eq!(strategy_family("BTC_5M"), "FAIR_VALUE");
+        assert_eq!(strategy_family("BTC_15M"), "FAIR_VALUE");
+        assert_eq!(strategy_family("ATOMIC_ARB"), "ARBITRAGE");
+        assert_eq!(strategy_family("OBI_SCALPER"), "ORDER_FLOW");
+        assert_eq!(strategy_family("MAKER_MM"), "MARKET_MAKING");
+        assert_eq!(strategy_family("unknown"), "GENERIC");
+    }
+
+    #[test]
+    fn strategy_underlying_maps_known_ids() {
+        assert_eq!(strategy_underlying("BTC_5M"), "BTC");
+        assert_eq!(strategy_underlying("BTC_15M"), "BTC");
+        assert_eq!(strategy_underlying("ETH_15M"), "ETH");
+        assert_eq!(strategy_underlying("SOL_15M"), "SOL");
+        assert_eq!(strategy_underlying("CEX_SNIPER"), "BTC");
+        assert_eq!(strategy_underlying("MAKER_MM"), "POLY_EVENT");
+        assert_eq!(strategy_underlying("AS_MARKET_MAKER"), "POLY_EVENT");
+        assert_eq!(strategy_underlying("LONGSHOT_BIAS"), "POLY_EVENT");
+        assert_eq!(strategy_underlying("unknown"), "UNKNOWN");
+    }
 }

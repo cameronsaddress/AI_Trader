@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
-use redis::AsyncCommands;
 use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -15,6 +14,7 @@ use crate::strategies::control::{
     compute_strategy_bet_size,
     is_strategy_enabled,
     publish_heartbeat,
+    publish_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -364,14 +364,17 @@ impl Strategy for ConvergenceCarryStrategy {
                                             "entry": pos.entry_price, "hold_ms": hold_ms,
                                         }
                                     });
-                                    let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
                                 } else {
                                     keep_positions.push(pos);
                                 }
                                 continue;
                             }
 
-                            let book = book_opt.unwrap();
+                            let Some(book) = book_opt else {
+                                keep_positions.push(pos);
+                                continue;
+                            };
                             let mark = Self::mark_price(book, pos.side);
                             if mark <= 0.0 || pos.entry_price <= 0.0 {
                                 keep_positions.push(pos);
@@ -435,7 +438,7 @@ impl Strategy for ConvergenceCarryStrategy {
                                         "parity_edge": active_edge,
                                     }
                                 });
-                                let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                                publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
                             } else {
                                 keep_positions.push(pos);
                             }
@@ -542,7 +545,7 @@ impl Strategy for ConvergenceCarryStrategy {
                                 "open_positions": open_positions.len(),
                             }),
                         );
-                        let _: () = conn.publish("arbitrage:scan", scan_msg.to_string()).await.unwrap_or_default();
+                        publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
 
                         let already_in_market = open_positions.iter().any(|p| p.market_id == market.market_id);
                         if open_positions.len() >= MAX_OPEN_POSITIONS
@@ -605,7 +608,7 @@ impl Strategy for ConvergenceCarryStrategy {
                                             }
                                         }
                                     });
-                                    let _: () = conn.publish("arbitrage:execution", preview_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
                                     last_live_preview_ms = now_ms;
                                     last_entry_ms = now_ms;
                                 }
@@ -653,7 +656,7 @@ impl Strategy for ConvergenceCarryStrategy {
                                     "spread": spread,
                                 }
                             });
-                            let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                            publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
                         }
 
                         publish_heartbeat(&mut conn, "convergence_carry").await;

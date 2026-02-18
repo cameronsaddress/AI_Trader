@@ -10,7 +10,7 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 import { Side } from '@polymarket/clob-client';
 
-import { MarketDataService } from './services/MarketDataService';
+import { MarketDataService, type MarketTickerMessage } from './services/MarketDataService';
 import { ContextBuilder } from './services/ContextBuilder';
 import { AgentManager } from './agents/AgentManager';
 import { DecisionGate } from './agents/DecisionGate';
@@ -21,8 +21,26 @@ import type { PolymarketLiveExecutionResult } from './services/PolymarketPreflig
 import { PolymarketSettlementService, settlementEventToExecutionLog } from './services/PolymarketSettlementService';
 import { StrategyTradeRecorder } from './services/StrategyTradeRecorder';
 import { FeatureRegistryRecorder } from './services/FeatureRegistryRecorder';
+import { RejectedSignalRecorder } from './services/RejectedSignalRecorder';
 import { extractBearerToken } from './middleware/auth';
 import { connectRedis, redisClient, subscriber as redisSubscriber } from './config/redis';
+import { createRiskGuardModule } from './modules/risk/riskGuardModule';
+import {
+    createLedgerHealthModule,
+    type SimulationLedgerSnapshot,
+    type LedgerHealthState,
+} from './modules/ledger/ledgerHealthModule';
+import {
+    processArbitrageExecutionWorker,
+    type RejectedSignalRecord,
+} from './modules/execution/arbExecutionPipeline';
+import { scheduleNonOverlappingTask } from './modules/runtime/scheduler';
+import {
+    buildModelGateCalibrationSamples,
+    type ModelGateCalibrationSample,
+} from './modules/model/modelGateCalibration';
+import { validateArbitrageScanContract } from './modules/ingest/scanContract';
+import { logger } from './utils/logger';
 
 dotenv.config();
 
@@ -41,7 +59,7 @@ const io = new Server(httpServer, {
             if (!requestOrigin || allowed.includes(requestOrigin) || requestOrigin.match(/^http:\/\/\d+\.\d+\.\d+\.\d+:3112$/)) {
                 callback(null, true);
             } else {
-                console.warn(`[CORS] Blocked origin: ${requestOrigin}`);
+                logger.warn(`[CORS] blocked origin=${requestOrigin}`);
                 callback(new Error('Not allowed by CORS'));
             }
         },
@@ -105,9 +123,9 @@ import {
     DEFAULT_SIM_BANKROLL, STRATEGY_METRICS_KEY,
     SIM_BANKROLL_KEY, SIM_LEDGER_CASH_KEY, SIM_LEDGER_RESERVED_KEY,
     SIM_LEDGER_REALIZED_PNL_KEY, SIM_LEDGER_RESERVED_BY_STRATEGY_PREFIX,
-    SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX,
+    SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX, SIM_LEDGER_RESERVED_BY_UNDERLYING_PREFIX,
     SIM_STRATEGY_CONCENTRATION_CAP_PCT, SIM_FAMILY_CONCENTRATION_CAP_PCT,
-    SIM_GLOBAL_UTILIZATION_CAP_PCT,
+    SIM_UNDERLYING_CONCENTRATION_CAP_PCT, SIM_GLOBAL_UTILIZATION_CAP_PCT,
     STRATEGY_RISK_MULTIPLIER_PREFIX, STRATEGY_WEIGHT_FLOOR, STRATEGY_WEIGHT_CAP,
     STRATEGY_ALLOCATOR_EPSILON, STRATEGY_ALLOCATOR_MIN_SAMPLES,
     STRATEGY_ALLOCATOR_TARGET_SHARPE, DEFAULT_DISABLED_STRATEGIES,
@@ -135,10 +153,15 @@ import {
     FEATURE_REGISTRY_MAX_ROWS, FEATURE_REGISTRY_LABEL_LOOKBACK_MS,
     META_CONTROLLER_ENABLED, META_CONTROLLER_ADVISORY_ONLY, META_CONTROLLER_REFRESH_DEBOUNCE_MS,
     MODEL_PROBABILITY_GATE_ENABLED, MODEL_PROBABILITY_GATE_ENFORCE_PAPER,
-    MODEL_PROBABILITY_GATE_ENFORCE_LIVE, LEGACY_BRAIN_LOOP_ENABLED,
+    MODEL_PROBABILITY_GATE_ENFORCE_LIVE, LEGACY_BRAIN_LOOP_ENABLED, LEGACY_BRAIN_LOOP_UNSAFE_OK,
     MODEL_PROBABILITY_GATE_MIN_PROB, MODEL_PROBABILITY_GATE_MAX_STALENESS_MS,
     MODEL_PROBABILITY_GATE_REQUIRE_MODEL, MODEL_PROBABILITY_GATE_DISABLE_ON_DRIFT,
     MODEL_PROBABILITY_GATE_DRIFT_DISABLE_MS,
+    MODEL_PROBABILITY_GATE_TUNER_ENABLED, MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY,
+    MODEL_PROBABILITY_GATE_TUNER_INTERVAL_MS, MODEL_PROBABILITY_GATE_TUNER_LOOKBACK_MS,
+    MODEL_PROBABILITY_GATE_COUNTERFACTUAL_WINDOW_MS,
+    MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES, MODEL_PROBABILITY_GATE_TUNER_STEP,
+    MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT,
     MODEL_TRAINER_ENABLED, MODEL_TRAINER_INTERVAL_MS,
     MODEL_TRAINER_MIN_LABELED_ROWS, MODEL_TRAINER_MIN_NEW_LABELS, MODEL_TRAINER_MAX_ROWS,
     MODEL_TRAINER_SPLITS, MODEL_TRAINER_PURGE_ROWS, MODEL_TRAINER_EMBARGO_ROWS,
@@ -151,221 +174,178 @@ import {
 
 // Runtime state (not extractable — mutable per-process)
 const executionTraces = new Map<string, ExecutionTrace>();
+const strategyExecutionHistory = new Map<string, Record<string, unknown>[]>();
+const STRATEGY_EXECUTION_HISTORY_LIMIT = Math.max(
+    100,
+    Number(process.env.STRATEGY_EXECUTION_HISTORY_LIMIT || '500'),
+);
 
 const strategyStatus: Record<string, boolean> = Object.fromEntries(STRATEGY_IDS.map((id) => [id, true]));
 
-// ── Risk Guard state ─────────────────────────────────────────────────
-interface RiskGuardState {
-    cumPnl: number;
-    peakPnl: number;
-    consecutiveLosses: number;
-    lastLossAt: number;
-    lastDirection: string | null;
-    consecutiveSameDirLosses: number;
-    pausedUntil: number;
-    dayStartMs: number;
-}
-const riskGuardState: Record<string, RiskGuardState> = {};
-
-function computeDayStartMs(): number {
-    // Trading day boundary: configurable hour in UTC (default 8 = midnight PST).
-    // E.g. RISK_GUARD_DAY_RESET_HOUR_UTC=8 means the "trading day" runs 08:00 UTC → 08:00 UTC.
-    const now = new Date();
-    const boundary = new Date(now);
-    boundary.setUTCHours(RISK_GUARD_DAY_RESET_HOUR_UTC, 0, 0, 0);
-    // If we haven't passed today's boundary yet, the day started at yesterday's boundary.
-    if (now.getTime() < boundary.getTime()) {
-        boundary.setUTCDate(boundary.getUTCDate() - 1);
-    }
-    return boundary.getTime();
+interface SilentCatchTelemetryEntry {
+    count: number;
+    first_seen: number;
+    last_seen: number;
+    last_message: string;
+    last_context: Record<string, string | number | boolean | null>;
+    last_log_ms: number;
 }
 
-function nextDayBoundaryMs(): number {
-    const dayStart = computeDayStartMs();
-    return dayStart + 86_400_000;
-}
+const silentCatchTelemetry: Record<string, SilentCatchTelemetryEntry> = {};
+const SILENT_CATCH_LOG_COOLDOWN_MS = 30_000;
 
-function ensureRiskGuardState(strategyId: string): RiskGuardState {
-    const dayStart = computeDayStartMs();
-    if (!riskGuardState[strategyId] || riskGuardState[strategyId].dayStartMs < dayStart) {
-        riskGuardState[strategyId] = {
-            cumPnl: 0, peakPnl: 0,
-            consecutiveLosses: 0, lastLossAt: 0,
-            lastDirection: null, consecutiveSameDirLosses: 0,
-            pausedUntil: 0, dayStartMs: dayStart,
-        };
+function toTelemetryErrorMessage(error: unknown): string {
+    if (error instanceof Error) {
+        return `${error.name}: ${error.message}`.slice(0, 240);
     }
-    return riskGuardState[strategyId];
-}
-
-async function processRiskGuard(strategyId: string, pnl: number, parsed: Record<string, unknown>): Promise<void> {
-    if (!RISK_GUARD_STRATEGIES.has(strategyId)) return;
-
-    const state = ensureRiskGuardState(strategyId);
-    const now = Date.now();
-    const direction = typeof parsed?.side === 'string' ? parsed.side : null;
-    const isLoss = pnl < 0;
-
-    // ── Update tracking ──
-    state.cumPnl += pnl;
-    if (state.cumPnl > state.peakPnl) state.peakPnl = state.cumPnl;
-
-    if (isLoss) {
-        state.consecutiveLosses += 1;
-        state.lastLossAt = now;
-        if (direction && direction === state.lastDirection) {
-            state.consecutiveSameDirLosses += 1;
-        } else {
-            state.consecutiveSameDirLosses = 1;
-        }
-    } else {
-        state.consecutiveLosses = 0;
-        state.consecutiveSameDirLosses = 0;
+    if (typeof error === 'string') {
+        return error.slice(0, 240);
     }
-    state.lastDirection = direction;
-
-    // ── Guard 5: Size factor (anti-martingale + profit taper) ──
-    let sizeFactor = 1.0;
-
-    // Anti-martingale: halve after consecutive losses
-    if (state.consecutiveLosses >= RISK_GUARD_ANTI_MARTINGALE_AFTER) {
-        const reductions = state.consecutiveLosses - RISK_GUARD_ANTI_MARTINGALE_AFTER + 1;
-        sizeFactor = Math.min(sizeFactor, Math.max(0.1, Math.pow(RISK_GUARD_ANTI_MARTINGALE_FACTOR, reductions)));
-    }
-
-    // Profit taper: reduce sizing after big profit run to prevent give-back
-    if (RISK_GUARD_PROFIT_TAPER_START > 0 && state.cumPnl > RISK_GUARD_PROFIT_TAPER_START) {
-        const excess = state.cumPnl - RISK_GUARD_PROFIT_TAPER_START;
-        const taperFactor = Math.max(RISK_GUARD_PROFIT_TAPER_FLOOR, 1.0 - (excess / (RISK_GUARD_PROFIT_TAPER_START * 2)));
-        sizeFactor = Math.min(sizeFactor, taperFactor);
-    }
-
-    if (sizeFactor < 1.0) {
-        await redisClient.set(`risk_guard:size_factor:${strategyId}`, String(sizeFactor));
-        await redisClient.expire(`risk_guard:size_factor:${strategyId}`, 7200);
-    } else {
-        await redisClient.del(`risk_guard:size_factor:${strategyId}`);
-    }
-
-    // ── Guard 4: Post-loss cooldown (set Redis key for scanner) ──
-    if (isLoss && RISK_GUARD_POST_LOSS_COOLDOWN_MS > 0) {
-        const cooldownUntil = now + RISK_GUARD_POST_LOSS_COOLDOWN_MS;
-        await redisClient.set(`risk_guard:cooldown:${strategyId}`, String(cooldownUntil));
-        await redisClient.expire(`risk_guard:cooldown:${strategyId}`, Math.ceil(RISK_GUARD_POST_LOSS_COOLDOWN_MS / 1000) + 60);
-    }
-
-    // ── Check pause triggers (most severe first) ──
-    let shouldPause = false;
-    let pauseReason = '';
-    let pauseDurationMs = 0;
-
-    // Guard 1: Daily trailing stop
-    if (RISK_GUARD_TRAILING_STOP > 0) {
-        const drawdown = state.peakPnl - state.cumPnl;
-        if (drawdown >= RISK_GUARD_TRAILING_STOP) {
-            shouldPause = true;
-            pauseReason = `trailing_stop: drawdown $${drawdown.toFixed(2)} >= $${RISK_GUARD_TRAILING_STOP}`;
-            pauseDurationMs = nextDayBoundaryMs() - now;
-        }
-    }
-
-    // Guard 8: Daily profit target — once you've made enough, stop trading.
-    // Prevents giving back a great day by over-trading into a regime change.
-    if (!shouldPause && RISK_GUARD_DAILY_TARGET > 0 && state.cumPnl >= RISK_GUARD_DAILY_TARGET) {
-        shouldPause = true;
-        pauseReason = `daily_target: cumPnl $${state.cumPnl.toFixed(2)} >= target $${RISK_GUARD_DAILY_TARGET}`;
-        pauseDurationMs = nextDayBoundaryMs() - now;
-    }
-
-    // Guard 2: Consecutive loss circuit breaker
-    if (!shouldPause && state.consecutiveLosses >= RISK_GUARD_CONSEC_LOSS_LIMIT) {
-        shouldPause = true;
-        pauseReason = `consecutive_losses: ${state.consecutiveLosses} >= ${RISK_GUARD_CONSEC_LOSS_LIMIT}`;
-        pauseDurationMs = RISK_GUARD_CONSEC_LOSS_COOLDOWN_MS;
-    }
-
-    // Guard 7: Directional diversity
-    if (!shouldPause && state.consecutiveSameDirLosses >= RISK_GUARD_DIRECTION_LIMIT) {
-        shouldPause = true;
-        pauseReason = `direction_lock: ${state.consecutiveSameDirLosses} same-dir losses (${direction}) >= ${RISK_GUARD_DIRECTION_LIMIT}`;
-        pauseDurationMs = RISK_GUARD_POST_LOSS_COOLDOWN_MS;
-    }
-
-    if (shouldPause && now < state.pausedUntil) {
-        // Already paused from a prior trigger, skip re-setting
-        return;
-    }
-
-    if (shouldPause) {
-        state.pausedUntil = now + pauseDurationMs;
-        await redisClient.set(`strategy:enabled:${strategyId}`, '0');
-        await redisClient.expire(`strategy:enabled:${strategyId}`, 86400); // 24 hours
-        strategyStatus[strategyId] = false;
-        io.emit('strategy_status_update', strategyStatus);
-        console.info(`[RiskGuard] PAUSED ${strategyId}: ${pauseReason} | resume at ${new Date(state.pausedUntil).toISOString()}`);
-
-        // Schedule auto-resume (if not trailing stop to EOD)
-        if (pauseDurationMs > 0 && pauseDurationMs < 86_400_000) {
-            setTimeout(async () => {
-                try {
-                    const s = ensureRiskGuardState(strategyId);
-                    if (s.pausedUntil <= Date.now()) {
-                        await redisClient.set(`strategy:enabled:${strategyId}`, '1');
-                        await redisClient.expire(`strategy:enabled:${strategyId}`, 86400); // 24 hours
-                        strategyStatus[strategyId] = true;
-                        io.emit('strategy_status_update', strategyStatus);
-                        console.info(`[RiskGuard] RESUMED ${strategyId} after cooldown`);
-                    }
-                } catch (err) {
-                    console.error(`[RiskGuard] Error resuming ${strategyId}:`, err);
-                }
-            }, pauseDurationMs);
-        }
-    }
-
-    io.emit('risk_guard_update', { strategy: strategyId, ...state });
-
-    // Persist risk guard state to Redis so it survives restarts.
-    await redisClient.set(`risk_guard:state:${strategyId}`, JSON.stringify(state));
-    await redisClient.expire(`risk_guard:state:${strategyId}`, 72 * 60 * 60); // 72 hours
-}
-
-// ── Profit Vault: sweep excess cash into protected vault ─────────────
-async function sweepProfitsToVault(): Promise<void> {
-    if (!VAULT_ENABLED || VAULT_BANKROLL_CEILING <= 0) return;
     try {
-        const cash = parseFloat(await redisClient.get('sim_ledger:cash') || '0');
-        if (cash <= VAULT_BANKROLL_CEILING) return;
-        const excess = Math.round((cash - VAULT_BANKROLL_CEILING) * 100) / 100;
-        if (excess <= 0.01) return;
-
-        await redisClient.incrByFloat('sim_ledger:cash', -excess);
-        await redisClient.incrByFloat('sim_bankroll', -excess);
-        await redisClient.incrByFloat(VAULT_REDIS_KEY, excess);
-
-        const vault = parseFloat(await redisClient.get(VAULT_REDIS_KEY) || '0');
-        console.info(`[Vault] Swept $${excess.toFixed(2)} to vault (total locked: $${vault.toFixed(2)})`);
-        io.emit('vault_update', { swept: excess, vault: Math.round(vault * 100) / 100, ceiling: VAULT_BANKROLL_CEILING });
-    } catch (err) {
-        console.error('[Vault] sweep error:', err);
+        return JSON.stringify(error).slice(0, 240);
+    } catch {
+        return String(error).slice(0, 240);
     }
 }
 
-// Load risk guard state from Redis on boot.
-async function loadRiskGuardStates(): Promise<void> {
-    for (const id of RISK_GUARD_STRATEGIES) {
-        try {
-            const raw = await redisClient.get(`risk_guard:state:${id}`);
-            if (!raw) continue;
-            const saved = JSON.parse(raw) as RiskGuardState;
-            const dayStart = computeDayStartMs();
-            if (saved.dayStartMs >= dayStart) {
-                riskGuardState[id] = saved;
-                console.info(`[RiskGuard] Restored state for ${id}: cumPnl=$${saved.cumPnl.toFixed(2)}, peak=$${saved.peakPnl.toFixed(2)}, consec=${saved.consecutiveLosses}`);
-            }
-        } catch { /* ignore corrupt state */ }
+function toTelemetryContext(
+    input: Record<string, unknown> | undefined,
+): Record<string, string | number | boolean | null> {
+    if (!input) {
+        return {};
     }
+    const out: Record<string, string | number | boolean | null> = {};
+    const entries = Object.entries(input).slice(0, 8);
+    for (const [key, value] of entries) {
+        if (value === null) {
+            out[key] = null;
+            continue;
+        }
+        if (typeof value === 'string') {
+            out[key] = value.slice(0, 180);
+            continue;
+        }
+        if (typeof value === 'number') {
+            out[key] = Number.isFinite(value) ? value : null;
+            continue;
+        }
+        if (typeof value === 'boolean') {
+            out[key] = value;
+            continue;
+        }
+        out[key] = String(value).slice(0, 180);
+    }
+    return out;
 }
+
+function recordSilentCatch(
+    scope: string,
+    error: unknown,
+    context?: Record<string, unknown>,
+): void {
+    const now = Date.now();
+    const entry = silentCatchTelemetry[scope] ?? {
+        count: 0,
+        first_seen: now,
+        last_seen: now,
+        last_message: '',
+        last_context: {},
+        last_log_ms: 0,
+    };
+    entry.count += 1;
+    entry.last_seen = now;
+    entry.last_message = toTelemetryErrorMessage(error);
+    entry.last_context = toTelemetryContext(context);
+    silentCatchTelemetry[scope] = entry;
+
+    if (entry.last_log_ms === 0 || now - entry.last_log_ms >= SILENT_CATCH_LOG_COOLDOWN_MS) {
+        entry.last_log_ms = now;
+        logger.warn(
+            `[SilentCatch][${scope}] count=${entry.count} error=${entry.last_message} context=${JSON.stringify(entry.last_context)}`,
+        );
+    }
+
+    io.emit('silent_catch_telemetry_update', {
+        scope,
+        count: entry.count,
+        first_seen: entry.first_seen,
+        last_seen: entry.last_seen,
+        last_message: entry.last_message,
+        last_context: entry.last_context,
+    });
+}
+
+function fireAndForget(
+    scope: string,
+    task: Promise<unknown>,
+    context?: Record<string, unknown>,
+): void {
+    void task.catch((error) => {
+        recordSilentCatch(scope, error, context);
+    });
+}
+
+function silentCatchTelemetryPayload(limit = 80): Record<string, {
+    count: number;
+    first_seen: number;
+    last_seen: number;
+    last_message: string;
+    last_context: Record<string, string | number | boolean | null>;
+}> {
+    return Object.fromEntries(
+        Object.entries(silentCatchTelemetry)
+            .sort((a, b) => b[1].last_seen - a[1].last_seen)
+            .slice(0, limit)
+            .map(([scope, entry]) => [scope, {
+                count: entry.count,
+                first_seen: entry.first_seen,
+                last_seen: entry.last_seen,
+                last_message: entry.last_message,
+                last_context: entry.last_context,
+            }]),
+    );
+}
+
+// ── Risk Guard state ─────────────────────────────────────────────────
+const {
+    processRiskGuard,
+    sweepProfitsToVault,
+    loadRiskGuardStates,
+    resetRiskGuardStates,
+    getRiskGuardState,
+} = createRiskGuardModule({
+    redis: redisClient,
+    strategyStatus,
+    emitStrategyStatusUpdate: (status) => {
+        io.emit('strategy_status_update', status);
+    },
+    emitRiskGuardUpdate: (payload) => {
+        io.emit('risk_guard_update', payload);
+    },
+    emitVaultUpdate: (payload) => {
+        io.emit('vault_update', payload);
+    },
+    recordError: recordSilentCatch,
+    config: {
+        trailingStop: RISK_GUARD_TRAILING_STOP,
+        consecutiveLossLimit: RISK_GUARD_CONSEC_LOSS_LIMIT,
+        consecutiveLossCooldownMs: RISK_GUARD_CONSEC_LOSS_COOLDOWN_MS,
+        postLossCooldownMs: RISK_GUARD_POST_LOSS_COOLDOWN_MS,
+        antiMartingaleAfter: RISK_GUARD_ANTI_MARTINGALE_AFTER,
+        antiMartingaleFactor: RISK_GUARD_ANTI_MARTINGALE_FACTOR,
+        directionLimit: RISK_GUARD_DIRECTION_LIMIT,
+        profitTaperStart: RISK_GUARD_PROFIT_TAPER_START,
+        profitTaperFloor: RISK_GUARD_PROFIT_TAPER_FLOOR,
+        dailyTarget: RISK_GUARD_DAILY_TARGET,
+        dayResetHourUtc: RISK_GUARD_DAY_RESET_HOUR_UTC,
+        strategies: RISK_GUARD_STRATEGIES,
+        vaultEnabled: VAULT_ENABLED,
+        vaultBankrollCeiling: VAULT_BANKROLL_CEILING,
+        vaultRedisKey: VAULT_REDIS_KEY,
+        simLedgerCashKey: SIM_LEDGER_CASH_KEY,
+        simBankrollKey: SIM_BANKROLL_KEY,
+    },
+});
 
 const strategyMetrics: Record<string, StrategyMetric> = Object.fromEntries(
     STRATEGY_IDS.map((id) => [id, { pnl: 0, daily_trades: 0, updated_at: 0 }]),
@@ -435,6 +415,8 @@ const strategyCostDiagnostics: Record<string, StrategyCostDiagnostics> = Object.
 const strategyTradeSamples: Record<string, StrategyTradeSample[]> = Object.fromEntries(
     STRATEGY_IDS.map((id) => [id, []]),
 );
+const REJECTED_SIGNAL_RETENTION = 2_000;
+const rejectedSignalHistory: RejectedSignalRecord[] = [];
 const strategyGovernanceLastActionMs: Record<string, number> = Object.fromEntries(
     STRATEGY_IDS.map((id) => [id, 0]),
 );
@@ -462,29 +444,31 @@ const dataIntegrityState: DataIntegrityState = {
     recent_alerts: [],
     updated_at: 0,
 };
-let ledgerHealthState: LedgerHealthState = {
-    status: 'HEALTHY',
-    issues: [],
-    checked_at: 0,
-    ledger: {
-        cash: DEFAULT_SIM_BANKROLL,
-        reserved: 0,
-        realized_pnl: 0,
-        equity: DEFAULT_SIM_BANKROLL,
-        utilization_pct: 0,
+const ledgerHealthModule = createLedgerHealthModule({
+    redis: redisClient,
+    config: {
+        defaultSimBankroll: DEFAULT_SIM_BANKROLL,
+        simBankrollKey: SIM_BANKROLL_KEY,
+        simLedgerCashKey: SIM_LEDGER_CASH_KEY,
+        simLedgerReservedKey: SIM_LEDGER_RESERVED_KEY,
+        simLedgerRealizedPnlKey: SIM_LEDGER_REALIZED_PNL_KEY,
+        reservedByStrategyPrefix: SIM_LEDGER_RESERVED_BY_STRATEGY_PREFIX,
+        reservedByFamilyPrefix: SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX,
+        reservedByUnderlyingPrefix: SIM_LEDGER_RESERVED_BY_UNDERLYING_PREFIX,
+        strategyConcentrationCapPct: SIM_STRATEGY_CONCENTRATION_CAP_PCT,
+        familyConcentrationCapPct: SIM_FAMILY_CONCENTRATION_CAP_PCT,
+        underlyingConcentrationCapPct: SIM_UNDERLYING_CONCENTRATION_CAP_PCT,
+        globalUtilizationCapPct: SIM_GLOBAL_UTILIZATION_CAP_PCT,
     },
-    caps: {
-        strategy_pct: SIM_STRATEGY_CONCENTRATION_CAP_PCT * 100,
-        family_pct: SIM_FAMILY_CONCENTRATION_CAP_PCT * 100,
-        utilization_pct: SIM_GLOBAL_UTILIZATION_CAP_PCT * 100,
+    emitLedgerHealthUpdate: (payload) => {
+        io.emit('ledger_health_update', payload);
     },
-    strategy_reserved_total: 0,
-    family_reserved_total: 0,
-    reserved_gap_vs_strategy: 0,
-    reserved_gap_vs_family: 0,
-    top_strategy_exposure: [],
-    top_family_exposure: [],
-};
+    touchLedgerRuntime: (health, detail) => {
+        touchRuntimeModule('PNL_LEDGER', health, detail);
+    },
+    recordError: recordSilentCatch,
+});
+let ledgerHealthState: LedgerHealthState = ledgerHealthModule.getLedgerHealthState();
 const featureRegistryRows: FeatureSnapshot[] = [];
 const featureRegistryIndexById = new Map<string, number>();
 const featureRegistryCountsByStrategy: Record<string, { rows: number; labeled_rows: number; unlabeled_rows: number }> = {};
@@ -552,6 +536,49 @@ let modelDriftState: ModelDriftState = {
     by_strategy: {},
     updated_at: 0,
 };
+type ModelGateCalibrationState = {
+    enabled: boolean;
+    advisory_only: boolean;
+    baseline_gate: number;
+    active_gate: number;
+    recommended_gate: number;
+    lookback_ms: number;
+    min_samples: number;
+    step_size: number;
+    max_drift: number;
+    sample_count: number;
+    accepted_samples: number;
+    rejected_samples: number;
+    expected_pnl_baseline: number;
+    expected_pnl_recommended: number;
+    delta_expected_pnl: number;
+    profitable_rejected_signals: number;
+    loss_avoided_signals: number;
+    updated_at: number;
+    reason: string;
+};
+const MODEL_GATE_CALIBRATION_KEY = 'model_gate:calibration_state';
+let modelGateCalibrationState: ModelGateCalibrationState = {
+    enabled: MODEL_PROBABILITY_GATE_TUNER_ENABLED,
+    advisory_only: MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY,
+    baseline_gate: MODEL_PROBABILITY_GATE_MIN_PROB,
+    active_gate: MODEL_PROBABILITY_GATE_MIN_PROB,
+    recommended_gate: MODEL_PROBABILITY_GATE_MIN_PROB,
+    lookback_ms: MODEL_PROBABILITY_GATE_TUNER_LOOKBACK_MS,
+    min_samples: MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES,
+    step_size: MODEL_PROBABILITY_GATE_TUNER_STEP,
+    max_drift: MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT,
+    sample_count: 0,
+    accepted_samples: 0,
+    rejected_samples: 0,
+    expected_pnl_baseline: 0,
+    expected_pnl_recommended: 0,
+    delta_expected_pnl: 0,
+    profitable_rejected_signals: 0,
+    loss_avoided_signals: 0,
+    updated_at: 0,
+    reason: 'not yet calibrated',
+};
 const modelPredictionByRowId = new Map<string, ModelPredictionTrace>();
 let modelTrainerInFlight = false;
 let modelTrainerLastLabeledRows = 0;
@@ -578,10 +605,18 @@ const agentManager = new AgentManager(contextBuilder);
 const decisionGate = new DecisionGate();
 const riskGuard = new RiskGuard();
 const executor = new HyperliquidExecutor();
-const polymarketPreflight = new PolymarketPreflightService();
+const setRedisDedupeKey = redisClient.set.bind(redisClient) as (
+    key: string,
+    value: string,
+    options?: { NX?: boolean; PX?: number },
+) => Promise<unknown>;
+const polymarketPreflight = new PolymarketPreflightService({
+    set: setRedisDedupeKey,
+});
 const settlementService = new PolymarketSettlementService(redisClient);
 const strategyTradeRecorder = new StrategyTradeRecorder();
 const featureRegistryRecorder = new FeatureRegistryRecorder();
+const rejectedSignalRecorder = new RejectedSignalRecorder();
 
 function isControlPlaneTokenConfigured(): boolean {
     return CONTROL_PLANE_TOKEN.length > 0;
@@ -638,40 +673,6 @@ function enforceSocketControlAuth(socket: { emit: (event: string, payload: Recor
     });
     return false;
 }
-
-type SimulationLedgerSnapshot = {
-    cash: number;
-    reserved: number;
-    realized_pnl: number;
-    equity: number;
-    utilization_pct: number;
-};
-
-type LedgerHealthStatus = 'HEALTHY' | 'WARN' | 'CRITICAL';
-
-type LedgerConcentrationEntry = {
-    id: string;
-    reserved: number;
-    share_pct: number;
-};
-
-type LedgerHealthState = {
-    status: LedgerHealthStatus;
-    issues: string[];
-    checked_at: number;
-    ledger: SimulationLedgerSnapshot;
-    caps: {
-        strategy_pct: number;
-        family_pct: number;
-        utilization_pct: number;
-    };
-    strategy_reserved_total: number;
-    family_reserved_total: number;
-    reserved_gap_vs_strategy: number;
-    reserved_gap_vs_family: number;
-    top_strategy_exposure: LedgerConcentrationEntry[];
-    top_family_exposure: LedgerConcentrationEntry[];
-};
 
 function getRecentStrategyScans(now = Date.now()): StrategyScanState[] {
     pruneIntelligenceState(now);
@@ -1240,6 +1241,28 @@ function ensureExecutionId(payload: unknown): string {
     return id;
 }
 
+function pushStrategyExecutionHistory(strategyId: string, payload: Record<string, unknown>): void {
+    const key = strategyId.trim().toUpperCase();
+    if (!key) {
+        return;
+    }
+    const existing = strategyExecutionHistory.get(key) || [];
+    const normalized = {
+        ...payload,
+        strategy: key,
+        timestamp: asNumber(payload.timestamp) ?? Date.now(),
+    };
+    existing.push(normalized);
+    if (existing.length > STRATEGY_EXECUTION_HISTORY_LIMIT) {
+        existing.splice(0, existing.length - STRATEGY_EXECUTION_HISTORY_LIMIT);
+    }
+    strategyExecutionHistory.set(key, existing);
+}
+
+function clearStrategyExecutionHistory(): void {
+    strategyExecutionHistory.clear();
+}
+
 function pruneExecutionTraces(now = Date.now()): void {
     for (const [id, trace] of executionTraces.entries()) {
         if (now - trace.updated_at > EXECUTION_TRACE_TTL_MS) {
@@ -1501,8 +1524,8 @@ async function getRiskConfig(): Promise<RiskConfig> {
             if (normalized) {
                 return normalized;
             }
-        } catch {
-            // ignore malformed payload and fall back to default
+        } catch (error) {
+            recordSilentCatch('RiskConfig.Parse', error, { key: 'system:risk_config' });
         }
     }
 
@@ -1620,7 +1643,8 @@ async function isLiveReady(): Promise<LiveReadinessResult> {
 
     try {
         await redisClient.ping();
-    } catch {
+    } catch (error) {
+        recordSilentCatch('LiveReadiness.RedisPing', error, { op: 'PING' });
         failures.push('Redis connection failed');
     }
 
@@ -1634,6 +1658,11 @@ async function isLiveReady(): Promise<LiveReadinessResult> {
 
     if (!MODEL_PROBABILITY_GATE_ENFORCE_LIVE) {
         failures.push('MODEL_PROBABILITY_GATE_ENFORCE_LIVE is disabled');
+    }
+
+    const settlementReadiness = settlementService.getReadinessSnapshot();
+    for (const issue of settlementReadiness.failures) {
+        failures.push(`Settlement: ${issue}`);
     }
 
     return { ready: failures.length === 0, failures };
@@ -1653,218 +1682,20 @@ function normalizeResetBankroll(value: unknown): number | null {
 }
 
 async function getSimulationLedgerSnapshot(): Promise<SimulationLedgerSnapshot> {
-    const fallbackBankroll = asNumber(await redisClient.get(SIM_BANKROLL_KEY)) ?? DEFAULT_SIM_BANKROLL;
-    const cashRaw = asNumber(await redisClient.get(SIM_LEDGER_CASH_KEY));
-    const reservedRaw = asNumber(await redisClient.get(SIM_LEDGER_RESERVED_KEY));
-    const realizedRaw = asNumber(await redisClient.get(SIM_LEDGER_REALIZED_PNL_KEY));
-
-    const cash = cashRaw ?? fallbackBankroll;
-    const reserved = reservedRaw ?? 0;
-    const realizedPnl = realizedRaw ?? 0;
-    const equity = cash + reserved;
-    const utilizationPct = equity > 0 ? (reserved / equity) * 100 : 0;
-
-    if (cashRaw === null) {
-        await redisClient.set(SIM_LEDGER_CASH_KEY, cash.toFixed(8));
-    }
-    if (reservedRaw === null) {
-        await redisClient.set(SIM_LEDGER_RESERVED_KEY, reserved.toFixed(8));
-    }
-    if (realizedRaw === null) {
-        await redisClient.set(SIM_LEDGER_REALIZED_PNL_KEY, realizedPnl.toFixed(8));
-    }
-    await redisClient.set(SIM_BANKROLL_KEY, equity.toFixed(8));
-
-    return {
-        cash,
-        reserved,
-        realized_pnl: realizedPnl,
-        equity,
-        utilization_pct: utilizationPct,
-    };
+    return ledgerHealthModule.getSimulationLedgerSnapshot();
 }
 
 async function reconcileSimulationLedgerWithStrategyMetrics(): Promise<void> {
-    const ledger = await getSimulationLedgerSnapshot();
-    const cumulativePnl = Object.values(strategyMetrics)
-        .reduce((sum, metric) => sum + (asNumber(metric?.pnl) ?? 0), 0);
-
-    const ledgerLooksFresh = Math.abs(ledger.realized_pnl) < 1e-6
-        && Math.abs(ledger.reserved) < 1e-6
-        && Math.abs(ledger.cash - DEFAULT_SIM_BANKROLL) < 1e-6;
-    if (!ledgerLooksFresh || Math.abs(cumulativePnl) < 0.01) {
-        return;
-    }
-
-    const reconciledCash = Math.max(0, DEFAULT_SIM_BANKROLL + cumulativePnl);
-    const reconciledEquity = reconciledCash + ledger.reserved;
-    await redisClient.set(SIM_LEDGER_CASH_KEY, reconciledCash.toFixed(8));
-    await redisClient.set(SIM_LEDGER_REALIZED_PNL_KEY, cumulativePnl.toFixed(8));
-    await redisClient.set(SIM_BANKROLL_KEY, reconciledEquity.toFixed(8));
-}
-
-async function scanReservedMap(prefix: string): Promise<Record<string, number>> {
-    const entries: Record<string, number> = {};
-    const pattern = `${prefix}*`;
-    try {
-        for await (const key of redisClient.scanIterator({ MATCH: pattern, COUNT: 200 })) {
-            if (typeof key !== 'string' || !key.startsWith(prefix)) {
-                continue;
-            }
-            const id = key.slice(prefix.length).trim().toUpperCase();
-            if (!id) {
-                continue;
-            }
-            const value = asNumber(await redisClient.get(key)) ?? 0;
-            if (!Number.isFinite(value) || Math.abs(value) < 1e-9) {
-                continue;
-            }
-            entries[id] = Math.max(0, value);
-        }
-    } catch {
-        // best-effort snapshot
-    }
-    return entries;
+    await ledgerHealthModule.reconcileSimulationLedgerWithStrategyMetrics(strategyMetrics);
 }
 
 async function clearReservedMaps(): Promise<void> {
-    const patterns = [
-        `${SIM_LEDGER_RESERVED_BY_STRATEGY_PREFIX}*`,
-        `${SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX}*`,
-    ];
-    for (const pattern of patterns) {
-        const deleteBatch: string[] = [];
-        try {
-            for await (const key of redisClient.scanIterator({ MATCH: pattern, COUNT: 200 })) {
-                if (typeof key === 'string') {
-                    deleteBatch.push(key);
-                }
-                if (deleteBatch.length >= 100) {
-                    await redisClient.del(deleteBatch);
-                    deleteBatch.length = 0;
-                }
-            }
-            if (deleteBatch.length > 0) {
-                await redisClient.del(deleteBatch);
-            }
-        } catch {
-            // best-effort cleanup
-        }
-    }
-}
-
-function rankConcentration(entries: Record<string, number>, equity: number, limit = 8): LedgerConcentrationEntry[] {
-    const denominator = equity > 0 ? equity : 1;
-    return Object.entries(entries)
-        .map(([id, reserved]) => ({
-            id,
-            reserved,
-            share_pct: (reserved / denominator) * 100,
-        }))
-        .sort((a, b) => b.reserved - a.reserved)
-        .slice(0, limit)
-        .map((entry) => ({
-            ...entry,
-            reserved: Math.round(entry.reserved * 100) / 100,
-            share_pct: Math.round(entry.share_pct * 10) / 10,
-        }));
-}
-
-async function evaluateLedgerHealth(): Promise<LedgerHealthState> {
-    const ledger = await getSimulationLedgerSnapshot();
-    const strategyReserved = await scanReservedMap(SIM_LEDGER_RESERVED_BY_STRATEGY_PREFIX);
-    const familyReserved = await scanReservedMap(SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX);
-    const strategyTotal = Object.values(strategyReserved).reduce((sum, value) => sum + value, 0);
-    const familyTotal = Object.values(familyReserved).reduce((sum, value) => sum + value, 0);
-    const gapVsStrategy = Math.abs(ledger.reserved - strategyTotal);
-    const gapVsFamily = Math.abs(ledger.reserved - familyTotal);
-    const issues: string[] = [];
-    const equity = Math.max(0, ledger.equity);
-
-    if (ledger.cash < -0.01) {
-        issues.push(`cash is negative (${ledger.cash.toFixed(2)})`);
-    }
-    if (ledger.reserved < -0.01) {
-        issues.push(`reserved is negative (${ledger.reserved.toFixed(2)})`);
-    }
-    if (equity < 0.01 && Math.abs(ledger.realized_pnl) > 0.01) {
-        issues.push('equity nearly zero with non-trivial realized pnl');
-    }
-
-    const warnGapAbs = Math.max(1, equity * 0.005);
-    const criticalGapAbs = Math.max(5, equity * 0.02);
-    if (gapVsStrategy > criticalGapAbs) {
-        issues.push(`strategy reserved mismatch ${gapVsStrategy.toFixed(2)} exceeds critical ${criticalGapAbs.toFixed(2)}`);
-    } else if (gapVsStrategy > warnGapAbs) {
-        issues.push(`strategy reserved mismatch ${gapVsStrategy.toFixed(2)} exceeds warn ${warnGapAbs.toFixed(2)}`);
-    }
-    if (gapVsFamily > criticalGapAbs) {
-        issues.push(`family reserved mismatch ${gapVsFamily.toFixed(2)} exceeds critical ${criticalGapAbs.toFixed(2)}`);
-    } else if (gapVsFamily > warnGapAbs) {
-        issues.push(`family reserved mismatch ${gapVsFamily.toFixed(2)} exceeds warn ${warnGapAbs.toFixed(2)}`);
-    }
-
-    const strategyCapPct = SIM_STRATEGY_CONCENTRATION_CAP_PCT * 100;
-    const familyCapPct = SIM_FAMILY_CONCENTRATION_CAP_PCT * 100;
-    const utilizationCapPct = SIM_GLOBAL_UTILIZATION_CAP_PCT * 100;
-    const topStrategies = rankConcentration(strategyReserved, equity);
-    const topFamilies = rankConcentration(familyReserved, equity);
-    const maxStrategyShare = topStrategies[0]?.share_pct || 0;
-    const maxFamilyShare = topFamilies[0]?.share_pct || 0;
-    if (maxStrategyShare > strategyCapPct + 0.5) {
-        issues.push(`strategy concentration ${maxStrategyShare.toFixed(1)}% above cap ${strategyCapPct.toFixed(1)}%`);
-    }
-    if (maxFamilyShare > familyCapPct + 0.5) {
-        issues.push(`family concentration ${maxFamilyShare.toFixed(1)}% above cap ${familyCapPct.toFixed(1)}%`);
-    }
-    if (ledger.utilization_pct > utilizationCapPct + 0.5) {
-        issues.push(`utilization ${ledger.utilization_pct.toFixed(1)}% above cap ${utilizationCapPct.toFixed(1)}%`);
-    }
-
-    const hasCritical = issues.some((issue) => issue.includes('critical') || issue.includes('negative'));
-    const status: LedgerHealthStatus = hasCritical
-        ? 'CRITICAL'
-        : issues.length > 0
-            ? 'WARN'
-            : 'HEALTHY';
-
-    return {
-        status,
-        issues: issues.slice(0, 12),
-        checked_at: Date.now(),
-        ledger: {
-            cash: Math.round(ledger.cash * 100) / 100,
-            reserved: Math.round(ledger.reserved * 100) / 100,
-            realized_pnl: Math.round(ledger.realized_pnl * 100) / 100,
-            equity: Math.round(ledger.equity * 100) / 100,
-            utilization_pct: Math.round(ledger.utilization_pct * 10) / 10,
-        },
-        caps: {
-            strategy_pct: Math.round(strategyCapPct * 10) / 10,
-            family_pct: Math.round(familyCapPct * 10) / 10,
-            utilization_pct: Math.round(utilizationCapPct * 10) / 10,
-        },
-        strategy_reserved_total: Math.round(strategyTotal * 100) / 100,
-        family_reserved_total: Math.round(familyTotal * 100) / 100,
-        reserved_gap_vs_strategy: Math.round(gapVsStrategy * 100) / 100,
-        reserved_gap_vs_family: Math.round(gapVsFamily * 100) / 100,
-        top_strategy_exposure: topStrategies,
-        top_family_exposure: topFamilies,
-    };
+    await ledgerHealthModule.clearReservedMaps();
 }
 
 async function refreshLedgerHealth(): Promise<void> {
-    ledgerHealthState = await evaluateLedgerHealth();
-    io.emit('ledger_health_update', ledgerHealthState);
-    touchRuntimeModule(
-        'PNL_LEDGER',
-        ledgerHealthState.status === 'CRITICAL'
-            ? 'DEGRADED'
-            : 'ONLINE',
-        ledgerHealthState.status === 'HEALTHY'
-            ? 'ledger healthy'
-            : `ledger ${ledgerHealthState.status.toLowerCase()}: ${ledgerHealthState.issues[0] || 'issue detected'}`,
-    );
+    await ledgerHealthModule.refreshLedgerHealth();
+    ledgerHealthState = ledgerHealthModule.getLedgerHealthState();
 }
 
 function clearStrategyMetrics(): void {
@@ -2150,6 +1981,47 @@ function updateDataIntegrityFromScan(scan: StrategyScanState): DataIntegrityAler
     return alert;
 }
 
+function recordScanSchemaDrift(strategy: string, marketKey: string, reason: string, issues: string[]): DataIntegrityAlert | null {
+    const normalizedStrategy = strategy.trim().toUpperCase() || 'UNKNOWN';
+    const normalizedMarket = marketKey.trim() || `${normalizedStrategy.toLowerCase()}:unknown`;
+    const now = Date.now();
+    const strategyState = ensureStrategyDataIntegrityEntry(normalizedStrategy);
+
+    strategyState.total_scans += 1;
+    strategyState.hold_scans += 1;
+    strategyState.other += 1;
+    strategyState.consecutive_holds += 1;
+    strategyState.last_category = 'other';
+    strategyState.last_reason = reason;
+    strategyState.updated_at = now;
+
+    dataIntegrityState.totals.total_scans += 1;
+    dataIntegrityState.totals.hold_scans += 1;
+    dataIntegrityState.totals.other += 1;
+    dataIntegrityState.updated_at = now;
+
+    if (now - strategyState.last_alert_at < DATA_INTEGRITY_ALERT_COOLDOWN_MS) {
+        return null;
+    }
+
+    strategyState.last_alert_at = now;
+    const alert: DataIntegrityAlert = {
+        id: `${normalizedStrategy}:${normalizedMarket}:schema:${now}`,
+        strategy: normalizedStrategy,
+        market_key: normalizedMarket,
+        category: 'other',
+        severity: 'CRITICAL',
+        reason: `${reason}${issues.length > 1 ? ` | ${issues.slice(1, 3).join(' | ')}` : ''}`,
+        consecutive_holds: strategyState.consecutive_holds,
+        timestamp: now,
+    };
+    dataIntegrityState.recent_alerts = [
+        alert,
+        ...dataIntegrityState.recent_alerts,
+    ].slice(0, DATA_INTEGRITY_ALERT_RING_LIMIT);
+    return alert;
+}
+
 function updateStrategyQuality(scan: StrategyScanState): void {
     const state = ensureStrategyQualityEntry(scan.strategy);
     state.total_scans += 1;
@@ -2271,6 +2143,39 @@ function pushTradeSample(sample: StrategyTradeSample): void {
     bucket.push(sample);
     if (bucket.length > STRATEGY_SAMPLE_RETENTION) {
         bucket.splice(0, bucket.length - STRATEGY_SAMPLE_RETENTION);
+    }
+}
+
+function recordRejectedSignal(record: RejectedSignalRecord): void {
+    rejectedSignalHistory.push(record);
+    if (rejectedSignalHistory.length > REJECTED_SIGNAL_RETENTION) {
+        rejectedSignalHistory.splice(0, rejectedSignalHistory.length - REJECTED_SIGNAL_RETENTION);
+    }
+    rejectedSignalRecorder.record(record);
+    io.emit('rejected_signal', record);
+}
+
+function normalizedStrategyFilter(input: unknown): string | null {
+    const parsed = asString(input);
+    return parsed ? parsed.toUpperCase() : null;
+}
+
+function rejectedSignalSnapshot(limit = 200, strategy?: string | null): RejectedSignalRecord[] {
+    const capped = Math.max(1, Math.min(REJECTED_SIGNAL_RETENTION, Math.floor(limit)));
+    const normalized = normalizedStrategyFilter(strategy);
+    if (!normalized) {
+        return rejectedSignalHistory.slice(-capped).reverse();
+    }
+    const filtered = rejectedSignalHistory.filter((entry) => normalizedStrategyFilter(entry.strategy) === normalized);
+    return filtered.slice(-capped).reverse();
+}
+
+async function bootstrapRejectedSignalHistory(): Promise<void> {
+    try {
+        const persisted = await rejectedSignalRecorder.readRecent(REJECTED_SIGNAL_RETENTION);
+        rejectedSignalHistory.splice(0, rejectedSignalHistory.length, ...persisted);
+    } catch (error) {
+        recordSilentCatch('RejectedSignal.Bootstrap', error, { path: rejectedSignalRecorder.getPath() });
     }
 }
 
@@ -2884,7 +2789,9 @@ async function refreshMetaController(): Promise<void> {
             signal_count: metaControllerState.signal_count,
             updated_at: metaControllerState.updated_at,
         }));
-    } catch { /* best-effort */ }
+    } catch (error) {
+        recordSilentCatch('MetaController.PersistRegime', error, { key: 'meta_controller:regime' });
+    }
     touchRuntimeModule(
         'REGIME_ENGINE',
         'ONLINE',
@@ -2908,7 +2815,7 @@ async function runMetaControllerRefreshSafely(): Promise<void> {
     try {
         await refreshMetaController();
     } catch (error) {
-        console.error('[MetaController] refresh error:', error);
+        recordSilentCatch('MetaController.Refresh', error);
         touchRuntimeModule('REGIME_ENGINE', 'DEGRADED', `meta controller error: ${String(error)}`);
         touchRuntimeModule('ENSEMBLE_ROUTER', 'DEGRADED', `meta controller error: ${String(error)}`);
     }
@@ -2948,7 +2855,8 @@ async function readJsonFileSafe(filePath: string): Promise<Record<string, unknow
         const raw = await fs.readFile(filePath, 'utf8');
         const parsed = JSON.parse(raw);
         return asRecord(parsed);
-    } catch {
+    } catch (error) {
+        recordSilentCatch('MLArtifact.ReadJsonSafe', error, { file_path: filePath });
         return null;
     }
 }
@@ -3263,6 +3171,228 @@ function modelDriftPayload(): ModelDriftState {
     };
 }
 
+function clampProbabilityGate(value: number): number {
+    if (!Number.isFinite(value)) {
+        return MODEL_PROBABILITY_GATE_MIN_PROB;
+    }
+    return Math.min(0.95, Math.max(0.50, value));
+}
+
+function activeModelProbabilityGate(): number {
+    return clampProbabilityGate(modelGateCalibrationState.active_gate);
+}
+
+function modelGateCalibrationPayload(): ModelGateCalibrationState {
+    return {
+        ...modelGateCalibrationState,
+        baseline_gate: Math.round(modelGateCalibrationState.baseline_gate * 1000) / 1000,
+        active_gate: Math.round(modelGateCalibrationState.active_gate * 1000) / 1000,
+        recommended_gate: Math.round(modelGateCalibrationState.recommended_gate * 1000) / 1000,
+        expected_pnl_baseline: Math.round(modelGateCalibrationState.expected_pnl_baseline * 100) / 100,
+        expected_pnl_recommended: Math.round(modelGateCalibrationState.expected_pnl_recommended * 100) / 100,
+        delta_expected_pnl: Math.round(modelGateCalibrationState.delta_expected_pnl * 100) / 100,
+    };
+}
+
+function modelGateProbabilityFromTrace(executionId: string): number | null {
+    const trace = executionTraces.get(executionId);
+    if (!trace || trace.events.length === 0) {
+        return null;
+    }
+    for (let index = trace.events.length - 1; index >= 0; index -= 1) {
+        const event = trace.events[index];
+        if (!event || event.type !== 'MODEL_GATE') {
+            continue;
+        }
+        const probability = asNumber(asRecord(event.payload)?.probability);
+        if (probability !== null && Number.isFinite(probability)) {
+            return clampProbabilityGate(probability);
+        }
+    }
+    return null;
+}
+
+function collectModelGateCalibrationSamples(now = Date.now()): ModelGateCalibrationSample[] {
+    return buildModelGateCalibrationSamples({
+        now,
+        lookbackMs: MODEL_PROBABILITY_GATE_TUNER_LOOKBACK_MS,
+        counterfactualWindowMs: MODEL_PROBABILITY_GATE_COUNTERFACTUAL_WINDOW_MS,
+        strategyIds: STRATEGY_IDS,
+        strategyTradeSamples,
+        featureRegistryRows,
+        rejectedSignalHistory,
+        probabilityForExecutionId: modelGateProbabilityFromTrace,
+        clampProbability: clampProbabilityGate,
+        fallbackNotionalUsd: 100,
+    });
+}
+
+function scoreModelGate(samples: ModelGateCalibrationSample[], gate: number): number {
+    let sum = 0;
+    for (const sample of samples) {
+        if (sample.probability >= gate) {
+            sum += sample.pnl;
+        }
+    }
+    return sum;
+}
+
+async function loadModelGateCalibrationState(): Promise<void> {
+    try {
+        const raw = await redisClient.get(MODEL_GATE_CALIBRATION_KEY);
+        if (!raw) {
+            return;
+        }
+        const parsed = asRecord(JSON.parse(raw));
+        if (!parsed) {
+            return;
+        }
+        const baselineGate = MODEL_PROBABILITY_GATE_MIN_PROB;
+        const drift = MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT;
+        const minGate = clampProbabilityGate(baselineGate - drift);
+        const maxGate = clampProbabilityGate(baselineGate + drift);
+        const restoredActive = clampProbabilityGate(asNumber(parsed.active_gate) ?? baselineGate);
+        const restoredRecommended = clampProbabilityGate(asNumber(parsed.recommended_gate) ?? restoredActive);
+        modelGateCalibrationState = {
+            ...modelGateCalibrationState,
+            baseline_gate: baselineGate,
+            active_gate: Math.min(maxGate, Math.max(minGate, restoredActive)),
+            recommended_gate: Math.min(maxGate, Math.max(minGate, restoredRecommended)),
+            updated_at: asNumber(parsed.updated_at) ?? Date.now(),
+            reason: 'restored calibration state from redis',
+        };
+    } catch (error) {
+        recordSilentCatch('ModelGateCalibration.Load', error, { key: MODEL_GATE_CALIBRATION_KEY });
+    }
+}
+
+async function runModelProbabilityGateCalibration(now = Date.now()): Promise<void> {
+    const baselineGate = MODEL_PROBABILITY_GATE_MIN_PROB;
+    const stepSize = MODEL_PROBABILITY_GATE_TUNER_STEP;
+    const maxDrift = MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT;
+    const minGate = clampProbabilityGate(baselineGate - maxDrift);
+    const maxGate = clampProbabilityGate(baselineGate + maxDrift);
+    if (!MODEL_PROBABILITY_GATE_TUNER_ENABLED) {
+        modelGateCalibrationState = {
+            ...modelGateCalibrationState,
+            enabled: false,
+            advisory_only: MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY,
+            baseline_gate: baselineGate,
+            active_gate: baselineGate,
+            recommended_gate: baselineGate,
+            lookback_ms: MODEL_PROBABILITY_GATE_TUNER_LOOKBACK_MS,
+            min_samples: MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES,
+            step_size: stepSize,
+            max_drift: maxDrift,
+            sample_count: 0,
+            accepted_samples: 0,
+            rejected_samples: 0,
+            expected_pnl_baseline: 0,
+            expected_pnl_recommended: 0,
+            delta_expected_pnl: 0,
+            profitable_rejected_signals: 0,
+            loss_avoided_signals: 0,
+            updated_at: now,
+            reason: 'tuner disabled by env',
+        };
+        io.emit('model_gate_calibration_update', modelGateCalibrationPayload());
+        return;
+    }
+
+    const samples = collectModelGateCalibrationSamples(now);
+    const acceptedSamples = samples.filter((sample) => sample.accepted).length;
+    const rejectedSamples = samples.length - acceptedSamples;
+    if (samples.length < MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES) {
+        modelGateCalibrationState = {
+            ...modelGateCalibrationState,
+            enabled: true,
+            advisory_only: MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY,
+            baseline_gate: baselineGate,
+            active_gate: MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY
+                ? baselineGate
+                : Math.min(maxGate, Math.max(minGate, modelGateCalibrationState.active_gate)),
+            recommended_gate: modelGateCalibrationState.recommended_gate,
+            lookback_ms: MODEL_PROBABILITY_GATE_TUNER_LOOKBACK_MS,
+            min_samples: MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES,
+            step_size: stepSize,
+            max_drift: maxDrift,
+            sample_count: samples.length,
+            accepted_samples: acceptedSamples,
+            rejected_samples: rejectedSamples,
+            expected_pnl_baseline: 0,
+            expected_pnl_recommended: 0,
+            delta_expected_pnl: 0,
+            profitable_rejected_signals: samples.filter((sample) => !sample.accepted && sample.pnl > 0).length,
+            loss_avoided_signals: samples.filter((sample) => !sample.accepted && sample.pnl <= 0).length,
+            updated_at: now,
+            reason: `insufficient labeled samples (${samples.length}/${MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES})`,
+        };
+        io.emit('model_gate_calibration_update', modelGateCalibrationPayload());
+        return;
+    }
+
+    const baselineScore = scoreModelGate(samples, baselineGate);
+    let bestGate = baselineGate;
+    let bestScore = baselineScore;
+    for (let gate = minGate; gate <= maxGate + 1e-9; gate += stepSize) {
+        const candidateGate = clampProbabilityGate(gate);
+        const candidateScore = scoreModelGate(samples, candidateGate);
+        const currentDelta = Math.abs(bestGate - modelGateCalibrationState.active_gate);
+        const candidateDelta = Math.abs(candidateGate - modelGateCalibrationState.active_gate);
+        if (candidateScore > bestScore + 1e-9 || (Math.abs(candidateScore - bestScore) <= 1e-9 && candidateDelta < currentDelta)) {
+            bestGate = candidateGate;
+            bestScore = candidateScore;
+        }
+    }
+
+    const boundedRecommended = Math.min(maxGate, Math.max(minGate, bestGate));
+    const previousActive = Math.min(maxGate, Math.max(minGate, modelGateCalibrationState.active_gate));
+    const nextActive = MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY
+        ? baselineGate
+        : (() => {
+            const delta = boundedRecommended - previousActive;
+            if (Math.abs(delta) <= stepSize) {
+                return boundedRecommended;
+            }
+            return clampProbabilityGate(previousActive + Math.sign(delta) * stepSize);
+        })();
+
+    modelGateCalibrationState = {
+        ...modelGateCalibrationState,
+        enabled: true,
+        advisory_only: MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY,
+        baseline_gate: baselineGate,
+        active_gate: Math.min(maxGate, Math.max(minGate, nextActive)),
+        recommended_gate: boundedRecommended,
+        lookback_ms: MODEL_PROBABILITY_GATE_TUNER_LOOKBACK_MS,
+        min_samples: MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES,
+        step_size: stepSize,
+        max_drift: maxDrift,
+        sample_count: samples.length,
+        accepted_samples: acceptedSamples,
+        rejected_samples: rejectedSamples,
+        expected_pnl_baseline: baselineScore,
+        expected_pnl_recommended: bestScore,
+        delta_expected_pnl: bestScore - baselineScore,
+        profitable_rejected_signals: samples.filter((sample) => !sample.accepted && sample.pnl > 0).length,
+        loss_avoided_signals: samples.filter((sample) => !sample.accepted && sample.pnl <= 0).length,
+        updated_at: now,
+        reason: MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY
+            ? `recommended ${boundedRecommended.toFixed(3)} from ${samples.length} samples (advisory)`
+            : `active ${nextActive.toFixed(3)} toward ${boundedRecommended.toFixed(3)} from ${samples.length} samples`,
+    };
+
+    touchRuntimeModule(
+        'UNCERTAINTY_GATE',
+        'ONLINE',
+        `model gate ${modelGateCalibrationState.active_gate.toFixed(3)} rec ${modelGateCalibrationState.recommended_gate.toFixed(3)} samples ${samples.length}`,
+    );
+    io.emit('model_gate_calibration_update', modelGateCalibrationPayload());
+    await redisClient.set(MODEL_GATE_CALIBRATION_KEY, JSON.stringify(modelGateCalibrationState)).catch((error) => {
+        recordSilentCatch('ModelGateCalibration.Persist', error, { key: MODEL_GATE_CALIBRATION_KEY });
+    });
+}
+
 function trimModelInferenceLatestIfNeeded(): void {
     if (modelInferenceState.tracked_rows <= MODEL_INFERENCE_TRIM_TRIGGER_ROWS) {
         return;
@@ -3332,7 +3462,7 @@ async function refreshSignalModelArtifact(): Promise<void> {
 function updateModelInferenceFromScan(scan: StrategyScanState, rowId: string | null = null): ModelInferenceEntry {
     const key = buildStrategyMarketKey(scan.strategy, scan.market_key);
     const features = buildScanFeatureMap(scan);
-    const probabilityGate = MODEL_PROBABILITY_GATE_MIN_PROB;
+    const probabilityGate = activeModelProbabilityGate();
     const fallback: ModelInferenceEntry = {
         strategy: scan.strategy,
         market_key: scan.market_key,
@@ -3565,6 +3695,7 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
 } {
     const strategy = extractExecutionStrategy(payload);
     const marketKey = extractExecutionMarketKey(payload);
+    const probabilityGate = activeModelProbabilityGate();
     const enforceMode = (tradingMode === 'PAPER' && MODEL_PROBABILITY_GATE_ENFORCE_PAPER)
         || (tradingMode === 'LIVE' && MODEL_PROBABILITY_GATE_ENFORCE_LIVE);
     if (!MODEL_PROBABILITY_GATE_ENABLED || !enforceMode) {
@@ -3575,7 +3706,7 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
             strategy,
             market_key: marketKey,
             probability: null,
-            gate: MODEL_PROBABILITY_GATE_MIN_PROB,
+            gate: probabilityGate,
             model_loaded: Boolean(signalModelArtifact),
         };
     }
@@ -3587,7 +3718,7 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
             strategy,
             market_key: marketKey,
             probability: null,
-            gate: MODEL_PROBABILITY_GATE_MIN_PROB,
+            gate: probabilityGate,
             model_loaded: Boolean(signalModelArtifact),
         };
     }
@@ -3599,7 +3730,7 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
             strategy,
             market_key: marketKey,
             probability: null,
-            gate: MODEL_PROBABILITY_GATE_MIN_PROB,
+            gate: probabilityGate,
             model_loaded: Boolean(signalModelArtifact),
         };
     }
@@ -3620,7 +3751,7 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
             strategy,
             market_key: marketKey,
             probability: null,
-            gate: MODEL_PROBABILITY_GATE_MIN_PROB,
+            gate: probabilityGate,
             model_loaded: Boolean(signalModelArtifact),
         };
     }
@@ -3633,7 +3764,7 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
             strategy,
             market_key: fallback.market_key,
             probability: fallback.probability_positive,
-            gate: fallback.probability_gate,
+            gate: probabilityGate,
             model_loaded: fallback.model_loaded,
         };
     }
@@ -3645,30 +3776,30 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
             strategy,
             market_key: fallback.market_key,
             probability: null,
-            gate: fallback.probability_gate,
+            gate: probabilityGate,
             model_loaded: fallback.model_loaded,
         };
     }
-    if (fallback.probability_positive < fallback.probability_gate) {
+    if (fallback.probability_positive < probabilityGate) {
         return {
             ok: false,
             blocked: true,
-            reason: `probability ${fallback.probability_positive.toFixed(3)} below gate ${fallback.probability_gate.toFixed(3)}`,
+            reason: `probability ${fallback.probability_positive.toFixed(3)} below gate ${probabilityGate.toFixed(3)}`,
             strategy,
             market_key: fallback.market_key,
             probability: fallback.probability_positive,
-            gate: fallback.probability_gate,
+            gate: probabilityGate,
             model_loaded: fallback.model_loaded,
         };
     }
     return {
         ok: true,
         blocked: false,
-        reason: `probability ${fallback.probability_positive.toFixed(3)} >= gate ${fallback.probability_gate.toFixed(3)}`,
+        reason: `probability ${fallback.probability_positive.toFixed(3)} >= gate ${probabilityGate.toFixed(3)}`,
         strategy,
         market_key: fallback.market_key,
         probability: fallback.probability_positive,
-        gate: fallback.probability_gate,
+        gate: probabilityGate,
         model_loaded: fallback.model_loaded,
     };
 }
@@ -3895,7 +4026,12 @@ async function runInProcessModelTraining(force = false): Promise<void> {
 async function refreshMlPipelineStatus(): Promise<void> {
     await refreshSignalModelArtifact();
     const now = Date.now();
-    const featureLogRows = await featureRegistryRecorder.countRows().catch(() => 0);
+    const featureLogRows = await featureRegistryRecorder.countRows().catch((error) => {
+        recordSilentCatch('MlPipeline.FeatureLogRows', error, {
+            path: featureRegistryRecorder.getPath(),
+        });
+        return 0;
+    });
     const datasetManifest = await readJsonFileSafe(FEATURE_DATASET_MANIFEST_PATH);
     const modelReport = await readJsonFileSafe(SIGNAL_MODEL_REPORT_PATH);
     const registrySummary = featureRegistrySummary();
@@ -4062,7 +4198,10 @@ function attachLabelToFeature(sample: StrategyTradeSample): boolean {
             label_source: 'strategy:pnl',
         });
         featureRegistryUpdatedAt = Date.now();
-        void runInProcessModelTraining(false);
+        fireAndForget('MLTrainer.InProcess', runInProcessModelTraining(false), {
+            source: 'feature_label_attach',
+            strategy: row.strategy,
+        });
         return true;
     }
     return false;
@@ -4121,7 +4260,7 @@ async function applyDefaultStrategyStates(force = false): Promise<void> {
                 const now = Date.now();
                 if (!cooldownUntil || Number(cooldownUntil) <= now) {
                     await redisClient.set(enabledKey, '1');
-                    console.info(`[Boot] Re-enabled ${strategyId}: Risk Guard cooldown expired or absent`);
+                    logger.info(`[Boot] re-enabled ${strategyId}: Risk Guard cooldown expired or absent`);
                 } else {
                     // Cooldown still active — reschedule the resume timer
                     const remaining = Number(cooldownUntil) - now;
@@ -4131,12 +4270,15 @@ async function applyDefaultStrategyStates(force = false): Promise<void> {
                             await redisClient.expire(enabledKey, 86400);
                             strategyStatus[strategyId] = true;
                             io.emit('strategy_status_update', strategyStatus);
-                            console.info(`[RiskGuard] RESUMED ${strategyId} after boot-rescheduled cooldown`);
+                            logger.info(`[RiskGuard] resumed ${strategyId} after boot-rescheduled cooldown`);
                         } catch (err) {
-                            console.error(`[RiskGuard] Error resuming ${strategyId} after boot:`, err);
+                            recordSilentCatch('RiskGuard.BootResume', err, {
+                                strategy: strategyId,
+                                enabled_key: enabledKey,
+                            });
                         }
                     }, remaining);
-                    console.info(`[Boot] ${strategyId} still in Risk Guard cooldown, resume in ${Math.ceil(remaining / 1000)}s`);
+                    logger.info(`[Boot] ${strategyId} still in Risk Guard cooldown, resume in ${Math.ceil(remaining / 1000)}s`);
                 }
             }
         }
@@ -4241,7 +4383,8 @@ async function loadStrategyMetrics(): Promise<void> {
                 updated_at: updatedAt,
             };
         }
-    } catch {
+    } catch (error) {
+        recordSilentCatch('StrategyMetrics.Load', error, { key: STRATEGY_METRICS_KEY });
         clearStrategyMetrics();
     }
 }
@@ -4271,11 +4414,13 @@ async function resetSimulationState(
     clearStrategyPerformance();
     clearStrategyCostDiagnostics();
     clearStrategyTradeSamples();
+    clearStrategyExecutionHistory();
     clearDataIntegrityState();
     clearGovernanceState();
     clearFeatureRegistry();
     clearModelInferenceState();
     clearModelDriftState();
+    await resetRiskGuardStates();
     // Preserve any operator-enabled/disabled strategy toggles by default.
     // For deterministic benchmark runs, callers can force defaults.
     await applyDefaultStrategyStates(options.forceDefaults === true);
@@ -4298,7 +4443,7 @@ async function resetSimulationState(
 }
 
 // Real-time streams from market data and arb services
-marketDataService.on('ticker', (data: any) => {
+marketDataService.on('ticker', (data: MarketTickerMessage) => {
     io.emit('market_update', data);
     const symbol = asString(asRecord(data)?.symbol) || 'UNKNOWN';
     touchRuntimeModule('MARKET_DATA_PIPELINE', 'ONLINE', `ticker ${symbol}`);
@@ -4308,7 +4453,10 @@ redisSubscriber.subscribe('arbitrage:opportunities', (message) => {
     try {
         io.emit('arbitrage_update', JSON.parse(message));
     } catch (error) {
-        console.error('Error parsing arb message:', error);
+        recordSilentCatch('RedisSub.ArbOpportunities', error, {
+            channel: 'arbitrage:opportunities',
+            preview: typeof message === 'string' ? message.slice(0, 160) : String(message),
+        });
     }
 });
 
@@ -4318,6 +4466,10 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
         const executionId = ensureExecutionId(parsed);
         const parsedStrategy = extractExecutionStrategy(parsed);
         const parsedMarketKey = extractExecutionMarketKey(parsed);
+        const parsedRecord = asRecord(parsed);
+        if (parsedStrategy && parsedRecord) {
+            pushStrategyExecutionHistory(parsedStrategy, parsedRecord);
+        }
         pushExecutionTraceEvent(executionId, 'EXECUTION_EVENT', parsed, {
             strategy: parsedStrategy,
             market_key: parsedMarketKey,
@@ -4326,184 +4478,49 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
 
         void (async () => {
             try {
-                const currentTradingMode = await getTradingMode();
-                const intelligenceGate = evaluateIntelligenceGate(parsed, currentTradingMode);
-                const gateMeta = {
-                    strategy: intelligenceGate.strategy || parsedStrategy,
-                    market_key: intelligenceGate.marketKey || parsedMarketKey,
-                };
-                if (!intelligenceGate.ok) {
-                    touchRuntimeModule('INTELLIGENCE_GATE', 'DEGRADED', intelligenceGate.reason || 'execution blocked');
-                    const blockPayload = {
-                        execution_id: executionId,
-                        timestamp: Date.now(),
-                        strategy: intelligenceGate.strategy || 'UNKNOWN',
-                        market_key: intelligenceGate.marketKey || intelligenceGate.scan?.market_key || null,
-                        reason: intelligenceGate.reason || 'Intelligence gate rejected execution',
-                        scan: intelligenceGate.scan || null,
-                        margin: intelligenceGate.margin,
-                        normalized_margin: intelligenceGate.normalizedMargin,
-                        age_ms: intelligenceGate.ageMs,
-                        peer_signals: intelligenceGate.peerSignals ?? 0,
-                        peer_consensus: intelligenceGate.peerConsensus ?? 0,
-                        peer_strategies: intelligenceGate.peerStrategies || [],
-                    };
-                    pushExecutionTraceEvent(executionId, 'INTELLIGENCE_GATE', blockPayload, gateMeta);
-                    io.emit('strategy_intelligence_block', blockPayload);
-                    io.emit('execution_log', {
-                        execution_id: executionId,
-                        timestamp: Date.now(),
-                        side: 'INTEL_BLOCK',
-                        market: asString(asRecord(parsed)?.market) || 'Polymarket',
-                        price: blockPayload.reason,
-                        size: blockPayload.strategy,
-                        mode: 'LIVE_GUARD',
-                        details: blockPayload,
-                    });
-                    return;
-                }
-                pushExecutionTraceEvent(
-                    executionId,
-                    'INTELLIGENCE_GATE',
+                await processArbitrageExecutionWorker(
                     {
-                        execution_id: executionId,
-                        ok: true,
-                        timestamp: Date.now(),
-                        strategy: intelligenceGate.strategy || parsedStrategy,
-                        market_key: intelligenceGate.marketKey || parsedMarketKey,
-                        margin: intelligenceGate.margin,
-                        normalized_margin: intelligenceGate.normalizedMargin,
-                        age_ms: intelligenceGate.ageMs,
-                        peer_signals: intelligenceGate.peerSignals ?? 0,
-                        peer_consensus: intelligenceGate.peerConsensus ?? 0,
-                        peer_strategies: intelligenceGate.peerStrategies || [],
-                    },
-                    gateMeta,
-                );
-                touchRuntimeModule('INTELLIGENCE_GATE', 'ONLINE', `execution allowed for ${intelligenceGate.strategy || 'UNKNOWN'}`);
-                const modelGate = evaluateModelProbabilityGate(parsed, currentTradingMode);
-                if (!modelGate.ok) {
-                    touchRuntimeModule(
-                        'UNCERTAINTY_GATE',
-                        'DEGRADED',
-                        `${modelGate.strategy || 'UNKNOWN'} blocked: ${modelGate.reason}`,
-                    );
-                    const modelBlockPayload = {
-                        execution_id: executionId,
-                        timestamp: Date.now(),
-                        strategy: modelGate.strategy || intelligenceGate.strategy || 'UNKNOWN',
-                        market_key: modelGate.market_key || intelligenceGate.marketKey || intelligenceGate.scan?.market_key || null,
-                        reason: `[MODEL_GATE] ${modelGate.reason}`,
-                        probability: modelGate.probability,
-                        gate: modelGate.gate,
-                        model_loaded: modelGate.model_loaded,
-                        mode: currentTradingMode,
-                    };
-                    pushExecutionTraceEvent(executionId, 'MODEL_GATE', modelBlockPayload, {
-                        strategy: modelBlockPayload.strategy,
-                        market_key: modelBlockPayload.market_key,
-                    });
-                    io.emit('strategy_model_block', modelBlockPayload);
-                    // Reuse existing UI intelligence block stream for visibility.
-                    io.emit('strategy_intelligence_block', modelBlockPayload);
-                    io.emit('execution_log', {
-                        execution_id: executionId,
-                        timestamp: Date.now(),
-                        side: 'MODEL_BLOCK',
-                        market: asString(asRecord(parsed)?.market) || 'Polymarket',
-                        price: modelBlockPayload.reason,
-                        size: modelBlockPayload.strategy,
-                        mode: currentTradingMode === 'PAPER' ? 'PAPER_MODEL_GUARD' : 'LIVE_MODEL_GUARD',
-                        details: modelBlockPayload,
-                    });
-                    return;
-                }
-                pushExecutionTraceEvent(
-                    executionId,
-                    'MODEL_GATE',
-                    {
-                        execution_id: executionId,
-                        ok: true,
-                        timestamp: Date.now(),
-                        strategy: modelGate.strategy || intelligenceGate.strategy || parsedStrategy,
-                        market_key: modelGate.market_key || intelligenceGate.marketKey || parsedMarketKey,
-                        probability: modelGate.probability,
-                        gate: modelGate.gate,
-                        model_loaded: modelGate.model_loaded,
-                        mode: currentTradingMode,
-                    },
-                    {
-                        strategy: modelGate.strategy || intelligenceGate.strategy || parsedStrategy,
-                        market_key: modelGate.market_key || intelligenceGate.marketKey || parsedMarketKey,
-                    },
-                );
-                touchRuntimeModule(
-                    'UNCERTAINTY_GATE',
-                    'ONLINE',
-                    `${modelGate.strategy || 'UNKNOWN'} prob gate pass (${modelGate.reason})`,
-                );
-
-                const preflight = await polymarketPreflight.preflightFromExecution(parsed);
-                if (!preflight) {
-                    touchRuntimeModule('EXECUTION_PREFLIGHT', 'ONLINE', 'preflight bypassed (no polymarket order payload)');
-                    pushExecutionTraceEvent(
+                        parsed,
                         executionId,
-                        'PREFLIGHT',
-                        {
-                            execution_id: executionId,
-                            timestamp: Date.now(),
-                            bypassed: true,
-                            mode: currentTradingMode,
+                        parsedStrategy,
+                        parsedMarketKey,
+                    },
+                    {
+                        getTradingMode,
+                        evaluateIntelligenceGate,
+                        evaluateModelProbabilityGate,
+                        preflightFromExecution: polymarketPreflight.preflightFromExecution.bind(polymarketPreflight),
+                        executeFromExecution: polymarketPreflight.executeFromExecution.bind(polymarketPreflight),
+                        registerAtomicExecution: settlementService.registerAtomicExecution.bind(settlementService),
+                        emitSettlementEvents,
+                        pushExecutionTraceEvent,
+                        touchRuntimeModule,
+                        emit: (event, payload) => {
+                            io.emit(event, payload);
                         },
-                        {
-                            strategy: modelGate.strategy || intelligenceGate.strategy || parsedStrategy,
-                            market_key: modelGate.market_key || intelligenceGate.marketKey || parsedMarketKey,
+                        preflightToExecutionLog: PolymarketPreflightService.toExecutionLog,
+                        liveToExecutionLog: PolymarketPreflightService.toLiveExecutionLog,
+                        marketLabelFromPayload: (payload) => asString(asRecord(payload)?.market) || 'Polymarket',
+                        annotateExecutionId: (target, id) => {
+                            (target as Record<string, unknown>).execution_id = id;
                         },
-                    );
-                    const liveExecution = await polymarketPreflight.executeFromExecution(parsed, currentTradingMode);
-                    if (!liveExecution) {
-                        return;
-                    }
-                    (liveExecution as unknown as Record<string, unknown>).execution_id = executionId;
-                    pushExecutionTraceEvent(executionId, 'LIVE_EXECUTION', liveExecution, {
-                        strategy: liveExecution.strategy || modelGate.strategy || intelligenceGate.strategy || parsedStrategy,
-                        market_key: parsedMarketKey,
-                    });
-                    io.emit('strategy_live_execution', liveExecution);
-                    io.emit('execution_log', PolymarketPreflightService.toLiveExecutionLog(liveExecution));
-                    const settlementEvents = await settlementService.registerAtomicExecution(liveExecution);
-                    await emitSettlementEvents(settlementEvents);
-                    return;
-                }
-
-                touchRuntimeModule('EXECUTION_PREFLIGHT', preflight.ok ? 'ONLINE' : 'DEGRADED', `${preflight.strategy} preflight ${preflight.ok ? 'ok' : 'failed'}`);
-                (preflight as unknown as Record<string, unknown>).execution_id = executionId;
-                pushExecutionTraceEvent(executionId, 'PREFLIGHT', preflight, {
-                    strategy: preflight.strategy || modelGate.strategy || intelligenceGate.strategy || parsedStrategy,
-                    market_key: parsedMarketKey,
-                });
-                io.emit('strategy_preflight', preflight);
-                io.emit('execution_log', PolymarketPreflightService.toExecutionLog(preflight));
-
-                const liveExecution = await polymarketPreflight.executeFromExecution(parsed, currentTradingMode);
-                if (!liveExecution) {
-                    return;
-                }
-                (liveExecution as unknown as Record<string, unknown>).execution_id = executionId;
-                pushExecutionTraceEvent(executionId, 'LIVE_EXECUTION', liveExecution, {
-                    strategy: liveExecution.strategy || preflight.strategy || modelGate.strategy || intelligenceGate.strategy || parsedStrategy,
-                    market_key: parsedMarketKey,
-                });
-                io.emit('strategy_live_execution', liveExecution);
-                io.emit('execution_log', PolymarketPreflightService.toLiveExecutionLog(liveExecution));
-                const settlementEvents = await settlementService.registerAtomicExecution(liveExecution);
-                await emitSettlementEvents(settlementEvents);
+                        recordRejectedSignal,
+                    },
+                );
             } catch (workerError) {
-                console.error('[PolymarketPreflight] execution worker error:', workerError);
+                recordSilentCatch('RedisSub.ArbExecutionWorker', workerError, {
+                    channel: 'arbitrage:execution',
+                    execution_id: executionId,
+                    strategy: parsedStrategy || 'UNKNOWN',
+                    market_key: parsedMarketKey || 'UNKNOWN',
+                });
             }
         })();
     } catch (error) {
-        console.error('Error parsing execution message:', error);
+        recordSilentCatch('RedisSub.ArbExecutionParse', error, {
+            channel: 'arbitrage:execution',
+            preview: typeof message === 'string' ? message.slice(0, 160) : String(message),
+        });
     }
 });
 
@@ -4552,15 +4569,21 @@ redisSubscriber.subscribe('strategy:pnl', (message) => {
                 updated_at: Date.now(),
             };
             io.emit('strategy_metrics_update', strategyMetrics);
-            void persistStrategyMetrics();
+            fireAndForget('StrategyMetrics.Persist', persistStrategyMetrics(), {
+                source: 'strategy:pnl',
+                strategy,
+            });
 
             const notional = asNumber(parsed?.notional);
-            void updateStrategyAllocator(strategy, pnl, notional);
-            void processRiskGuard(strategy, pnl, parsed as Record<string, unknown>);
-            void sweepProfitsToVault();
+            fireAndForget('RiskAllocator.Update', updateStrategyAllocator(strategy, pnl, notional), { strategy });
+            fireAndForget('RiskGuard.Process', processRiskGuard(strategy, pnl, parsed as Record<string, unknown>), { strategy });
+            fireAndForget('Vault.Sweep', sweepProfitsToVault(), { strategy });
         }
     } catch (error) {
-        console.error('Error parsing pnl message:', error);
+        recordSilentCatch('RedisSub.StrategyPnl', error, {
+            channel: 'strategy:pnl',
+            preview: typeof message === 'string' ? message.slice(0, 160) : String(message),
+        });
     }
 });
 
@@ -4599,74 +4622,102 @@ redisSubscriber.subscribe('arbitrage:scan', (message) => {
         if (!parsedRecord) {
             return;
         }
-
-        const strategy = asString(parsedRecord.strategy);
-        if (strategy) {
-            const timestamp = asNumber(parsedRecord.timestamp) || Date.now();
-            const marketKey = extractScanMarketKey(parsedRecord) || strategy.toLowerCase();
-            const rawSignalType = asString(parsedRecord.signal_type);
-            const rawUnit = asString(parsedRecord.unit);
-            const metaFeatures = extractScanMetaFeatures(parsedRecord.meta);
-            const inferred = inferScanDescriptor(strategy, rawSignalType, rawUnit);
-            const metricFamily = parseMetricFamily(parsedRecord.metric_family) || inferred.metric_family;
-            const directionality = parseMetricDirection(parsedRecord.directionality) || inferred.directionality;
-            const comparableGroup = asString(parsedRecord.comparable_group) || inferred.comparable_group;
-            const scanState: StrategyScanState = {
-                strategy,
-                symbol: asString(parsedRecord.symbol) || strategy,
-                market_key: marketKey,
-                timestamp,
-                passes_threshold: parsedRecord.passes_threshold === true,
-                score: asNumber(parsedRecord.score) ?? asNumber(parsedRecord.gap) ?? 0,
-                threshold: asNumber(parsedRecord.threshold) ?? 0,
-                reason: asString(parsedRecord.reason) || '',
-                signal_type: rawSignalType || inferred.signal_type,
-                unit: normalizeMetricUnit(rawUnit || inferred.unit),
-                metric_family: metricFamily,
-                directionality,
-                comparable_group: comparableGroup,
-                meta_features: Object.keys(metaFeatures).length > 0 ? metaFeatures : undefined,
-            };
-            latestStrategyScans.set(strategy, scanState);
-            latestStrategyScansByMarket.set(buildStrategyMarketKey(strategy, marketKey), scanState);
-            pruneIntelligenceState();
-            upsertFeatureSnapshot(scanState);
-            touchRuntimeModule('FEATURE_REGISTRY', 'ONLINE', `feature row ${scanState.strategy} ${scanState.market_key}`);
-            updateStrategyQuality(scanState);
-            const dataIntegrityAlert = updateDataIntegrityFromScan(scanState);
-            const quality = ensureStrategyQualityEntry(strategy);
-            const integrity = ensureStrategyDataIntegrityEntry(strategy);
-            io.emit('strategy_quality_update', {
-                strategy,
-                ...quality,
-                pass_rate_pct: quality.total_scans > 0
-                    ? (quality.pass_scans / quality.total_scans) * 100
-                    : 0,
-            });
-            io.emit('data_integrity_update', {
-                strategy,
-                ...integrity,
-            });
-            if (dataIntegrityAlert) {
-                touchRuntimeModule(
-                    'SCAN_INGEST',
-                    dataIntegrityAlert.severity === 'CRITICAL' ? 'DEGRADED' : 'ONLINE',
-                    `${strategy} ${dataIntegrityAlert.category} ${dataIntegrityAlert.severity.toLowerCase()} x${dataIntegrityAlert.consecutive_holds}`,
-                );
-                io.emit('data_integrity_alert', dataIntegrityAlert);
+        const scanContract = validateArbitrageScanContract(parsedRecord);
+        if (!scanContract.ok) {
+            const strategyHint = asString(parsedRecord.strategy)?.toUpperCase() || 'UNKNOWN';
+            const marketHint = extractScanMarketKey(parsedRecord) || `${strategyHint.toLowerCase()}:unknown`;
+            const reason = `scan schema drift: ${scanContract.error}`;
+            const alert = recordScanSchemaDrift(strategyHint, marketHint, reason, scanContract.issues);
+            if (alert) {
+                io.emit('data_integrity_alert', alert);
             }
-            io.emit('feature_registry_update', featureRegistrySummary());
-            requestMetaControllerRefresh();
-            touchRuntimeModule('SCAN_INGEST', 'ONLINE', `${strategy} ${scanState.passes_threshold ? 'PASS' : 'HOLD'} ${scanState.symbol}`);
-            io.emit('intelligence_update', scanState);
+            io.emit('data_integrity_update', {
+                strategy: strategyHint,
+                ...ensureStrategyDataIntegrityEntry(strategyHint),
+            });
+            io.emit('scan_ingest_alert', {
+                severity: 'CRITICAL',
+                strategy: strategyHint,
+                market_key: marketHint,
+                reason,
+                issues: scanContract.issues,
+                timestamp: Date.now(),
+            });
+            touchRuntimeModule('SCAN_INGEST', 'DEGRADED', `${strategyHint} schema drift: ${scanContract.error}`);
+            return;
         }
+
+        const normalizedScan = scanContract.value;
+        const strategy = normalizedScan.strategy;
+        const timestamp = normalizedScan.timestamp;
+        const marketKey = normalizeMarketKey(normalizedScan.market_key)
+            || extractScanMarketKey(parsedRecord)
+            || strategy.toLowerCase();
+        const rawSignalType = normalizedScan.signal_type || asString(parsedRecord.signal_type);
+        const rawUnit = normalizedScan.unit || asString(parsedRecord.unit);
+        const metaFeatures = extractScanMetaFeatures(normalizedScan.meta ?? parsedRecord.meta);
+        const inferred = inferScanDescriptor(strategy, rawSignalType, rawUnit);
+        const metricFamily = parseMetricFamily(normalizedScan.metric_family ?? parsedRecord.metric_family) || inferred.metric_family;
+        const directionality = parseMetricDirection(normalizedScan.directionality ?? parsedRecord.directionality) || inferred.directionality;
+        const comparableGroup = asString(normalizedScan.comparable_group ?? parsedRecord.comparable_group) || inferred.comparable_group;
+        const scanState: StrategyScanState = {
+            strategy,
+            symbol: normalizedScan.symbol || asString(parsedRecord.symbol) || strategy,
+            market_key: marketKey,
+            timestamp,
+            passes_threshold: normalizedScan.passes_threshold,
+            score: normalizedScan.score,
+            threshold: normalizedScan.threshold,
+            reason: normalizedScan.reason,
+            signal_type: rawSignalType || inferred.signal_type,
+            unit: normalizeMetricUnit(rawUnit || inferred.unit),
+            metric_family: metricFamily,
+            directionality,
+            comparable_group: comparableGroup,
+            meta_features: Object.keys(metaFeatures).length > 0 ? metaFeatures : undefined,
+        };
+        latestStrategyScans.set(strategy, scanState);
+        latestStrategyScansByMarket.set(buildStrategyMarketKey(strategy, marketKey), scanState);
+        pruneIntelligenceState();
+        upsertFeatureSnapshot(scanState);
+        touchRuntimeModule('FEATURE_REGISTRY', 'ONLINE', `feature row ${scanState.strategy} ${scanState.market_key}`);
+        updateStrategyQuality(scanState);
+        const dataIntegrityAlert = updateDataIntegrityFromScan(scanState);
+        const quality = ensureStrategyQualityEntry(strategy);
+        const integrity = ensureStrategyDataIntegrityEntry(strategy);
+        io.emit('strategy_quality_update', {
+            strategy,
+            ...quality,
+            pass_rate_pct: quality.total_scans > 0
+                ? (quality.pass_scans / quality.total_scans) * 100
+                : 0,
+        });
+        io.emit('data_integrity_update', {
+            strategy,
+            ...integrity,
+        });
+        if (dataIntegrityAlert) {
+            touchRuntimeModule(
+                'SCAN_INGEST',
+                dataIntegrityAlert.severity === 'CRITICAL' ? 'DEGRADED' : 'ONLINE',
+                `${strategy} ${dataIntegrityAlert.category} ${dataIntegrityAlert.severity.toLowerCase()} x${dataIntegrityAlert.consecutive_holds}`,
+            );
+            io.emit('data_integrity_alert', dataIntegrityAlert);
+        }
+        io.emit('feature_registry_update', featureRegistrySummary());
+        requestMetaControllerRefresh();
+        touchRuntimeModule('SCAN_INGEST', 'ONLINE', `${strategy} ${scanState.passes_threshold ? 'PASS' : 'HOLD'} ${scanState.symbol}`);
+        io.emit('intelligence_update', scanState);
         io.emit('scanner_update', parsed);
     } catch (error) {
         const now = Date.now();
         if (now - lastScannerParseErrorLogMs >= 30_000) {
             lastScannerParseErrorLogMs = now;
             const preview = typeof message === 'string' ? message.slice(0, 160) : String(message);
-            console.error('Error in scanner_update:', error, 'payload_preview=', preview);
+            recordSilentCatch('RedisSub.ScannerUpdate', error, {
+                channel: 'scanner_update',
+                preview,
+            });
         }
     }
 });
@@ -4674,20 +4725,46 @@ redisSubscriber.subscribe('arbitrage:scan', (message) => {
 // Persist ML features to Redis keys so Rust scanners can read RSI/SMA for momentum filtering.
 redisSubscriber.subscribe('ml:features', (message) => {
     try {
-        const parsed = JSON.parse(message);
+        const parsed = JSON.parse(message) as Record<string, unknown>;
         const symbol = parsed?.symbol;
         if (typeof symbol === 'string' && symbol.length > 0) {
-            const key = `ml:features:latest:${symbol}`;
-            void redisClient.set(key, JSON.stringify({
+            const normalized = {
                 symbol,
-                rsi_14: parsed.rsi_14 ?? null,
-                sma_20: parsed.sma_20 ?? null,
-                price: parsed.price ?? null,
-                returns: parsed.returns ?? null,
+                rsi_14: asNumber(parsed.rsi_14),
+                sma_20: asNumber(parsed.sma_20),
+                price: asNumber(parsed.price),
+                returns: asNumber(parsed.returns),
+                ml_prob_up: asNumber(parsed.ml_prob_up),
+                ml_prob_down: asNumber(parsed.ml_prob_down),
+                ml_signal_edge: asNumber(parsed.ml_signal_edge),
+                ml_signal_confidence: asNumber(parsed.ml_signal_confidence),
+                ml_signal_direction: asString(parsed.ml_signal_direction),
+                ml_model: asString(parsed.ml_model),
+                ml_model_ready: typeof parsed.ml_model_ready === 'boolean' ? parsed.ml_model_ready : null,
+                ml_model_samples: asNumber(parsed.ml_model_samples),
+                ml_model_horizon_ms: asNumber(parsed.ml_model_horizon_ms),
+                ml_model_last_train_ts: asNumber(parsed.ml_model_last_train_ts),
+                ml_model_age_ms: asNumber(parsed.ml_model_age_ms),
+                ml_model_eval_logloss: asNumber(parsed.ml_model_eval_logloss),
+                ml_model_eval_auc: asNumber(parsed.ml_model_eval_auc),
+                ml_model_eval_accuracy: asNumber(parsed.ml_model_eval_accuracy),
+                ml_model_eval_brier: asNumber(parsed.ml_model_eval_brier),
                 timestamp: normalizeTimestampMs(parsed.timestamp),
-            }), { EX: 120 }); // expire after 2 min if ML service stops
+            };
+            const key = `ml:features:latest:${symbol}`;
+            fireAndForget(
+                'RedisSub.MLFeaturesPersist',
+                redisClient.set(key, JSON.stringify(normalized), { EX: 120 }),
+                { key, symbol },
+            ); // expire after 2 min if ML service stops
+            io.emit('ml_features_update', normalized);
         }
-    } catch { /* ignore */ }
+    } catch (error) {
+        recordSilentCatch('RedisSub.MLFeatures', error, {
+            channel: 'ml:features',
+            preview: typeof message === 'string' ? message.slice(0, 160) : String(message),
+        });
+    }
 });
 
 redisSubscriber.subscribe('system:heartbeat', (msg) => {
@@ -4696,8 +4773,11 @@ redisSubscriber.subscribe('system:heartbeat', (msg) => {
         if (typeof id === 'string') {
             heartbeats[id] = Number(timestamp) || Date.now();
         }
-    } catch {
-        // ignore malformed heartbeat
+    } catch (error) {
+        recordSilentCatch('RedisSub.SystemHeartbeat', error, {
+            channel: 'system:heartbeat',
+            preview: typeof msg === 'string' ? msg.slice(0, 160) : String(msg),
+        });
     }
 });
 
@@ -4717,8 +4797,11 @@ redisSubscriber.subscribe('system:trading_mode', (msg) => {
             timestamp: Number(parsed?.timestamp) || Date.now(),
             live_order_posting_enabled: livePostingEnabled,
         });
-    } catch {
-        // ignore malformed trading mode update
+    } catch (error) {
+        recordSilentCatch('RedisSub.TradingMode', error, {
+            channel: 'system:trading_mode',
+            preview: typeof msg === 'string' ? msg.slice(0, 160) : String(msg),
+        });
     }
 });
 
@@ -4742,7 +4825,12 @@ redisSubscriber.subscribe('system:simulation_reset', (msg) => {
         clearFeatureRegistry();
         clearModelInferenceState();
         clearModelDriftState();
-        void persistStrategyMetrics();
+        fireAndForget('RiskGuard.ResetState', resetRiskGuardStates(), {
+            source: 'system:simulation_reset',
+        });
+        fireAndForget('StrategyMetrics.Persist', persistStrategyMetrics(), {
+            source: 'system:simulation_reset',
+        });
         io.emit('strategy_metrics_update', strategyMetrics);
         io.emit('strategy_cost_diagnostics_snapshot', strategyCostDiagnosticsPayload());
         io.emit('data_integrity_snapshot', dataIntegrityPayload());
@@ -4751,19 +4839,22 @@ redisSubscriber.subscribe('system:simulation_reset', (msg) => {
         io.emit('model_inference_snapshot', modelInferencePayload());
         io.emit('model_drift_update', modelDriftPayload());
         requestMetaControllerRefresh();
-        void refreshMlPipelineStatus();
-        void runStrategyGovernanceCycle();
-        void refreshLedgerHealth();
+        fireAndForget('MLPipeline.Refresh', refreshMlPipelineStatus(), { source: 'system:simulation_reset' });
+        fireAndForget('Governance.Cycle', runStrategyGovernanceCycle(), { source: 'system:simulation_reset' });
+        fireAndForget('LedgerHealth.Refresh', refreshLedgerHealth(), { source: 'system:simulation_reset' });
         io.emit('strategy_risk_multiplier_snapshot', Object.fromEntries(
             STRATEGY_IDS.map((strategyId) => [strategyId, ensureStrategyPerformanceEntry(strategyId)]),
         ));
-    } catch {
-        // ignore malformed simulation reset update
+    } catch (error) {
+        recordSilentCatch('RedisSub.SimulationReset', error, {
+            channel: 'system:simulation_reset',
+            preview: typeof msg === 'string' ? msg.slice(0, 160) : String(msg),
+        });
     }
 });
 
 io.on('connection', async (socket) => {
-    console.log('Client connected:', socket.id);
+    logger.info(`[Socket] client connected id=${socket.id}`);
     const socketControlAuthorized = isControlPlaneAuthorized(getControlTokenFromSocket(socket));
 
     socket.emit('system_status', {
@@ -4825,14 +4916,17 @@ io.on('connection', async (socket) => {
     ));
     socket.emit('settlement_snapshot', settlementService.getSnapshot());
     socket.emit('runtime_status_update', runtimeStatusPayload());
+    socket.emit('silent_catch_telemetry_snapshot', silentCatchTelemetryPayload());
     socket.emit('ledger_health_update', ledgerHealthState);
     socket.emit('meta_controller_update', metaControllerPayload());
     socket.emit('ml_pipeline_status_update', mlPipelineStatus);
     socket.emit('model_inference_snapshot', modelInferencePayload());
     socket.emit('model_drift_update', modelDriftPayload());
+    socket.emit('model_gate_calibration_update', modelGateCalibrationPayload());
+    socket.emit('rejected_signal_snapshot', rejectedSignalSnapshot());
 
     socket.on('disconnect', () => {
-        console.log('Client disconnected:', socket.id);
+        logger.info(`[Socket] client disconnected id=${socket.id}`);
     });
 
     socket.on('toggle_agent', ({ name, active }: { name: string; active: boolean }) => {
@@ -4848,7 +4942,7 @@ io.on('connection', async (socket) => {
             return;
         }
         await redisClient.publish('system:config', JSON.stringify(data));
-        console.log('Config Updated:', data);
+        logger.info(`[Control] config updated payload=${JSON.stringify(data).slice(0, 200)}`);
     });
 
     socket.on('update_risk_config', async (payload: Partial<RiskConfig>) => {
@@ -4864,7 +4958,7 @@ io.on('connection', async (socket) => {
         await redisClient.set('system:risk_config', JSON.stringify(normalized));
         await redisClient.publish('system:risk_config', JSON.stringify(normalized));
         io.emit('risk_config_update', normalized);
-        console.log('Risk Config Updated:', normalized);
+        logger.info(`[Control] risk config updated payload=${JSON.stringify(normalized)}`);
     });
 
     socket.on('request_risk_config', async () => {
@@ -4882,7 +4976,7 @@ io.on('connection', async (socket) => {
 
     socket.on('request_risk_guard', () => {
         for (const id of RISK_GUARD_STRATEGIES) {
-            const state = riskGuardState[id];
+            const state = getRiskGuardState(id);
             if (state) {
                 socket.emit('risk_guard_update', { strategy: id, ...state });
             }
@@ -4898,6 +4992,22 @@ io.on('connection', async (socket) => {
             equity: ledger.equity,
             utilization_pct: ledger.utilization_pct,
         });
+    });
+
+    socket.on('request_silent_catch_telemetry', () => {
+        socket.emit('silent_catch_telemetry_snapshot', silentCatchTelemetryPayload());
+    });
+
+    socket.on('request_rejected_signals', (payload?: { limit?: unknown; strategy?: unknown }) => {
+        const payloadRecord = asRecord(payload);
+        const requestedLimit = asNumber(payloadRecord?.limit);
+        const limit = Number.isFinite(requestedLimit) ? requestedLimit as number : 200;
+        const strategy = normalizedStrategyFilter(payloadRecord?.strategy);
+        socket.emit('rejected_signal_snapshot', rejectedSignalSnapshot(limit, strategy));
+    });
+
+    socket.on('request_model_gate_calibration', () => {
+        socket.emit('model_gate_calibration_update', modelGateCalibrationPayload());
     });
 
     socket.on('request_trading_mode', async () => {
@@ -5028,6 +5138,14 @@ app.get('/api/arb/stats', async (_req, res) => {
     const settlementSnapshot = settlementService.getSnapshot();
     const trackedSettlements = settlementSnapshot.positions.filter((position) => position.status !== 'REDEEMED');
     const redeemableSettlements = settlementSnapshot.positions.filter((position) => position.status === 'REDEEMABLE');
+    const rejectedPersistedRows = await rejectedSignalRecorder.countRows().catch((error) => {
+        recordSilentCatch('RejectedSignal.CountRows', error, { path: rejectedSignalRecorder.getPath() });
+        return rejectedSignalHistory.length;
+    });
+    const rejectedByStage = rejectedSignalHistory.reduce<Record<string, number>>((acc, entry) => {
+        acc[entry.stage] = (acc[entry.stage] ?? 0) + 1;
+        return acc;
+    }, {});
 
     res.json({
         bankroll,
@@ -5062,22 +5180,34 @@ app.get('/api/arb/stats', async (_req, res) => {
             enforce_paper: MODEL_PROBABILITY_GATE_ENFORCE_PAPER,
             enforce_live: MODEL_PROBABILITY_GATE_ENFORCE_LIVE,
             min_probability: MODEL_PROBABILITY_GATE_MIN_PROB,
+            active_probability: activeModelProbabilityGate(),
+            tuner_enabled: MODEL_PROBABILITY_GATE_TUNER_ENABLED,
+            tuner_advisory_only: MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY,
             require_model: MODEL_PROBABILITY_GATE_REQUIRE_MODEL,
             disable_on_drift: MODEL_PROBABILITY_GATE_DISABLE_ON_DRIFT,
             drift_disabled_until: modelDriftState.gate_disabled_until,
             currently_enforcing: modelDriftState.gate_enforcing,
         },
+        silent_catch_telemetry: silentCatchTelemetryPayload(),
         build_runtime: runtimeStatusPayload(),
         settlements: {
             tracked: trackedSettlements.length,
             redeemable: redeemableSettlements.length,
             auto_redeem_enabled: settlementSnapshot.autoRedeemEnabled,
+            readiness: settlementService.getReadinessSnapshot(),
+        },
+        rejected_signals: {
+            tracked: rejectedSignalHistory.length,
+            persisted_rows: rejectedPersistedRows,
+            log_path: rejectedSignalRecorder.getPath(),
+            by_stage: rejectedByStage,
         },
         ledger_health: ledgerHealthState,
         meta_controller: metaControllerPayload(),
         ml_pipeline: mlPipelineStatus,
         model_inference: modelInferencePayload(),
         model_drift: modelDriftPayload(),
+        model_gate_calibration: modelGateCalibrationPayload(),
         strategy_allocator: Object.fromEntries(
             STRATEGY_IDS.map((strategyId) => {
                 const perf = ensureStrategyPerformanceEntry(strategyId);
@@ -5105,6 +5235,52 @@ app.get('/api/arb/stats', async (_req, res) => {
         data_integrity: dataIntegrityPayload(),
         strategy_governance: governancePayload(),
         feature_registry: featureRegistrySummary(),
+    });
+});
+
+app.get('/api/arb/rejected-signals', async (req, res) => {
+    const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : 200;
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(REJECTED_SIGNAL_RETENTION, Math.floor(rawLimit))) : 200;
+    const stage = typeof req.query.stage === 'string' ? req.query.stage.trim().toUpperCase() : '';
+    const strategy = normalizedStrategyFilter(typeof req.query.strategy === 'string' ? req.query.strategy : null);
+    const source = typeof req.query.source === 'string' ? req.query.source.trim().toLowerCase() : 'memory';
+    const fromFile = source === 'file';
+    const persistedRows = await rejectedSignalRecorder.countRows().catch((error) => {
+        recordSilentCatch('RejectedSignal.CountRows', error, { path: rejectedSignalRecorder.getPath() });
+        return rejectedSignalHistory.length;
+    });
+    const base = fromFile
+        ? await rejectedSignalRecorder.readRecent(REJECTED_SIGNAL_RETENTION).catch((error) => {
+            recordSilentCatch('RejectedSignal.ReadRecent', error, { path: rejectedSignalRecorder.getPath() });
+            return [] as RejectedSignalRecord[];
+        })
+        : rejectedSignalSnapshot(REJECTED_SIGNAL_RETENTION).reverse();
+    const filteredByStage = stage ? base.filter((entry) => entry.stage === stage) : base;
+    const filtered = strategy
+        ? filteredByStage.filter((entry) => normalizedStrategyFilter(entry.strategy) === strategy)
+        : filteredByStage;
+    const entries = filtered.slice(Math.max(0, filtered.length - limit)).reverse();
+    res.json({
+        limit,
+        stage: stage || null,
+        strategy: strategy || null,
+        source: fromFile ? 'file' : 'memory',
+        log_path: rejectedSignalRecorder.getPath(),
+        persisted_rows: persistedRows,
+        count: entries.length,
+        entries,
+    });
+});
+
+app.get('/api/arb/model-gate-calibration', (_req, res) => {
+    res.json(modelGateCalibrationPayload());
+});
+
+app.post('/api/arb/model-gate-calibration/recompute', requireControlPlaneAuth, async (_req, res) => {
+    await runModelProbabilityGateCalibration();
+    res.json({
+        ok: true,
+        calibration: modelGateCalibrationPayload(),
     });
 });
 
@@ -5352,6 +5528,19 @@ app.get('/api/arb/validation-trades', async (_req, res) => {
     });
 });
 
+app.get('/api/arb/strategy-executions', (req, res) => {
+    const strategy = typeof req.query.strategy === 'string' ? req.query.strategy.trim().toUpperCase() : '';
+    const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : 200;
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(2000, Math.floor(rawLimit))) : 200;
+    if (!strategy) {
+        res.status(400).json({ error: 'Missing strategy query parameter' });
+        return;
+    }
+    const history = strategyExecutionHistory.get(strategy) || [];
+    const entries = history.slice(Math.max(0, history.length - limit)).reverse();
+    res.json({ strategy, entries });
+});
+
 app.get('/api/arb/strategy-trades', async (req, res) => {
     const strategy = typeof req.query.strategy === 'string' ? req.query.strategy.trim() : '';
     const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : 200;
@@ -5398,7 +5587,13 @@ app.get('/api/arb/strategy-trades', async (req, res) => {
 
     try {
         const filePath = strategyTradeRecorder.getPath();
-        const content = await fs.readFile(filePath, 'utf8').catch(() => '');
+        const content = await fs.readFile(filePath, 'utf8').catch((error) => {
+            const errorCode = asString(asRecord(error)?.code);
+            if (errorCode !== 'ENOENT') {
+                recordSilentCatch('StrategyTrades.ReadFile', error, { path: filePath });
+            }
+            return '';
+        });
         const lines = content.split('\n').map((line) => line.trim()).filter((line) => line.length > 0);
         if (lines.length <= 1) {
             res.json({ trades: [] });
@@ -5423,7 +5618,19 @@ app.get('/api/arb/strategy-trades', async (req, res) => {
         const start = Math.max(1, lines.length - scanWindow);
         const slice = lines.slice(start);
 
-        const trades: any[] = [];
+        type StrategyTradeHistoryEntry = {
+            timestamp: number;
+            strategy: string;
+            variant: string;
+            pnl: number | null;
+            notional: number | null;
+            mode: string;
+            reason: string;
+            execution_id: string | null;
+            side: string | null;
+            entry_price: number | null;
+        };
+        const trades: StrategyTradeHistoryEntry[] = [];
         for (let j = slice.length - 1; j >= 0; j -= 1) {
             const line = slice[j];
             const cells = parseCsvLine(line);
@@ -5434,6 +5641,7 @@ app.get('/api/arb/strategy-trades', async (req, res) => {
             const ts = timestampIdx >= 0 ? Number(unquote(cells[timestampIdx] || '')) : NaN;
             const pnl = pnlIdx >= 0 ? Number(unquote(cells[pnlIdx] || '')) : NaN;
             const notional = notionalIdx >= 0 ? Number(unquote(cells[notionalIdx] || '')) : NaN;
+            const entryPrice = entryPriceIdx >= 0 ? Number(unquote(cells[entryPriceIdx] || '')) : NaN;
             const trade = {
                 timestamp: Number.isFinite(ts) ? ts : Date.now(),
                 strategy: rowStrategy,
@@ -5444,7 +5652,7 @@ app.get('/api/arb/strategy-trades', async (req, res) => {
                 reason: reasonIdx >= 0 ? unquote(cells[reasonIdx] || '') : '',
                 execution_id: executionIdIdx >= 0 ? (unquote(cells[executionIdIdx] || '') || null) : null,
                 side: sideIdx >= 0 ? (unquote(cells[sideIdx] || '') || null) : null,
-                entry_price: entryPriceIdx >= 0 ? (Number(unquote(cells[entryPriceIdx] || '')) || null) : null,
+                entry_price: Number.isFinite(entryPrice) ? entryPrice : null,
             };
             trades.push(trade);
             if (trades.length >= limit) {
@@ -5463,6 +5671,28 @@ app.post('/api/arb/validation-trades/reset', requireControlPlaneAuth, async (_re
     res.json({
         ok: true,
         path: strategyTradeRecorder.getPath(),
+        rows: 0,
+    });
+});
+
+app.get('/api/arb/rejected-signals/log', async (_req, res) => {
+    const rows = await rejectedSignalRecorder.countRows().catch((error) => {
+        recordSilentCatch('RejectedSignal.CountRows', error, { path: rejectedSignalRecorder.getPath() });
+        return rejectedSignalHistory.length;
+    });
+    res.json({
+        path: rejectedSignalRecorder.getPath(),
+        rows,
+    });
+});
+
+app.post('/api/arb/rejected-signals/reset', requireControlPlaneAuth, async (_req, res) => {
+    await rejectedSignalRecorder.reset();
+    rejectedSignalHistory.splice(0, rejectedSignalHistory.length);
+    io.emit('rejected_signal_snapshot', rejectedSignalSnapshot());
+    res.json({
+        ok: true,
+        path: rejectedSignalRecorder.getPath(),
         rows: 0,
     });
 });
@@ -5581,26 +5811,10 @@ async function runStrategyGovernanceCycle(): Promise<void> {
     }
 }
 
-function scheduleNonOverlappingTask(taskName: string, intervalMs: number, task: () => Promise<void>): void {
-    let inFlight = false;
-    setInterval(() => {
-        if (inFlight) {
-            return;
-        }
-        inFlight = true;
-        void task()
-            .catch((error) => {
-                console.error(`[${taskName}] interval error:`, error);
-            })
-            .finally(() => {
-                inFlight = false;
-            });
-    }, intervalMs);
-}
-
-// Agentic Decision Loop — DISABLED by default. Set LEGACY_BRAIN_LOOP_ENABLED=true to re-enable.
-if (LEGACY_BRAIN_LOOP_ENABLED) {
-    console.warn('[Brain] LEGACY_BRAIN_LOOP_ENABLED=true — running deprecated agentic decision loop.');
+// Agentic Decision Loop — DISABLED by default.
+// Re-enable requires both LEGACY_BRAIN_LOOP_ENABLED=true and LEGACY_BRAIN_LOOP_UNSAFE_OK=true.
+if (LEGACY_BRAIN_LOOP_ENABLED && LEGACY_BRAIN_LOOP_UNSAFE_OK) {
+    logger.warn('[Brain] legacy decision loop enabled in unsafe mode by explicit override.');
     scheduleNonOverlappingTask('Brain', 30_000, async () => {
         try {
             const symbol = 'BTC-USD';
@@ -5631,11 +5845,16 @@ if (LEGACY_BRAIN_LOOP_ENABLED) {
                 timestamp: Date.now(),
             });
         } catch (error) {
-            console.error('[Brain] Error in decision loop:', error);
+            recordSilentCatch('Brain.DecisionLoop', error, { loop: 'legacy_brain' });
+            touchRuntimeModule('MODEL_INFERENCE', 'DEGRADED', `decision loop error: ${String(error)}`);
         }
     });
 } else {
-    console.info('[Brain] Legacy decision loop disabled (default). Set LEGACY_BRAIN_LOOP_ENABLED=true to re-enable.');
+    if (LEGACY_BRAIN_LOOP_ENABLED && !LEGACY_BRAIN_LOOP_UNSAFE_OK) {
+        logger.warn('[Brain] LEGACY_BRAIN_LOOP_ENABLED=true ignored because LEGACY_BRAIN_LOOP_UNSAFE_OK is not set.');
+    } else {
+        logger.info('[Brain] Legacy decision loop disabled (default).');
+    }
 }
 
 // System Health Heartbeat (Every 2s)
@@ -5645,7 +5864,8 @@ scheduleNonOverlappingTask('SystemHealth', 2000, async () => {
     try {
         await redisClient.ping();
         redisLatency = Date.now() - start;
-    } catch {
+    } catch (error) {
+        recordSilentCatch('SystemHealth.RedisPing', error, { op: 'PING' });
         redisLatency = -1;
     }
 
@@ -5693,7 +5913,8 @@ scheduleNonOverlappingTask('Settlement', settlementService.getPollIntervalMs(), 
             io.emit('settlement_snapshot', settlementService.getSnapshot());
         }
     } catch (error) {
-        console.error('[Settlement] cycle error:', error);
+        recordSilentCatch('Settlement.Cycle', error);
+        touchRuntimeModule('SETTLEMENT_ENGINE', 'DEGRADED', `settlement cycle error: ${String(error)}`);
     }
 });
 
@@ -5701,7 +5922,7 @@ scheduleNonOverlappingTask('Governance', STRATEGY_GOVERNANCE_INTERVAL_MS, async 
     try {
         await runStrategyGovernanceCycle();
     } catch (error) {
-        console.error('[Governance] cycle error:', error);
+        recordSilentCatch('Governance.Cycle', error);
         touchRuntimeModule('FEATURE_REGISTRY', 'DEGRADED', `governance error: ${String(error)}`);
     }
 });
@@ -5710,7 +5931,7 @@ scheduleNonOverlappingTask('LedgerHealth', 5_000, async () => {
     try {
         await refreshLedgerHealth();
     } catch (error) {
-        console.error('[LedgerHealth] refresh error:', error);
+        recordSilentCatch('LedgerHealth.Refresh', error);
         touchRuntimeModule('PNL_LEDGER', 'DEGRADED', `ledger health error: ${String(error)}`);
     }
 });
@@ -5723,7 +5944,7 @@ scheduleNonOverlappingTask('MLPipeline', 10_000, async () => {
     try {
         await refreshMlPipelineStatus();
     } catch (error) {
-        console.error('[MLPipeline] refresh error:', error);
+        recordSilentCatch('MLPipeline.Refresh', error);
         touchRuntimeModule('ML_TRAINER', 'DEGRADED', `ml pipeline error: ${String(error)}`);
         touchRuntimeModule('MODEL_INFERENCE', 'DEGRADED', `ml pipeline error: ${String(error)}`);
         touchRuntimeModule('DRIFT_MONITOR', 'DEGRADED', `ml pipeline error: ${String(error)}`);
@@ -5734,8 +5955,17 @@ scheduleNonOverlappingTask('MLTrainer', MODEL_TRAINER_INTERVAL_MS, async () => {
     try {
         await runInProcessModelTraining(false);
     } catch (error) {
-        console.error('[MLTrainer] in-process training cycle error:', error);
+        recordSilentCatch('MLTrainer.Cycle', error);
         touchRuntimeModule('ML_TRAINER', 'DEGRADED', `trainer cycle error: ${String(error)}`);
+    }
+});
+
+scheduleNonOverlappingTask('ModelGateCalibration', MODEL_PROBABILITY_GATE_TUNER_INTERVAL_MS, async () => {
+    try {
+        await runModelProbabilityGateCalibration();
+    } catch (error) {
+        recordSilentCatch('ModelGateCalibration.Cycle', error);
+        touchRuntimeModule('UNCERTAINTY_GATE', 'DEGRADED', `model gate calibration error: ${String(error)}`);
     }
 });
 
@@ -5748,7 +5978,10 @@ async function bootstrap() {
     await marketDataService.start();
 
     if (!isControlPlaneTokenConfigured()) {
-        console.error('CONTROL_PLANE_TOKEN is not configured. Control actions are locked until a token is set.');
+        logger.error('CONTROL_PLANE_TOKEN is not configured. Control actions are locked until a token is set.');
+        touchRuntimeModule('TRADING_MODE_GUARD', 'DEGRADED', 'control plane token missing; control actions locked');
+    } else {
+        touchRuntimeModule('TRADING_MODE_GUARD', 'ONLINE', 'control plane token configured');
     }
 
     await redisClient.setNX(SIM_BANKROLL_KEY, DEFAULT_SIM_BANKROLL.toFixed(2));
@@ -5769,11 +6002,14 @@ async function bootstrap() {
     await applyDefaultStrategyStates(false);
     await bootstrapStrategyMultipliers();
     await loadRiskGuardStates();
+    await bootstrapRejectedSignalHistory();
     await runStrategyGovernanceCycle();
     await refreshLedgerHealth();
     await refreshMetaController();
     await refreshMlPipelineStatus();
     refreshModelDriftRuntime();
+    await loadModelGateCalibrationState();
+    await runModelProbabilityGateCalibration();
     await runInProcessModelTraining(false);
 
     // ── Periodic state broadcast: keep all dashboards live ──
@@ -5792,20 +6028,22 @@ async function bootstrap() {
                 utilization_pct: ledger.utilization_pct,
             });
             for (const id of RISK_GUARD_STRATEGIES) {
-                const state = riskGuardState[id];
+                const state = getRiskGuardState(id);
                 if (state) io.emit('risk_guard_update', { strategy: id, ...state });
             }
-        } catch { /* non-critical broadcast */ }
+        } catch (error) {
+            recordSilentCatch('StateBroadcast.Emit', error, { task: 'StateBroadcast' });
+        }
     });
 
     const PORT = Number(process.env.PORT) || 5114;
     httpServer.listen(PORT, () => {
-        console.log(`Backend server running on port ${PORT}`);
+        logger.info(`Backend server running on port ${PORT}`);
     });
 }
 
 bootstrap().catch((error) => {
-    console.error('Failed to bootstrap backend:', error);
+    logger.error(`Failed to bootstrap backend: ${String(error)}`);
     process.exit(1);
 });
 
@@ -5816,17 +6054,21 @@ const shutdown = async (signal: string) => {
         return;
     }
     shutdownInProgress = true;
-    console.info(`[System] ${signal} received, shutting down gracefully...`);
+    logger.info(`[System] ${signal} received, shutting down gracefully...`);
 
     await new Promise<void>((resolve) => {
         httpServer.close(() => resolve());
     });
 
     if (redisSubscriber.isOpen) {
-        await redisSubscriber.quit().catch(() => undefined);
+        await redisSubscriber.quit().catch((error) => {
+            recordSilentCatch('Shutdown.RedisSubscriberQuit', error, { signal });
+        });
     }
     if (redisClient.isOpen) {
-        await redisClient.quit().catch(() => undefined);
+        await redisClient.quit().catch((error) => {
+            recordSilentCatch('Shutdown.RedisClientQuit', error, { signal });
+        });
     }
 
     process.exit(0);

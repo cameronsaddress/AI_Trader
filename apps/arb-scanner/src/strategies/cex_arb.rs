@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
-use redis::AsyncCommands;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -18,6 +17,7 @@ use crate::strategies::control::{
     compute_strategy_bet_size,
     is_strategy_enabled,
     publish_heartbeat,
+    publish_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -519,7 +519,7 @@ impl Strategy for CexArbStrategy {
                                     "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
                                 }),
                         );
-                        let _: () = conn.publish("arbitrage:scan", scan_msg.to_string()).await.unwrap_or_default();
+                        publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
 
                         let trading_mode = read_trading_mode(&mut conn).await;
                         if trading_mode == TradingMode::Live {
@@ -593,7 +593,7 @@ impl Strategy for CexArbStrategy {
                                                 }
                                             }
                                         });
-                                        let _: () = conn.publish("arbitrage:execution", preview_msg.to_string()).await.unwrap_or_default();
+                                        publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
                                         last_live_preview_ms = now_ms;
                                     }
                                 }
@@ -742,7 +742,7 @@ impl Strategy for CexArbStrategy {
                                     "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
                                 }
                             });
-                            let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                            publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
 
                             let exec_msg = serde_json::json!({
                                 "execution_id": execution_id,
@@ -759,7 +759,7 @@ impl Strategy for CexArbStrategy {
                                     "hold_ms": hold_ms,
                                 }
                             });
-                            let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                            publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
                         }
 
                         if let Some(mut pos) = new_entry {
@@ -817,7 +817,7 @@ impl Strategy for CexArbStrategy {
                                     "position_id": pos.id,
                                 }
                             });
-                            let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                            publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
                         }
 
                         publish_heartbeat(&mut conn, "cex_arb").await;

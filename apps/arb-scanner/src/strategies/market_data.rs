@@ -259,3 +259,74 @@ pub fn update_book_from_market_ws(payload: &str, yes_token: &str, no_token: &str
 
     yes_updated || no_updated
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{BinaryBook, TokenBinding, update_books_from_market_ws};
+    use std::collections::HashMap;
+
+    #[test]
+    fn malformed_ws_payload_is_ignored() {
+        let mut bindings: HashMap<String, TokenBinding> = HashMap::new();
+        bindings.insert(
+            "yes-token".to_string(),
+            TokenBinding {
+                market_key: "market-1".to_string(),
+                is_yes: true,
+            },
+        );
+        let mut books: HashMap<String, BinaryBook> = HashMap::new();
+        let updated = update_books_from_market_ws("not-json", &bindings, &mut books);
+        assert_eq!(updated, 0);
+        assert!(books.is_empty());
+    }
+
+    #[test]
+    fn unknown_tokens_do_not_mutate_books() {
+        let mut bindings: HashMap<String, TokenBinding> = HashMap::new();
+        bindings.insert(
+            "yes-token".to_string(),
+            TokenBinding {
+                market_key: "market-1".to_string(),
+                is_yes: true,
+            },
+        );
+        let mut books: HashMap<String, BinaryBook> = HashMap::new();
+        let payload = r#"[{"asset_id":"other-token","bids":[{"price":"0.51"}],"asks":[{"price":"0.53"}]}]"#;
+        let updated = update_books_from_market_ws(payload, &bindings, &mut books);
+        assert_eq!(updated, 0);
+        assert!(books.is_empty());
+    }
+
+    #[test]
+    fn price_changes_update_bound_sides_only() {
+        let mut bindings: HashMap<String, TokenBinding> = HashMap::new();
+        bindings.insert(
+            "yes-token".to_string(),
+            TokenBinding {
+                market_key: "market-1".to_string(),
+                is_yes: true,
+            },
+        );
+        bindings.insert(
+            "no-token".to_string(),
+            TokenBinding {
+                market_key: "market-1".to_string(),
+                is_yes: false,
+            },
+        );
+        let mut books: HashMap<String, BinaryBook> = HashMap::new();
+        let payload = r#"{"price_changes":[
+            {"asset_id":"yes-token","best_bid":"0.56","best_ask":"0.58"},
+            {"asset_id":"no-token","best_bid":"0.41","best_ask":"0.43"}
+        ]}"#;
+        let updated = update_books_from_market_ws(payload, &bindings, &mut books);
+        assert_eq!(updated, 1);
+
+        let book = books.get("market-1").expect("book created");
+        assert!(book.yes.best_bid > 0.0);
+        assert!(book.yes.best_ask > 0.0);
+        assert!(book.no.best_bid > 0.0);
+        assert!(book.no.best_ask > 0.0);
+    }
+}

@@ -31,6 +31,7 @@ type DisplayRow = {
     marketLabel: string;
     dataText: string;
     metricText: string;
+    modelText?: string;
     signalText: string;
     signalValue: number;
     kind: ScanKind;
@@ -71,6 +72,22 @@ const ROW_ORDER: Record<ScanKind, number> = {
 function parseNumber(input: unknown): number {
     const value = Number(input);
     return Number.isFinite(value) ? value : 0;
+}
+
+function parseOptionalNumber(input: unknown): number | null {
+    const value = Number(input);
+    return Number.isFinite(value) ? value : null;
+}
+
+function parseOptionalText(input: unknown): string | null {
+    if (typeof input !== 'string') return null;
+    const trimmed = input.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function parseOptionalBoolean(input: unknown): boolean | null {
+    if (typeof input === 'boolean') return input;
+    return null;
 }
 
 function hasNumber(input: unknown): input is number {
@@ -178,6 +195,7 @@ function buildRow(rowKey: string, scan: ScanMessage, history: SignalPoint[]): Di
     let marketLabel = scan.symbol;
     let dataText = `P1 ${scan.prices[0].toFixed(4)} | P2 ${scan.prices[1].toFixed(4)}`;
     let metricText = scan.metric_label ? `${scan.metric_label}: ${scan.sum.toFixed(4)}` : scan.sum.toFixed(4);
+    let modelText: string | undefined;
     let signalText = formatSignedPercent(score);
     let actionable = score > 0;
     let fallbackReason = 'Signal positive';
@@ -256,9 +274,40 @@ function buildRow(rowKey: string, scan: ScanMessage, history: SignalPoint[]): Di
         const fairProb = Math.max(0, Math.min(1, scan.sum));
         const direction = score >= 0 ? 'UP' : 'DOWN';
         const expectedNetBps = Math.abs(score) * 10_000;
+        const meta = scan.meta && typeof scan.meta === 'object' ? scan.meta : {};
+        const modelName = parseOptionalText(meta.ml_model) || parseOptionalText(meta.model_signal_model);
+        const modelLabel = parseOptionalText(meta.model_signal_label) || parseOptionalText(meta.ml_signal_direction);
+        const modelReady = parseOptionalBoolean(meta.model_signal_ready) ?? parseOptionalBoolean(meta.ml_model_ready);
+        const modelProbUp = parseOptionalNumber(meta.ml_prob_up);
+        const modelSideProb = parseOptionalNumber(meta.model_signal_side_prob);
+        const selectedSideProb = modelSideProb
+            ?? (modelProbUp !== null ? (direction === 'UP' ? modelProbUp : 1 - modelProbUp) : null);
+        const modelConfRaw = parseOptionalNumber(meta.model_signal_confidence)
+            ?? parseOptionalNumber(meta.ml_signal_confidence_raw)
+            ?? parseOptionalNumber(meta.ml_signal_confidence);
+        const modelConf = modelConfRaw !== null
+            ? Math.max(0, Math.min(1, modelConfRaw))
+            : (selectedSideProb !== null ? Math.abs(selectedSideProb - 0.5) * 2 : null);
+        const modelBits: string[] = [];
+        if (selectedSideProb !== null) {
+            modelBits.push(`P ${(Math.max(0, Math.min(1, selectedSideProb)) * 100).toFixed(1)}%`);
+        }
+        if (modelConf !== null) {
+            modelBits.push(`C ${(modelConf * 100).toFixed(0)}%`);
+        }
+        if (modelLabel) {
+            modelBits.push(modelLabel.replace(/^MODEL_/, ''));
+        }
+        if (modelReady !== null) {
+            modelBits.push(modelReady ? 'READY' : 'WARMUP');
+        }
+        if (modelName) {
+            modelBits.push(modelName);
+        }
         marketLabel = scan.symbol || 'Window Engine';
         dataText = `Coinbase ${formatMoneyCompact(spot)} | Ask ${formatCents(ask)}`;
         metricText = `Fair ${direction} ${(fairProb * 100).toFixed(2)}%`;
+        modelText = modelBits.length > 0 ? `ML ${modelBits.join(' · ')}` : 'ML --';
         signalText = `EV +${expectedNetBps.toFixed(1)}bps`;
         actionable = Math.abs(score) >= Math.abs(threshold);
         fallbackReason = actionable
@@ -292,6 +341,7 @@ function buildRow(rowKey: string, scan: ScanMessage, history: SignalPoint[]): Di
         marketLabel,
         dataText,
         metricText,
+        modelText,
         signalText,
         signalValue: score,
         kind,
@@ -434,7 +484,14 @@ export const ArbitrageScannerWidget = () => {
                             <span className={`w-1.5 h-1.5 rounded-full ${row.stale ? 'bg-gray-600' : 'bg-emerald-500 animate-pulse'}`} />
                         </span>
                         <span className="text-[10px] font-mono text-gray-300 truncate pr-2">{row.dataText}</span>
-                        <ValueCell value={row.metricText} className="text-[10px] font-mono text-cyan-300 truncate pr-2" />
+                        <div className="pr-2">
+                            <ValueCell value={row.metricText} className="text-[10px] font-mono text-cyan-300 truncate" />
+                            {row.modelText && (
+                                <div className="text-[9px] font-mono text-violet-300/85 truncate mt-0.5" title={row.modelText}>
+                                    {row.modelText}
+                                </div>
+                            )}
+                        </div>
                         <div className="pr-2">
                             <ValueCell
                                 value={row.signalText}

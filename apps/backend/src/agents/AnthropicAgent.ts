@@ -16,16 +16,22 @@ export class AnthropicAgent implements IAgent {
 
     async analyze(context: AgentContext): Promise<AgentResponse> {
         try {
-            const msg = await (this.client as any).messages.create({
+            const msg = await this.client.beta.messages.create({
                 model: this.model,
                 max_tokens: 1024,
                 system: this.buildSystemPrompt(),
                 messages: [
-                    { role: 'user', content: JSON.stringify(context) }
-                ]
+                    { role: 'user', content: JSON.stringify(context) },
+                ],
+            }, {
+                headers: { 'anthropic-beta': 'messages-2023-12-15' },
             });
 
-            const content = msg.content[0].text;
+            const textBlock = msg.content.find((block: { type: string; text?: string }) => block.type === 'text');
+            const content = textBlock?.text;
+            if (!content) {
+                throw new Error('Empty response from Anthropic');
+            }
             const parsed = this.parseResponse(content);
 
             return parsed;

@@ -23,9 +23,23 @@ use crate::strategies::maker_mm::MakerMmStrategy;
 use crate::strategies::btc_5m_lag::Btc5mLagStrategy;
 use crate::strategies::as_market_maker::AsMarketMakerStrategy;
 use crate::strategies::longshot_bias::LongshotBiasStrategy;
+use crate::strategies::control::{
+    read_strategy_reserved_notional,
+    release_sim_notional_for_strategy,
+};
 
 const STRATEGY_LOCK_TTL_MS: i64 = 30_000;
 const STRATEGY_LOCK_REFRESH_MS: u64 = 10_000;
+
+fn env_flag_enabled(name: &str, default: bool) -> bool {
+    match env::var(name) {
+        Ok(raw) => {
+            let value = raw.trim().to_ascii_lowercase();
+            !(value == "0" || value == "false" || value == "no")
+        }
+        Err(_) => default,
+    }
+}
 
 fn canonical_strategy_id(input: &str) -> &'static str {
     match input {
@@ -153,16 +167,40 @@ fn spawn_strategy_lock_lease(client: redis::Client, strategy_id: String, owner: 
                 if !recovered {
                     error!("Strategy lock permanently lost for {}. Exiting.", strategy_id);
                     if let Ok(mut alert_conn) = client.get_multiplexed_async_connection().await {
-                        let _: () = alert_conn.publish::<_, _, ()>(
+                        if let Err(alert_error) = alert_conn.publish::<_, _, ()>(
                             "system:alert",
                             format!(r#"{{"level":"CRITICAL","strategy":"{}","msg":"LOCK_LOST_EXIT"}}"#, strategy_id),
-                        ).await.unwrap_or(());
+                        ).await {
+                            warn!(
+                                "[{}] failed to publish system:alert LOCK_LOST_EXIT: {}",
+                                strategy_id, alert_error
+                            );
+                        }
                     }
                     process::exit(1);
                 }
             }
         }
     });
+}
+
+async fn release_stranded_notional_if_any(
+    client: &redis::Client,
+    strategy_id: &str,
+    reason: &str,
+) -> Result<f64, redis::RedisError> {
+    let mut conn = client.get_multiplexed_async_connection().await?;
+    let reserved = read_strategy_reserved_notional(&mut conn, strategy_id).await;
+    if reserved > 0.0 {
+        let _ = release_sim_notional_for_strategy(&mut conn, strategy_id, reserved).await;
+        info!(
+            "[{}] released stranded reserved notional {:.2} during {}",
+            strategy_id,
+            reserved,
+            reason,
+        );
+    }
+    Ok(reserved.max(0.0))
 }
 
 #[tokio::main]
@@ -196,6 +234,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     info!("Acquired strategy process lock for {}", strategy_id);
+
+    if env_flag_enabled("SCANNER_RELEASE_STRANDED_RESERVE_ON_BOOT", true) {
+        if let Err(error) = release_stranded_notional_if_any(&client, &strategy_id, "boot").await {
+            warn!(
+                "[{}] failed to reconcile stranded reserve on boot: {}",
+                strategy_id, error
+            );
+        }
+    }
+
     spawn_strategy_lock_lease(client.clone(), strategy_id.clone(), owner.clone());
 
     let strategy: Box<dyn Strategy + Send + Sync> = match strategy_type.as_str() {
@@ -221,13 +269,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Graceful shutdown: listen for SIGTERM/SIGINT and stop strategy cleanly.
     let shutdown_strategy_id = strategy_id.clone();
     let shutdown = async move {
-        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to register SIGTERM handler");
-        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
-            .expect("Failed to register SIGINT handler");
-        tokio::select! {
-            _ = sigterm.recv() => info!("[{}] SIGTERM received", shutdown_strategy_id),
-            _ = sigint.recv() => info!("[{}] SIGINT received", shutdown_strategy_id),
+        let mut sigterm = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                warn!(
+                    "[{}] failed to register SIGTERM handler: {}",
+                    shutdown_strategy_id, error
+                );
+                None
+            }
+        };
+        let mut sigint = match signal::unix::signal(signal::unix::SignalKind::interrupt()) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                warn!(
+                    "[{}] failed to register SIGINT handler: {}",
+                    shutdown_strategy_id, error
+                );
+                None
+            }
+        };
+        match (sigterm.as_mut(), sigint.as_mut()) {
+            (Some(term), Some(int)) => {
+                tokio::select! {
+                    _ = term.recv() => info!("[{}] SIGTERM received", shutdown_strategy_id),
+                    _ = int.recv() => info!("[{}] SIGINT received", shutdown_strategy_id),
+                }
+            }
+            (Some(term), None) => {
+                term.recv().await;
+                info!("[{}] SIGTERM received", shutdown_strategy_id);
+            }
+            (None, Some(int)) => {
+                int.recv().await;
+                info!("[{}] SIGINT received", shutdown_strategy_id);
+            }
+            (None, None) => {
+                // Keep strategy running if signal hooks are unavailable.
+                std::future::pending::<()>().await;
+            }
         }
     };
 
@@ -238,6 +318,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = shutdown => {
             info!("[{}] Shutdown signal received, cleaning up...", strategy_id);
         },
+    }
+
+    if let Err(error) = release_stranded_notional_if_any(&client, &strategy_id, "shutdown").await {
+        warn!(
+            "[{}] failed to release stranded reserve during shutdown: {}",
+            strategy_id, error
+        );
     }
 
     let _ = release_strategy_lock(&client, &strategy_id, &owner).await;

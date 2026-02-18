@@ -30,6 +30,7 @@ export const SCANNER_HEARTBEAT_IDS = [
     'eth_15m',
     'sol_15m',
     'cex_arb',
+    'SYNDICATE',
     'copy_bot',
     'atomic_arb',
     'obi_scalper',
@@ -53,6 +54,7 @@ export const SIM_LEDGER_RESERVED_KEY = 'sim_ledger:reserved';
 export const SIM_LEDGER_REALIZED_PNL_KEY = 'sim_ledger:realized_pnl';
 export const SIM_LEDGER_RESERVED_BY_STRATEGY_PREFIX = 'sim_ledger:reserved:strategy:';
 export const SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX = 'sim_ledger:reserved:family:';
+export const SIM_LEDGER_RESERVED_BY_UNDERLYING_PREFIX = 'sim_ledger:reserved:underlying:';
 export const SIM_STRATEGY_CONCENTRATION_CAP_PCT = Math.min(
     1,
     Math.max(0.05, Number(process.env.SIM_STRATEGY_CONCENTRATION_CAP_PCT || '0.35')),
@@ -60,6 +62,10 @@ export const SIM_STRATEGY_CONCENTRATION_CAP_PCT = Math.min(
 export const SIM_FAMILY_CONCENTRATION_CAP_PCT = Math.min(
     1,
     Math.max(0.10, Number(process.env.SIM_FAMILY_CONCENTRATION_CAP_PCT || '0.60')),
+);
+export const SIM_UNDERLYING_CONCENTRATION_CAP_PCT = Math.min(
+    1,
+    Math.max(0.10, Number(process.env.SIM_UNDERLYING_CONCENTRATION_CAP_PCT || '0.70')),
 );
 export const SIM_GLOBAL_UTILIZATION_CAP_PCT = Math.min(
     1,
@@ -183,6 +189,7 @@ export const MODEL_PROBABILITY_GATE_ENABLED = process.env.MODEL_PROBABILITY_GATE
 export const MODEL_PROBABILITY_GATE_ENFORCE_PAPER = process.env.MODEL_PROBABILITY_GATE_ENFORCE_PAPER !== 'false';
 export const MODEL_PROBABILITY_GATE_ENFORCE_LIVE = process.env.MODEL_PROBABILITY_GATE_ENFORCE_LIVE !== 'false';
 export const LEGACY_BRAIN_LOOP_ENABLED = process.env.LEGACY_BRAIN_LOOP_ENABLED === 'true';
+export const LEGACY_BRAIN_LOOP_UNSAFE_OK = process.env.LEGACY_BRAIN_LOOP_UNSAFE_OK === 'true';
 export const MODEL_PROBABILITY_GATE_MIN_PROB = Math.min(
     0.95,
     Math.max(0.50, Number(process.env.MODEL_PROBABILITY_GATE_MIN_PROB || '0.55')),
@@ -196,6 +203,32 @@ export const MODEL_PROBABILITY_GATE_DISABLE_ON_DRIFT = process.env.MODEL_PROBABI
 export const MODEL_PROBABILITY_GATE_DRIFT_DISABLE_MS = Math.max(
     60_000,
     Number(process.env.MODEL_PROBABILITY_GATE_DRIFT_DISABLE_MS || '900000'),
+);
+export const MODEL_PROBABILITY_GATE_TUNER_ENABLED = process.env.MODEL_PROBABILITY_GATE_TUNER_ENABLED !== 'false';
+export const MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY = process.env.MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY === 'true';
+export const MODEL_PROBABILITY_GATE_TUNER_INTERVAL_MS = Math.max(
+    30_000,
+    Number(process.env.MODEL_PROBABILITY_GATE_TUNER_INTERVAL_MS || '120000'),
+);
+export const MODEL_PROBABILITY_GATE_TUNER_LOOKBACK_MS = Math.max(
+    300_000,
+    Number(process.env.MODEL_PROBABILITY_GATE_TUNER_LOOKBACK_MS || '21600000'),
+);
+export const MODEL_PROBABILITY_GATE_COUNTERFACTUAL_WINDOW_MS = Math.max(
+    30_000,
+    Number(process.env.MODEL_PROBABILITY_GATE_COUNTERFACTUAL_WINDOW_MS || '600000'),
+);
+export const MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES = Math.max(
+    20,
+    Number(process.env.MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES || '60'),
+);
+export const MODEL_PROBABILITY_GATE_TUNER_STEP = Math.min(
+    0.05,
+    Math.max(0.001, Number(process.env.MODEL_PROBABILITY_GATE_TUNER_STEP || '0.01')),
+);
+export const MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT = Math.min(
+    0.25,
+    Math.max(0.01, Number(process.env.MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT || '0.08')),
 );
 
 // ── ML Trainer ──────────────────────────────────────────────────────

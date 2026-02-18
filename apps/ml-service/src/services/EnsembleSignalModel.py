@@ -1,0 +1,481 @@
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+import logging
+import math
+import os
+import time
+from typing import Any
+
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+try:
+    from xgboost import XGBClassifier
+except Exception:  # pragma: no cover - fallback if xgboost wheel is unavailable
+    XGBClassifier = None
+
+
+logger = logging.getLogger(__name__)
+
+EPS = 1e-9
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        parsed = int(float(raw.strip()))
+        return max(lo, min(hi, parsed))
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        parsed = float(raw.strip())
+        if not math.isfinite(parsed):
+            return default
+        return max(lo, min(hi, parsed))
+    except Exception:
+        return default
+
+
+def _clip(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _safe_number(value: Any, fallback: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        return fallback
+    if not math.isfinite(parsed):
+        return fallback
+    return parsed
+
+
+def _safe_probability(value: float) -> float:
+    return _clip(_safe_number(value, 0.5), 0.001, 0.999)
+
+
+def _sigmoid(value: float) -> float:
+    clipped = _clip(value, -30.0, 30.0)
+    return 1.0 / (1.0 + math.exp(-clipped))
+
+
+@dataclass
+class PendingSample:
+    timestamp_ms: int
+    price: float
+    features: np.ndarray
+
+
+@dataclass
+class TrainedModel:
+    name: str
+    estimator: Any
+    weight: float
+
+
+class EnsembleSignalModel:
+    """
+    Streaming ensemble model for directional short-horizon signal generation.
+
+    Design:
+    - Labels are derived online from realized return over a fixed time horizon.
+    - Uses a robust tabular ensemble (XGBoost + RandomForest + LogisticRegression).
+    - Falls back to deterministic heuristic until enough data is available.
+    """
+
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+
+        self.label_horizon_ms = _env_int("ML_SIGNAL_LABEL_HORIZON_MS", 90_000, 15_000, 600_000)
+        self.label_neutral_band = _env_float("ML_SIGNAL_LABEL_NEUTRAL_BAND", 0.0005, 0.0, 0.01)
+        self.min_train_samples = _env_int("ML_SIGNAL_MIN_TRAIN_SAMPLES", 400, 80, 20_000)
+        self.max_train_samples = _env_int("ML_SIGNAL_MAX_TRAIN_SAMPLES", 5000, 500, 100_000)
+        self.retrain_every_samples = _env_int("ML_SIGNAL_RETRAIN_EVERY_SAMPLES", 64, 8, 2048)
+        self.min_retrain_interval_ms = _env_int("ML_SIGNAL_MIN_RETRAIN_INTERVAL_MS", 45_000, 5_000, 900_000)
+        self.min_class_samples = _env_int("ML_SIGNAL_MIN_CLASS_SAMPLES", 40, 10, 2000)
+        self.eval_min_samples = _env_int("ML_SIGNAL_EVAL_MIN_SAMPLES", 80, 20, 5000)
+
+        self.pending_samples: deque[PendingSample] = deque(maxlen=self.max_train_samples * 2)
+        self.train_features: deque[np.ndarray] = deque(maxlen=self.max_train_samples)
+        self.train_labels: deque[int] = deque(maxlen=self.max_train_samples)
+        self.new_labels_since_train = 0
+
+        self.models: list[TrainedModel] = []
+        self.model_name = "HEURISTIC_BOOTSTRAP"
+        self.last_train_ts_ms = 0
+        self.last_eval_logloss: float | None = None
+        self.last_eval_brier: float | None = None
+        self.last_eval_accuracy: float | None = None
+        self.last_eval_auc: float | None = None
+        self.exception_counts: dict[str, int] = {}
+        self.last_exception_scope: str | None = None
+        self.last_exception_message: str | None = None
+        self.last_exception_ts_ms = 0
+        self.last_exception_log_ts_ms = 0
+        self.exception_log_cooldown_ms = _env_int(
+            "ML_SIGNAL_EXCEPTION_LOG_COOLDOWN_MS",
+            60_000,
+            1_000,
+            3_600_000,
+        )
+
+    def _record_exception(self, scope: str, exc: Exception, now_ms: int | None = None) -> None:
+        ts_ms = int(now_ms if now_ms is not None else (time.time() * 1000))
+        self.exception_counts[scope] = self.exception_counts.get(scope, 0) + 1
+        self.last_exception_scope = scope
+        self.last_exception_message = f"{type(exc).__name__}: {exc}"[:240]
+        self.last_exception_ts_ms = ts_ms
+        if (
+            self.last_exception_log_ts_ms <= 0
+            or (ts_ms - self.last_exception_log_ts_ms) >= self.exception_log_cooldown_ms
+        ):
+            self.last_exception_log_ts_ms = ts_ms
+            logger.warning(
+                "[ML][telemetry] exception symbol=%s scope=%s count=%d msg=%s",
+                self.symbol,
+                scope,
+                self.exception_counts[scope],
+                self.last_exception_message,
+            )
+
+    def update(self, timestamp_ms: int, features: dict[str, Any]) -> dict[str, Any]:
+        now_ms = int(_safe_number(timestamp_ms, 0))
+        if now_ms <= 0:
+            return self._build_output(0.5, now_ms)
+
+        price = _safe_number(features.get("price"), 0.0)
+        if price <= 0.0:
+            return self._build_output(0.5, now_ms)
+
+        vector = self._build_feature_vector(features)
+        self.pending_samples.append(PendingSample(timestamp_ms=now_ms, price=price, features=vector))
+
+        self._materialize_labels(now_ms, price)
+        self._train_if_needed(now_ms)
+
+        probability_up = self._predict_probability(vector)
+        return self._build_output(probability_up, now_ms)
+
+    def _build_feature_vector(self, row: dict[str, Any]) -> np.ndarray:
+        price = _safe_number(row.get("price"), 0.0)
+        rsi = _safe_number(row.get("rsi_14"), 50.0)
+        momentum_10 = _safe_number(row.get("momentum_10"), 0.0)
+        vol_5m = _safe_number(row.get("vol_5m"), 0.0)
+        returns = _safe_number(row.get("returns"), 0.0)
+        sma_20 = _safe_number(row.get("sma_20"), price)
+        sma_50 = _safe_number(row.get("sma_50"), sma_20)
+        ema_12 = _safe_number(row.get("ema_12"), price)
+        ema_26 = _safe_number(row.get("ema_26"), price)
+        macd = _safe_number(row.get("macd"), 0.0)
+        macd_signal = _safe_number(row.get("macd_signal"), 0.0)
+        bb_upper = _safe_number(row.get("bb_upper"), 0.0)
+        bb_lower = _safe_number(row.get("bb_lower"), 0.0)
+
+        rsi_centered = _clip((rsi - 50.0) / 50.0, -1.0, 1.0)
+        momentum = _clip(momentum_10, -0.06, 0.06)
+        realized_vol = _clip(vol_5m, 0.0, 0.12)
+        latest_return = _clip(returns, -0.03, 0.03)
+
+        sma_gap_20 = 0.0 if sma_20 <= EPS else _clip((price - sma_20) / sma_20, -0.06, 0.06)
+        sma_gap_50 = 0.0 if sma_50 <= EPS else _clip((price - sma_50) / sma_50, -0.08, 0.08)
+        ema_gap = 0.0 if price <= EPS else _clip((ema_12 - ema_26) / price, -0.03, 0.03)
+        macd_norm = 0.0 if price <= EPS else _clip(macd / price, -0.03, 0.03)
+        macd_signal_norm = 0.0 if price <= EPS else _clip(macd_signal / price, -0.03, 0.03)
+
+        bb_position = 0.0
+        band_width = bb_upper - bb_lower
+        if band_width > EPS and price > 0.0:
+            normalized = ((price - bb_lower) / band_width) - 0.5
+            bb_position = _clip(normalized, -1.0, 1.0)
+
+        return np.array(
+            [
+                rsi_centered,
+                momentum,
+                realized_vol,
+                latest_return,
+                sma_gap_20,
+                sma_gap_50,
+                ema_gap,
+                macd_norm,
+                macd_signal_norm,
+                bb_position,
+            ],
+            dtype=np.float64,
+        )
+
+    def _materialize_labels(self, now_ms: int, now_price: float) -> None:
+        while self.pending_samples and (now_ms - self.pending_samples[0].timestamp_ms) >= self.label_horizon_ms:
+            old = self.pending_samples.popleft()
+            if old.price <= 0.0:
+                continue
+
+            realized_return = (now_price / old.price) - 1.0
+            if not math.isfinite(realized_return):
+                continue
+            if abs(realized_return) < self.label_neutral_band:
+                continue
+
+            label = 1 if realized_return > 0.0 else 0
+            self.train_features.append(old.features)
+            self.train_labels.append(label)
+            self.new_labels_since_train += 1
+
+    def _train_if_needed(self, now_ms: int) -> None:
+        sample_count = len(self.train_labels)
+        if sample_count < self.min_train_samples:
+            return
+
+        if self.last_train_ts_ms > 0 and self.new_labels_since_train < self.retrain_every_samples:
+            return
+
+        if self.last_train_ts_ms > 0 and (now_ms - self.last_train_ts_ms) < self.min_retrain_interval_ms:
+            return
+
+        x = np.vstack(self.train_features)
+        y = np.asarray(self.train_labels, dtype=np.int32)
+        positives = int(y.sum())
+        negatives = int(y.shape[0] - positives)
+        if positives < self.min_class_samples or negatives < self.min_class_samples:
+            return
+
+        eval_size = max(self.eval_min_samples, int(y.shape[0] * 0.20))
+        if y.shape[0] <= eval_size + self.min_class_samples:
+            return
+        split_idx = y.shape[0] - eval_size
+
+        x_train = x[:split_idx]
+        y_train = y[:split_idx]
+        x_eval = x[split_idx:]
+        y_eval = y[split_idx:]
+
+        if len(np.unique(y_train)) < 2:
+            return
+
+        candidates: list[tuple[str, Any]] = [
+            (
+                "LR",
+                Pipeline(
+                    steps=[
+                        ("scaler", StandardScaler()),
+                        (
+                            "model",
+                            LogisticRegression(
+                                max_iter=600,
+                                class_weight="balanced",
+                                C=0.85,
+                                solver="lbfgs",
+                            ),
+                        ),
+                    ]
+                ),
+            ),
+            (
+                "RF",
+                RandomForestClassifier(
+                    n_estimators=240,
+                    max_depth=7,
+                    min_samples_leaf=10,
+                    class_weight="balanced_subsample",
+                    random_state=42,
+                    n_jobs=1,
+                ),
+            ),
+        ]
+
+        if XGBClassifier is not None:
+            candidates.append(
+                (
+                    "XGB",
+                    XGBClassifier(
+                        n_estimators=260,
+                        max_depth=4,
+                        learning_rate=0.045,
+                        subsample=0.90,
+                        colsample_bytree=0.85,
+                        min_child_weight=6,
+                        gamma=0.0,
+                        reg_alpha=0.15,
+                        reg_lambda=1.4,
+                        objective="binary:logistic",
+                        eval_metric="logloss",
+                        tree_method="hist",
+                        random_state=42,
+                        n_jobs=1,
+                    ),
+                )
+            )
+
+        trained: list[dict[str, Any]] = []
+        for name, estimator in candidates:
+            try:
+                estimator.fit(x_train, y_train)
+                proba_eval = estimator.predict_proba(x_eval)[:, 1].astype(np.float64)
+                metrics = self._evaluate(y_eval, proba_eval)
+                quality = self._quality(metrics)
+                trained.append(
+                    {
+                        "name": name,
+                        "estimator": estimator,
+                        "quality": quality,
+                        "proba_eval": proba_eval,
+                        "metrics": metrics,
+                    }
+                )
+            except Exception as exc:
+                self._record_exception("train_model", exc, now_ms)
+                logger.warning("Model %s failed during training for %s: %s", name, self.symbol, exc)
+
+        if not trained:
+            return
+
+        quality_sum = sum(max(0.01, _safe_number(item["quality"], 0.01)) for item in trained)
+        for item in trained:
+            item["weight"] = max(0.01, _safe_number(item["quality"], 0.01)) / quality_sum
+
+        ensemble_eval = np.zeros_like(trained[0]["proba_eval"], dtype=np.float64)
+        for item in trained:
+            ensemble_eval += float(item["weight"]) * item["proba_eval"]
+        ensemble_metrics = self._evaluate(y_eval, ensemble_eval)
+
+        self.models = [
+            TrainedModel(
+                name=str(item["name"]),
+                estimator=item["estimator"],
+                weight=float(item["weight"]),
+            )
+            for item in trained
+        ]
+        self.model_name = "+".join(model.name for model in self.models)
+        self.last_train_ts_ms = now_ms
+        self.new_labels_since_train = 0
+        self.last_eval_logloss = ensemble_metrics.get("logloss")
+        self.last_eval_brier = ensemble_metrics.get("brier")
+        self.last_eval_accuracy = ensemble_metrics.get("accuracy")
+        self.last_eval_auc = ensemble_metrics.get("auc")
+
+        logger.info(
+            "[ML] %s trained %s with %d samples (eval=%d, auc=%s, logloss=%s)",
+            self.symbol,
+            self.model_name,
+            y.shape[0],
+            y_eval.shape[0],
+            f"{self.last_eval_auc:.4f}" if self.last_eval_auc is not None else "n/a",
+            f"{self.last_eval_logloss:.4f}" if self.last_eval_logloss is not None else "n/a",
+        )
+
+    def _evaluate(self, y_true: np.ndarray, proba: np.ndarray) -> dict[str, float | None]:
+        clipped = np.clip(proba.astype(np.float64), 0.001, 0.999)
+        pred = (clipped >= 0.5).astype(np.int32)
+        metrics: dict[str, float | None] = {
+            "accuracy": float(accuracy_score(y_true, pred)),
+            "brier": float(brier_score_loss(y_true, clipped)),
+            "logloss": float(log_loss(y_true, clipped, labels=[0, 1])),
+            "auc": None,
+        }
+        if len(np.unique(y_true)) >= 2:
+            try:
+                metrics["auc"] = float(roc_auc_score(y_true, clipped))
+            except ValueError as exc:
+                self._record_exception("evaluate_auc", exc)
+                metrics["auc"] = None
+        return metrics
+
+    def _quality(self, metrics: dict[str, float | None]) -> float:
+        auc = metrics.get("auc")
+        logloss_value = metrics.get("logloss")
+        brier = metrics.get("brier")
+        accuracy = metrics.get("accuracy")
+
+        quality = 0.0
+        if auc is not None:
+            quality += max(0.0, auc - 0.50) * 3.0
+        if logloss_value is not None:
+            quality += max(0.0, 0.72 - logloss_value) * 2.0
+        if brier is not None:
+            quality += max(0.0, 0.30 - brier) * 2.0
+        if accuracy is not None:
+            quality += max(0.0, accuracy - 0.50) * 1.5
+        return max(0.01, quality)
+
+    def _predict_probability(self, vector: np.ndarray) -> float:
+        if self.models:
+            weighted = 0.0
+            weight_sum = 0.0
+            batch = vector.reshape(1, -1)
+            for model in self.models:
+                try:
+                    proba = float(model.estimator.predict_proba(batch)[0, 1])
+                    if not math.isfinite(proba):
+                        continue
+                    weighted += model.weight * _safe_probability(proba)
+                    weight_sum += model.weight
+                except Exception as exc:
+                    self._record_exception("predict_probability", exc)
+                    continue
+            if weight_sum > 0:
+                return _safe_probability(weighted / weight_sum)
+
+        return self._bootstrap_probability(vector)
+
+    def _bootstrap_probability(self, vector: np.ndarray) -> float:
+        # Conservative heuristic for warm-up period before supervised labels are available.
+        score = (
+            0.95 * vector[0]   # RSI mean-reversion vs momentum bias
+            + 1.35 * vector[1]  # 10-step momentum
+            - 0.90 * vector[2]  # realized volatility drag
+            + 1.20 * vector[3]  # latest return continuation
+            + 0.70 * vector[4]  # distance vs SMA20
+            + 0.35 * vector[6]  # EMA spread
+            + 0.45 * vector[7]  # MACD normalized
+        )
+        return _safe_probability(_sigmoid(score))
+
+    def _build_output(self, prob_up: float, now_ms: int) -> dict[str, Any]:
+        probability_up = _safe_probability(prob_up)
+        edge = _clip((probability_up - 0.5) * 2.0, -1.0, 1.0)
+        confidence = abs(edge)
+        model_age_ms: int | None = None
+        if self.last_train_ts_ms > 0 and now_ms > 0:
+            model_age_ms = max(0, now_ms - self.last_train_ts_ms)
+
+        output: dict[str, Any] = {
+            "ml_prob_up": float(probability_up),
+            "ml_prob_down": float(1.0 - probability_up),
+            "ml_signal_edge": float(edge),
+            "ml_signal_confidence": float(confidence),
+            "ml_signal_direction": "UP" if edge > 0.0 else ("DOWN" if edge < 0.0 else "NEUTRAL"),
+            "ml_model": self.model_name,
+            "ml_model_ready": bool(self.models),
+            "ml_model_samples": int(len(self.train_labels)),
+            "ml_model_horizon_ms": int(self.label_horizon_ms),
+            "ml_model_last_train_ts": int(self.last_train_ts_ms) if self.last_train_ts_ms > 0 else None,
+            "ml_model_age_ms": model_age_ms,
+            "ml_model_eval_logloss": self.last_eval_logloss,
+            "ml_model_eval_auc": self.last_eval_auc,
+            "ml_model_eval_accuracy": self.last_eval_accuracy,
+            "ml_model_eval_brier": self.last_eval_brier,
+            "ml_telemetry_exception_total": int(sum(self.exception_counts.values())),
+            "ml_telemetry_last_exception_scope": self.last_exception_scope,
+            "ml_telemetry_last_exception_message": self.last_exception_message,
+            "ml_telemetry_last_exception_ts": int(self.last_exception_ts_ms) if self.last_exception_ts_ms > 0 else None,
+        }
+
+        for key, value in list(output.items()):
+            if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                output[key] = None
+        return output

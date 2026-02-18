@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 
 export interface AuthRequest extends Request {
-    user?: any;
+    user?: unknown;
 }
 
 export function extractBearerToken(raw: unknown): string | null {

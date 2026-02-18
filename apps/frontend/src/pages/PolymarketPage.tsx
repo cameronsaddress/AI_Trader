@@ -42,14 +42,18 @@ type LedgerHealthState = {
     caps: {
         strategy_pct: number;
         family_pct: number;
+        underlying_pct: number;
         utilization_pct: number;
     };
     strategy_reserved_total: number;
     family_reserved_total: number;
+    underlying_reserved_total: number;
     reserved_gap_vs_strategy: number;
     reserved_gap_vs_family: number;
+    reserved_gap_vs_underlying: number;
     top_strategy_exposure: LedgerConcentrationEntry[];
     top_family_exposure: LedgerConcentrationEntry[];
+    top_underlying_exposure: LedgerConcentrationEntry[];
 };
 
 type RuntimePhase = 'PHASE_1' | 'PHASE_2' | 'PHASE_3';
@@ -328,6 +332,54 @@ type ModelDriftState = {
     issues: string[];
     by_strategy: Record<string, ModelDriftPerStrategy>;
     updated_at: number;
+};
+
+type ModelGateCalibrationState = {
+    enabled: boolean;
+    advisory_only: boolean;
+    baseline_gate: number;
+    active_gate: number;
+    recommended_gate: number;
+    lookback_ms: number;
+    min_samples: number;
+    step_size: number;
+    max_drift: number;
+    sample_count: number;
+    accepted_samples: number;
+    rejected_samples: number;
+    expected_pnl_baseline: number;
+    expected_pnl_recommended: number;
+    delta_expected_pnl: number;
+    profitable_rejected_signals: number;
+    loss_avoided_signals: number;
+    updated_at: number;
+    reason: string;
+};
+
+type RejectedSignalStage =
+    | 'INTELLIGENCE_GATE'
+    | 'MODEL_GATE'
+    | 'PREFLIGHT'
+    | 'LIVE_EXECUTION'
+    | 'SETTLEMENT'
+    | 'UNKNOWN';
+
+type RejectedSignalEntry = {
+    stage: RejectedSignalStage;
+    execution_id: string;
+    strategy: string | null;
+    market_key: string | null;
+    reason: string;
+    mode: TradingMode;
+    timestamp: number;
+    payload: Record<string, unknown> | null;
+};
+
+type RejectedSignalSummaryState = {
+    tracked: number;
+    persisted_rows: number;
+    log_path: string;
+    by_stage: Record<string, number>;
 };
 
 type IntelligenceBlockEvent = {
@@ -925,14 +977,18 @@ function parseLedgerHealthState(input: unknown): LedgerHealthState {
             caps: {
                 strategy_pct: 35,
                 family_pct: 60,
+                underlying_pct: 70,
                 utilization_pct: 90,
             },
             strategy_reserved_total: 0,
             family_reserved_total: 0,
+            underlying_reserved_total: 0,
             reserved_gap_vs_strategy: 0,
             reserved_gap_vs_family: 0,
+            reserved_gap_vs_underlying: 0,
             top_strategy_exposure: [],
             top_family_exposure: [],
+            top_underlying_exposure: [],
         };
     }
     const payload = input as Partial<LedgerHealthState>;
@@ -953,14 +1009,18 @@ function parseLedgerHealthState(input: unknown): LedgerHealthState {
         caps: {
             strategy_pct: parseNumber(payload.caps?.strategy_pct) ?? 35,
             family_pct: parseNumber(payload.caps?.family_pct) ?? 60,
+            underlying_pct: parseNumber(payload.caps?.underlying_pct) ?? 70,
             utilization_pct: parseNumber(payload.caps?.utilization_pct) ?? 90,
         },
         strategy_reserved_total: parseNumber(payload.strategy_reserved_total) ?? 0,
         family_reserved_total: parseNumber(payload.family_reserved_total) ?? 0,
+        underlying_reserved_total: parseNumber(payload.underlying_reserved_total) ?? 0,
         reserved_gap_vs_strategy: parseNumber(payload.reserved_gap_vs_strategy) ?? 0,
         reserved_gap_vs_family: parseNumber(payload.reserved_gap_vs_family) ?? 0,
+        reserved_gap_vs_underlying: parseNumber(payload.reserved_gap_vs_underlying) ?? 0,
         top_strategy_exposure: parseLedgerConcentrationEntries(payload.top_strategy_exposure),
         top_family_exposure: parseLedgerConcentrationEntries(payload.top_family_exposure),
+        top_underlying_exposure: parseLedgerConcentrationEntries(payload.top_underlying_exposure),
     };
 }
 
@@ -1243,6 +1303,118 @@ function parseModelDriftState(input: unknown): ModelDriftState {
     };
 }
 
+function parseModelGateCalibrationState(input: unknown): ModelGateCalibrationState {
+    if (!input || typeof input !== 'object') {
+        return {
+            enabled: false,
+            advisory_only: true,
+            baseline_gate: 0.55,
+            active_gate: 0.55,
+            recommended_gate: 0.55,
+            lookback_ms: 0,
+            min_samples: 0,
+            step_size: 0,
+            max_drift: 0,
+            sample_count: 0,
+            accepted_samples: 0,
+            rejected_samples: 0,
+            expected_pnl_baseline: 0,
+            expected_pnl_recommended: 0,
+            delta_expected_pnl: 0,
+            profitable_rejected_signals: 0,
+            loss_avoided_signals: 0,
+            updated_at: 0,
+            reason: '',
+        };
+    }
+    const payload = input as Partial<ModelGateCalibrationState>;
+    return {
+        enabled: payload.enabled === true,
+        advisory_only: payload.advisory_only !== false,
+        baseline_gate: parseNumber(payload.baseline_gate) ?? 0.55,
+        active_gate: parseNumber(payload.active_gate) ?? 0.55,
+        recommended_gate: parseNumber(payload.recommended_gate) ?? 0.55,
+        lookback_ms: parseNumber(payload.lookback_ms) ?? 0,
+        min_samples: parseNumber(payload.min_samples) ?? 0,
+        step_size: parseNumber(payload.step_size) ?? 0,
+        max_drift: parseNumber(payload.max_drift) ?? 0,
+        sample_count: parseNumber(payload.sample_count) ?? 0,
+        accepted_samples: parseNumber(payload.accepted_samples) ?? 0,
+        rejected_samples: parseNumber(payload.rejected_samples) ?? 0,
+        expected_pnl_baseline: parseNumber(payload.expected_pnl_baseline) ?? 0,
+        expected_pnl_recommended: parseNumber(payload.expected_pnl_recommended) ?? 0,
+        delta_expected_pnl: parseNumber(payload.delta_expected_pnl) ?? 0,
+        profitable_rejected_signals: parseNumber(payload.profitable_rejected_signals) ?? 0,
+        loss_avoided_signals: parseNumber(payload.loss_avoided_signals) ?? 0,
+        updated_at: parseNumber(payload.updated_at) ?? 0,
+        reason: typeof payload.reason === 'string' ? payload.reason : '',
+    };
+}
+
+function parseRejectedSignalStage(value: unknown): RejectedSignalStage {
+    if (value === 'INTELLIGENCE_GATE') return value;
+    if (value === 'MODEL_GATE') return value;
+    if (value === 'PREFLIGHT') return value;
+    if (value === 'LIVE_EXECUTION') return value;
+    if (value === 'SETTLEMENT') return value;
+    return 'UNKNOWN';
+}
+
+function parseRejectedSignalEntry(input: unknown): RejectedSignalEntry | null {
+    if (!input || typeof input !== 'object') {
+        return null;
+    }
+    const payload = input as Partial<RejectedSignalEntry>;
+    const executionId = typeof payload.execution_id === 'string' ? payload.execution_id : null;
+    if (!executionId) {
+        return null;
+    }
+    const strategy = typeof payload.strategy === 'string' ? payload.strategy : null;
+    const marketKey = typeof payload.market_key === 'string' ? payload.market_key : null;
+    const mode = payload.mode === 'LIVE' ? 'LIVE' : 'PAPER';
+    const payloadRecord = payload.payload && typeof payload.payload === 'object' && !Array.isArray(payload.payload)
+        ? payload.payload as Record<string, unknown>
+        : null;
+    return {
+        stage: parseRejectedSignalStage(payload.stage),
+        execution_id: executionId,
+        strategy,
+        market_key: marketKey,
+        reason: typeof payload.reason === 'string' ? payload.reason : '',
+        mode,
+        timestamp: parseNumber(payload.timestamp) ?? Date.now(),
+        payload: payloadRecord,
+    };
+}
+
+function parseRejectedSignalSummary(input: unknown): RejectedSignalSummaryState {
+    if (!input || typeof input !== 'object') {
+        return {
+            tracked: 0,
+            persisted_rows: 0,
+            log_path: '',
+            by_stage: {},
+        };
+    }
+    const payload = input as Partial<RejectedSignalSummaryState>;
+    const byStageRaw = payload.by_stage && typeof payload.by_stage === 'object'
+        ? payload.by_stage
+        : {};
+    const byStage: Record<string, number> = {};
+    for (const [stage, value] of Object.entries(byStageRaw as Record<string, unknown>)) {
+        const count = parseNumber(value);
+        if (count !== null && count > 0) {
+            byStage[stage] = count;
+        }
+    }
+    return {
+        tracked: parseNumber(payload.tracked) ?? 0,
+        persisted_rows: parseNumber(payload.persisted_rows) ?? 0,
+        log_path: typeof payload.log_path === 'string' ? payload.log_path : '',
+        by_stage: byStage,
+    };
+}
+
 function dominantBlockLabel(entry: StrategyQualityEntry): string {
     const buckets: Array<{ label: string; value: number }> = [
         { label: 'threshold', value: entry.threshold_blocks },
@@ -1268,6 +1440,19 @@ function runtimeHealthClass(health: RuntimeHealth): string {
     }
     if (health === 'OFFLINE') {
         return 'text-rose-300';
+    }
+    return 'text-gray-400';
+}
+
+function rejectedStageClass(stage: RejectedSignalStage): string {
+    if (stage === 'INTELLIGENCE_GATE' || stage === 'MODEL_GATE') {
+        return 'text-rose-300';
+    }
+    if (stage === 'PREFLIGHT' || stage === 'LIVE_EXECUTION') {
+        return 'text-amber-300';
+    }
+    if (stage === 'SETTLEMENT') {
+        return 'text-cyan-300';
     }
     return 'text-gray-400';
 }
@@ -1373,14 +1558,18 @@ export const PolymarketPage: React.FC = () => {
         caps: {
             strategy_pct: 35,
             family_pct: 60,
+            underlying_pct: 70,
             utilization_pct: 90,
         },
         strategy_reserved_total: 0,
         family_reserved_total: 0,
+        underlying_reserved_total: 0,
         reserved_gap_vs_strategy: 0,
         reserved_gap_vs_family: 0,
+        reserved_gap_vs_underlying: 0,
         top_strategy_exposure: [],
         top_family_exposure: [],
+        top_underlying_exposure: [],
     });
     const [featureRegistry, setFeatureRegistry] = React.useState<FeatureRegistrySummary>({
         rows: 0,
@@ -1441,6 +1630,34 @@ export const PolymarketPage: React.FC = () => {
         issues: [],
         by_strategy: {},
         updated_at: 0,
+    });
+    const [modelGateCalibration, setModelGateCalibration] = React.useState<ModelGateCalibrationState>({
+        enabled: false,
+        advisory_only: true,
+        baseline_gate: 0.55,
+        active_gate: 0.55,
+        recommended_gate: 0.55,
+        lookback_ms: 0,
+        min_samples: 0,
+        step_size: 0,
+        max_drift: 0,
+        sample_count: 0,
+        accepted_samples: 0,
+        rejected_samples: 0,
+        expected_pnl_baseline: 0,
+        expected_pnl_recommended: 0,
+        delta_expected_pnl: 0,
+        profitable_rejected_signals: 0,
+        loss_avoided_signals: 0,
+        updated_at: 0,
+        reason: '',
+    });
+    const [rejectedSignals, setRejectedSignals] = React.useState<RejectedSignalEntry[]>([]);
+    const [rejectedSignalSummary, setRejectedSignalSummary] = React.useState<RejectedSignalSummaryState>({
+        tracked: 0,
+        persisted_rows: 0,
+        log_path: '',
+        by_stage: {},
     });
     const [intelligenceBlocks, setIntelligenceBlocks] = React.useState<IntelligenceBlockEvent[]>([]);
     const [tradingMode, setTradingMode] = React.useState<TradingMode>('PAPER');
@@ -1620,6 +1837,20 @@ export const PolymarketPage: React.FC = () => {
             .slice(0, 4),
         [modelDrift.by_strategy],
     );
+    const recentRejectedSignals = React.useMemo(
+        () => rejectedSignals.slice(0, 6),
+        [rejectedSignals],
+    );
+    const rejectedStageRows = React.useMemo(
+        () => Object.entries(rejectedSignalSummary.by_stage)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 5),
+        [rejectedSignalSummary.by_stage],
+    );
+    const modelGateDeltaBps = React.useMemo(
+        () => (modelGateCalibration.recommended_gate - modelGateCalibration.active_gate) * 10_000,
+        [modelGateCalibration.recommended_gate, modelGateCalibration.active_gate],
+    );
 
     React.useEffect(() => {
         let mounted = true;
@@ -1657,6 +1888,8 @@ export const PolymarketPage: React.FC = () => {
                     ml_pipeline?: unknown;
                     model_inference?: unknown;
                     model_drift?: unknown;
+                    model_gate_calibration?: unknown;
+                    rejected_signals?: unknown;
                     trading_mode?: TradingMode;
                     live_order_posting_enabled?: boolean;
                     build_runtime?: unknown;
@@ -1690,6 +1923,8 @@ export const PolymarketPage: React.FC = () => {
                 const parsedMlPipeline = parseMlPipelineState(data.ml_pipeline);
                 const parsedModelInference = parseModelInferenceState(data.model_inference);
                 const parsedModelDrift = parseModelDriftState(data.model_drift);
+                const parsedModelGateCalibration = parseModelGateCalibrationState(data.model_gate_calibration);
+                const parsedRejectedSignalsSummary = parseRejectedSignalSummary(data.rejected_signals);
                 const runtime = parseRuntimeStatus(data.build_runtime);
 
                 setStats((prev) => ({
@@ -1716,6 +1951,8 @@ export const PolymarketPage: React.FC = () => {
                 setMlPipeline(parsedMlPipeline);
                 setModelInference(parsedModelInference);
                 setModelDrift(parsedModelDrift);
+                setModelGateCalibration(parsedModelGateCalibration);
+                setRejectedSignalSummary(parsedRejectedSignalsSummary);
                 if (runtime) {
                     setRuntimeStatus(runtime);
                 }
@@ -1851,10 +2088,13 @@ export const PolymarketPage: React.FC = () => {
                 },
                 strategy_reserved_total: 0,
                 family_reserved_total: 0,
+                underlying_reserved_total: 0,
                 reserved_gap_vs_strategy: 0,
                 reserved_gap_vs_family: 0,
+                reserved_gap_vs_underlying: 0,
                 top_strategy_exposure: [],
                 top_family_exposure: [],
+                top_underlying_exposure: [],
             }));
             setFeatureRegistry({
                 rows: 0,
@@ -2080,6 +2320,33 @@ export const PolymarketPage: React.FC = () => {
         const handleModelDriftUpdate = (payload: unknown) => {
             setModelDrift(parseModelDriftState(payload));
         };
+        const handleModelGateCalibrationUpdate = (payload: unknown) => {
+            setModelGateCalibration(parseModelGateCalibrationState(payload));
+        };
+        const handleRejectedSignal = (payload: unknown) => {
+            const parsed = parseRejectedSignalEntry(payload);
+            if (!parsed) {
+                return;
+            }
+            setRejectedSignals((prev) => [
+                parsed,
+                ...prev.filter((entry) => !(
+                    entry.execution_id === parsed.execution_id
+                    && entry.timestamp === parsed.timestamp
+                    && entry.stage === parsed.stage
+                )),
+            ].slice(0, 200));
+        };
+        const handleRejectedSignalSnapshot = (payload: unknown) => {
+            if (!Array.isArray(payload)) {
+                return;
+            }
+            const rows = payload
+                .map((entry) => parseRejectedSignalEntry(entry))
+                .filter((entry): entry is RejectedSignalEntry => entry !== null)
+                .slice(0, 200);
+            setRejectedSignals(rows);
+        };
 
         socket.on('system_health_update', handleSystemHealth);
         socket.on('execution_log', handleExecutionLog);
@@ -2107,6 +2374,9 @@ export const PolymarketPage: React.FC = () => {
         socket.on('model_inference_snapshot', handleModelInferenceSnapshot);
         socket.on('model_inference_update', handleModelInferenceUpdate);
         socket.on('model_drift_update', handleModelDriftUpdate);
+        socket.on('model_gate_calibration_update', handleModelGateCalibrationUpdate);
+        socket.on('rejected_signal', handleRejectedSignal);
+        socket.on('rejected_signal_snapshot', handleRejectedSignalSnapshot);
         socket.on('trading_mode_update', handleTradingMode);
         socket.on('simulation_reset', handleSimulationReset);
         socket.on('simulation_reset_error', handleSimulationResetError);
@@ -2118,6 +2388,8 @@ export const PolymarketPage: React.FC = () => {
             socket.emit('request_vault');
             socket.emit('request_risk_guard');
             socket.emit('request_ledger');
+            socket.emit('request_model_gate_calibration');
+            socket.emit('request_rejected_signals', { limit: 200 });
         };
         socket.on('connect', requestAllState);
         requestAllState();
@@ -2149,6 +2421,9 @@ export const PolymarketPage: React.FC = () => {
             socket.off('model_inference_snapshot', handleModelInferenceSnapshot);
             socket.off('model_inference_update', handleModelInferenceUpdate);
             socket.off('model_drift_update', handleModelDriftUpdate);
+            socket.off('model_gate_calibration_update', handleModelGateCalibrationUpdate);
+            socket.off('rejected_signal', handleRejectedSignal);
+            socket.off('rejected_signal_snapshot', handleRejectedSignalSnapshot);
             socket.off('trading_mode_update', handleTradingMode);
             socket.off('simulation_reset', handleSimulationReset);
             socket.off('simulation_reset_error', handleSimulationResetError);
@@ -2536,7 +2811,7 @@ export const PolymarketPage: React.FC = () => {
                                 <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-2">Concentration Guard</div>
                                 <div className="space-y-1">
                                     <div className="text-[10px] text-gray-500 font-mono">
-                                        Caps: strat {ledgerHealth.caps.strategy_pct.toFixed(1)}% | family {ledgerHealth.caps.family_pct.toFixed(1)}% | util {ledgerHealth.caps.utilization_pct.toFixed(1)}%
+                                        Caps: strat {ledgerHealth.caps.strategy_pct.toFixed(1)}% | family {ledgerHealth.caps.family_pct.toFixed(1)}% | underlying {ledgerHealth.caps.underlying_pct.toFixed(1)}% | util {ledgerHealth.caps.utilization_pct.toFixed(1)}%
                                     </div>
                                     {ledgerHealth.top_strategy_exposure.length === 0 && (
                                         <div className="text-xs text-gray-500 font-mono">No active reserved exposure</div>
@@ -2545,6 +2820,14 @@ export const PolymarketPage: React.FC = () => {
                                         <div key={entry.id} className="flex justify-between items-center text-[11px] font-mono border-b border-white/10 pb-1">
                                             <span className="text-gray-200 truncate pr-2">{STRATEGY_NAME_MAP[entry.id] || entry.id}</span>
                                             <span className={`${entry.share_pct > ledgerHealth.caps.strategy_pct ? 'text-rose-300' : 'text-gray-300'}`}>
+                                                {entry.share_pct.toFixed(1)}%
+                                            </span>
+                                        </div>
+                                    ))}
+                                    {ledgerHealth.top_underlying_exposure.slice(0, 2).map((entry) => (
+                                        <div key={entry.id} className="flex justify-between items-center text-[11px] font-mono border-b border-white/10 pb-1">
+                                            <span className="text-cyan-200 truncate pr-2">Underly {entry.id}</span>
+                                            <span className={`${entry.share_pct > ledgerHealth.caps.underlying_pct ? 'text-rose-300' : 'text-gray-300'}`}>
                                                 {entry.share_pct.toFixed(1)}%
                                             </span>
                                         </div>
@@ -2628,6 +2911,99 @@ export const PolymarketPage: React.FC = () => {
                                             </div>
                                         );
                                     })}
+                                </div>
+                            </div>
+
+                            <div>
+                                <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-2">Model Gate Calibration</div>
+                                <div className="space-y-1">
+                                    <div className="text-[10px] text-gray-500 font-mono">
+                                        {modelGateCalibration.enabled ? 'TUNER_ON' : 'TUNER_OFF'} | {modelGateCalibration.advisory_only ? 'ADVISORY' : 'ACTIVE'}
+                                    </div>
+                                    <div className="grid grid-cols-3 gap-2 text-[10px] font-mono">
+                                        <div className="rounded border border-white/10 bg-black/20 p-2">
+                                            <div className="text-gray-500">Active</div>
+                                            <div className="text-cyan-300">{(modelGateCalibration.active_gate * 100).toFixed(1)}%</div>
+                                        </div>
+                                        <div className="rounded border border-white/10 bg-black/20 p-2">
+                                            <div className="text-gray-500">Recommended</div>
+                                            <div className="text-white">{(modelGateCalibration.recommended_gate * 100).toFixed(1)}%</div>
+                                        </div>
+                                        <div className="rounded border border-white/10 bg-black/20 p-2">
+                                            <div className="text-gray-500">Delta</div>
+                                            <div className={`${modelGateDeltaBps > 0.1 ? 'text-amber-300' : modelGateDeltaBps < -0.1 ? 'text-emerald-300' : 'text-gray-300'}`}>
+                                                {modelGateDeltaBps >= 0 ? '+' : ''}{modelGateDeltaBps.toFixed(1)}bps
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-2 text-[10px] font-mono">
+                                        <div className="rounded border border-white/10 bg-black/20 p-2">
+                                            <div className="text-gray-500">Samples</div>
+                                            <div className="text-white">{modelGateCalibration.sample_count}</div>
+                                            <div className="text-gray-500 mt-1">
+                                                ok {modelGateCalibration.accepted_samples} | rej {modelGateCalibration.rejected_samples}
+                                            </div>
+                                        </div>
+                                        <div className="rounded border border-white/10 bg-black/20 p-2">
+                                            <div className="text-gray-500">Expected PnL Delta</div>
+                                            <div className={`${modelGateCalibration.delta_expected_pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
+                                                {modelGateCalibration.delta_expected_pnl >= 0 ? '+' : '-'}${Math.abs(modelGateCalibration.delta_expected_pnl).toFixed(2)}
+                                            </div>
+                                            <div className="text-gray-500 mt-1">
+                                                base ${modelGateCalibration.expected_pnl_baseline.toFixed(2)} | rec ${modelGateCalibration.expected_pnl_recommended.toFixed(2)}
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="text-[10px] text-gray-500 font-mono">
+                                        rejected winners {modelGateCalibration.profitable_rejected_signals} | losses avoided {modelGateCalibration.loss_avoided_signals}
+                                    </div>
+                                    <div className="text-[10px] text-gray-500 font-mono">
+                                        updated {formatAgeMs(modelGateCalibration.updated_at, Date.now())}
+                                    </div>
+                                    {modelGateCalibration.reason && (
+                                        <div className="text-[10px] text-gray-400 truncate" title={modelGateCalibration.reason}>
+                                            {modelGateCalibration.reason}
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+
+                            <div>
+                                <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-2">Rejected Signal Feed</div>
+                                <div className="space-y-1">
+                                    <div className="text-[10px] text-gray-500 font-mono truncate" title={rejectedSignalSummary.log_path || undefined}>
+                                        tracked {rejectedSignalSummary.tracked} | persisted {rejectedSignalSummary.persisted_rows}
+                                    </div>
+                                    <div className="flex flex-wrap gap-1">
+                                        {rejectedStageRows.map(([stage, count]) => (
+                                            <span key={stage} className={`text-[10px] font-mono px-1.5 py-0.5 rounded border border-white/10 bg-black/20 ${rejectedStageClass(parseRejectedSignalStage(stage))}`}>
+                                                {stage}:{count}
+                                            </span>
+                                        ))}
+                                        {rejectedStageRows.length === 0 && (
+                                            <span className="text-[10px] text-gray-500 font-mono">No stage counts yet</span>
+                                        )}
+                                    </div>
+                                    {recentRejectedSignals.length === 0 && (
+                                        <div className="text-xs text-gray-500 font-mono">No rejected signal records yet</div>
+                                    )}
+                                    {recentRejectedSignals.map((entry, index) => (
+                                        <div key={`${entry.execution_id}:${entry.timestamp}:${index}`} className="border border-white/10 rounded p-2 bg-black/20">
+                                            <div className="flex justify-between items-center text-[10px] font-mono">
+                                                <span className={rejectedStageClass(entry.stage)}>{entry.stage}</span>
+                                                <span className="text-gray-400 truncate pl-2">
+                                                    {entry.strategy ? (STRATEGY_NAME_MAP[entry.strategy] || entry.strategy) : 'UNKNOWN'}
+                                                </span>
+                                            </div>
+                                            <div className="text-[10px] text-gray-400 truncate mt-1" title={entry.reason}>
+                                                {entry.reason}
+                                            </div>
+                                            <div className="flex justify-between items-center text-[10px] text-gray-500 font-mono mt-1">
+                                                <span>{entry.mode}</span>
+                                                <span>{formatAgeMs(entry.timestamp, Date.now())}</span>
+                                            </div>
+                                        </div>
+                                    ))}
                                 </div>
                             </div>
 

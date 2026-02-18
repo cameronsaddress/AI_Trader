@@ -444,6 +444,7 @@ export function HomeDashboard() {
                   { label: 'BTC 5m Engine', path: '/btc-5m-engine', icon: <Zap size={14} />, desc: 'Primary profit engine' },
                   { label: 'HFT Strategies', path: '/hft', icon: <Activity size={14} />, desc: 'A-S MM, Longshot, Arb' },
                   { label: 'Polymarket', path: '/polymarket', icon: <TrendingUp size={14} />, desc: 'Market scanner' },
+                  { label: 'Strategy Coverage', path: '/strategies', icon: <ArrowUpRight size={14} />, desc: 'Per-strategy execution + pnl' },
                 ].map((link) => (
                   <button
                     key={link.path}

@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ethers::prelude::*;
 use log::{error, info, warn};
-use redis::AsyncCommands;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -15,6 +14,7 @@ use crate::strategies::control::{
     compute_strategy_bet_size,
     is_strategy_enabled,
     publish_heartbeat,
+    publish_event,
     read_risk_config,
     read_sim_available_cash,
     read_simulation_reset_ts,
@@ -278,7 +278,7 @@ impl Strategy for SyndicateStrategy {
                                         "round_trip_cost_rate": event_cost_model.round_trip_cost_rate(),
                                     }
                                 });
-                                let _: () = event_conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                                publish_event(&mut event_conn, "strategy:pnl", pnl_msg.to_string()).await;
                             }
                         }
                         Err(e) => {
@@ -433,7 +433,7 @@ impl Strategy for SyndicateStrategy {
                             "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
                         }
                     });
-                    let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                    publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
 
                     let exec_msg = serde_json::json!({
                         "execution_id": execution_id,
@@ -451,7 +451,7 @@ impl Strategy for SyndicateStrategy {
                             "net_return": net_return,
                         }
                     });
-                    let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                    publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
                 }
             }
 
@@ -691,7 +691,7 @@ impl Strategy for SyndicateStrategy {
                         "max_wallet_share": max_wallet_share,
                     }),
                 );
-                let _: () = conn.publish("arbitrage:scan", scan_msg.to_string()).await.unwrap_or_default();
+                publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
 
                 if trading_mode == TradingMode::Live {
                     let execution_id = Uuid::new_v4().to_string();
@@ -729,7 +729,7 @@ impl Strategy for SyndicateStrategy {
                             }
                         }
                     });
-                    let _: () = conn.publish("arbitrage:execution", preview_msg.to_string()).await.unwrap_or_default();
+                    publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
                     {
                         let mut last_entry_ts = self.last_entry_ts.write().await;
                         last_entry_ts.insert(*token_id, now);
@@ -788,7 +788,7 @@ impl Strategy for SyndicateStrategy {
                         "max_wallet_share": max_wallet_share,
                     }
                 });
-                let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
 
                 info!(
                     "SYNDICATE ENTRY token={} wallets={} vol={:.2} price={:.3}",

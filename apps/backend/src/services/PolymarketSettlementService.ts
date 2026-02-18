@@ -63,6 +63,16 @@ export type SettlementEvent = {
     details?: Record<string, unknown>;
 };
 
+export type PolymarketSettlementReadiness = {
+    ready: boolean;
+    enabled: boolean;
+    autoRedeemEnabled: boolean;
+    canDirectRedeem: boolean;
+    signerAddress: string | null;
+    funderAddress: string | null;
+    failures: string[];
+};
+
 type SettlementSnapshot = {
     enabled: boolean;
     autoRedeemEnabled: boolean;
@@ -247,6 +257,28 @@ export class PolymarketSettlementService {
         };
     }
 
+    public getReadinessSnapshot(): PolymarketSettlementReadiness {
+        const failures: string[] = [];
+        if (!this.enabled) {
+            failures.push('settlement service disabled (missing signer/provider initialization)');
+        }
+        if (!this.funderAddress) {
+            failures.push('missing POLY_FUNDER_ADDRESS/PROXY_WALLET_ADDRESS');
+        }
+        if (this.autoRedeemEnabled && !this.canDirectRedeem) {
+            failures.push('auto-redeem enabled but signer cannot directly redeem for configured funder');
+        }
+        return {
+            ready: failures.length === 0,
+            enabled: this.enabled,
+            autoRedeemEnabled: this.autoRedeemEnabled,
+            canDirectRedeem: this.canDirectRedeem,
+            signerAddress: this.signerAddress,
+            funderAddress: this.funderAddress,
+            failures,
+        };
+    }
+
     public async init(): Promise<void> {
         const raw = await this.redis.get(REDIS_KEY);
         if (!raw) {
@@ -266,8 +298,8 @@ export class PolymarketSettlementService {
                     conditionId,
                 });
             }
-        } catch {
-            logger.warn('[Settlement] failed to parse persisted state; starting with empty state');
+        } catch (error) {
+            logger.warn(`[Settlement] failed to parse persisted state; starting with empty state error=${String(error)}`);
         }
     }
 
@@ -391,6 +423,16 @@ export class PolymarketSettlementService {
 
         const events: SettlementEvent[] = [];
         let dirty = false;
+        const setIfChanged = <K extends keyof AtomicSettlementPosition>(
+            position: AtomicSettlementPosition,
+            key: K,
+            value: AtomicSettlementPosition[K],
+        ) => {
+            if (position[key] !== value) {
+                position[key] = value;
+                dirty = true;
+            }
+        };
 
         try {
             for (const position of this.positions.values()) {
@@ -398,53 +440,59 @@ export class PolymarketSettlementService {
                     continue;
                 }
 
-                if (Date.now() - position.openedAt > this.staleMs && position.status !== 'REDEEMABLE') {
-                    position.status = 'MANUAL_ACTION_REQUIRED';
-                    position.note = 'Position stale without redeemable signal';
-                    position.updatedAt = Date.now();
-                    dirty = true;
+                const cycleNow = Date.now();
+                if (cycleNow - position.openedAt > this.staleMs && position.status !== 'REDEEMABLE') {
+                    setIfChanged(position, 'status', 'MANUAL_ACTION_REQUIRED');
+                    setIfChanged(position, 'note', 'Position stale without redeemable signal');
+                    setIfChanged(position, 'updatedAt', cycleNow);
                 }
 
                 const marketState = await this.fetchMarketState(position.conditionId);
-                position.closed = marketState.closed ?? position.closed;
-                position.winnerTokenId = marketState.winnerTokenId || position.winnerTokenId;
+                setIfChanged(position, 'closed', marketState.closed ?? position.closed);
+                if (marketState.winnerTokenId) {
+                    setIfChanged(position, 'winnerTokenId', marketState.winnerTokenId);
+                }
                 position.settlementCheckedAt = Date.now();
 
                 if (!marketState.closed || !marketState.winnerTokenId) {
-                    if (position.status === 'TRACKED' || position.status === 'AWAITING_RESOLUTION') {
-                        position.status = 'AWAITING_RESOLUTION';
+                    if (position.status === 'TRACKED') {
+                        setIfChanged(position, 'status', 'AWAITING_RESOLUTION');
+                        setIfChanged(position, 'updatedAt', Date.now());
                     }
-                    position.updatedAt = Date.now();
                     continue;
                 }
 
                 const redeemableShares = await this.fetchRedeemableShares(position.conditionId);
-                position.redeemableShares = redeemableShares;
-                position.updatedAt = Date.now();
+                setIfChanged(position, 'redeemableShares', redeemableShares);
 
                 if (redeemableShares < this.minRedeemableShares) {
-                    position.status = 'RESOLVED';
-                    position.note = 'No redeemable balance detected (likely already redeemed or dust)';
+                    setIfChanged(position, 'status', 'RESOLVED');
+                    setIfChanged(position, 'note', 'No redeemable balance detected (likely already redeemed or dust)');
+                    setIfChanged(position, 'updatedAt', Date.now());
                     continue;
                 }
 
-                position.status = 'REDEEMABLE';
-                position.note = `Redeemable balance detected: ${redeemableShares.toFixed(4)} shares`;
+                setIfChanged(position, 'status', 'REDEEMABLE');
+                setIfChanged(position, 'note', `Redeemable balance detected: ${redeemableShares.toFixed(4)} shares`);
+                setIfChanged(position, 'updatedAt', Date.now());
 
                 if (!this.autoRedeemEnabled) {
-                    position.status = 'MANUAL_ACTION_REQUIRED';
-                    position.note = 'POLY_AUTO_REDEEM_ENABLED=false';
+                    setIfChanged(position, 'status', 'MANUAL_ACTION_REQUIRED');
+                    setIfChanged(position, 'note', 'POLY_AUTO_REDEEM_ENABLED=false');
+                    setIfChanged(position, 'updatedAt', Date.now());
                     continue;
                 }
 
                 if (tradingMode !== 'LIVE' || !livePostingEnabled) {
-                    position.note = 'Awaiting LIVE mode with live posting enabled for auto-redeem';
+                    setIfChanged(position, 'note', 'Awaiting LIVE mode with live posting enabled for auto-redeem');
+                    setIfChanged(position, 'updatedAt', Date.now());
                     continue;
                 }
 
                 if (!this.enabled || !this.contract || !this.canDirectRedeem) {
-                    position.status = 'MANUAL_ACTION_REQUIRED';
-                    position.note = 'Direct redemption unavailable (proxy wallet relayer flow required)';
+                    setIfChanged(position, 'status', 'MANUAL_ACTION_REQUIRED');
+                    setIfChanged(position, 'note', 'Direct redemption unavailable (proxy wallet relayer flow required)');
+                    setIfChanged(position, 'updatedAt', Date.now());
                     continue;
                 }
 
@@ -453,14 +501,15 @@ export class PolymarketSettlementService {
                 }
 
                 const redeemResult = await this.tryRedeem(position.conditionId);
-                position.redeemAttempts += 1;
-                position.nextRedeemAttemptAt = Date.now() + this.retryCooldownMs;
+                setIfChanged(position, 'redeemAttempts', position.redeemAttempts + 1);
+                setIfChanged(position, 'nextRedeemAttemptAt', Date.now() + this.retryCooldownMs);
 
                 if (redeemResult.ok) {
-                    position.status = 'REDEEMED';
-                    position.redeemTxHash = redeemResult.txHash || undefined;
-                    position.lastError = undefined;
-                    position.note = 'Redeemed on-chain';
+                    setIfChanged(position, 'status', 'REDEEMED');
+                    setIfChanged(position, 'redeemTxHash', redeemResult.txHash || undefined);
+                    setIfChanged(position, 'lastError', undefined);
+                    setIfChanged(position, 'note', 'Redeemed on-chain');
+                    setIfChanged(position, 'updatedAt', Date.now());
                     events.push({
                         type: 'REDEEMED',
                         timestamp: Date.now(),
@@ -473,9 +522,11 @@ export class PolymarketSettlementService {
                         },
                     });
                 } else {
-                    position.status = 'FAILED';
-                    position.lastError = redeemResult.error || 'Unknown redeem failure';
-                    position.note = position.lastError;
+                    const failure = redeemResult.error || 'Unknown redeem failure';
+                    setIfChanged(position, 'status', 'FAILED');
+                    setIfChanged(position, 'lastError', failure);
+                    setIfChanged(position, 'note', failure);
+                    setIfChanged(position, 'updatedAt', Date.now());
                     events.push({
                         type: 'ERROR',
                         timestamp: Date.now(),
@@ -483,12 +534,11 @@ export class PolymarketSettlementService {
                         positionId: position.id,
                         message: 'Redeem attempt failed',
                         details: {
-                            error: position.lastError,
+                            error: failure,
                             attempts: position.redeemAttempts,
                         },
                     });
                 }
-                dirty = true;
             }
         } finally {
             this.running = false;

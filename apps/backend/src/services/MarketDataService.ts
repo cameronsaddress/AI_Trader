@@ -1,7 +1,14 @@
-import { HyperliquidClient } from './HyperliquidClient';
+import { HyperliquidClient, type HyperliquidCandleEvent, type HyperliquidTickerEvent } from './HyperliquidClient';
 import { logger } from '../utils/logger';
 import { redisClient } from '../config/redis';
 import { EventEmitter } from 'events';
+
+export interface MarketTickerMessage {
+    symbol: string;
+    price: number;
+    timestamp: string;
+    candle?: HyperliquidCandleEvent['candle'];
+}
 
 export class MarketDataService extends EventEmitter {
     private hlClient: HyperliquidClient;
@@ -24,29 +31,31 @@ export class MarketDataService extends EventEmitter {
             this.hlClient.subscribe(this.symbols);
         });
 
-        this.hlClient.on('ticker', async (data: any) => {
-            const normalized = {
+        this.hlClient.on('ticker', (data: HyperliquidTickerEvent) => {
+            const normalized: MarketTickerMessage = {
                 symbol: data.product_id,
                 price: data.price,
-                timestamp: data.timestamp
+                timestamp: data.timestamp,
             };
 
             // Publish to Redis for other services
             if (redisClient.isOpen) {
-                await redisClient.publish('market_data:ticker', JSON.stringify(normalized));
+                void redisClient.publish('market_data:ticker', JSON.stringify(normalized)).catch((error) => {
+                    logger.error('[MarketDataService] failed to publish market_data:ticker', error);
+                });
             }
 
             // Emit for Socket.IO
             this.emit('ticker', normalized);
         });
 
-        this.hlClient.on('candle', (data: any) => {
+        this.hlClient.on('candle', (data: HyperliquidCandleEvent) => {
             // Emit candle data specifically for the chart
-            const payload = {
+            const payload: MarketTickerMessage = {
                 symbol: data.symbol,
                 price: data.candle.close, // Also update price with close of candle
                 timestamp: new Date().toISOString(),
-                candle: data.candle
+                candle: data.candle,
             };
             this.emit('ticker', payload); // Reuse ticker channel or create new one
         });

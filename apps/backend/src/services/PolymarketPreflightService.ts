@@ -1,5 +1,6 @@
-import { ClobClient, OrderType, Side } from '@polymarket/clob-client';
+import { ClobClient, OrderType, Side, type TickSize } from '@polymarket/clob-client';
 import { Wallet } from '@ethersproject/wallet';
+import { createHash } from 'crypto';
 import { logger } from '../utils/logger';
 
 type PreflightOrderCandidate = {
@@ -11,7 +12,7 @@ type PreflightOrderCandidate = {
     sizeUnit: 'USD_NOTIONAL' | 'SHARES';
     notionalUsd: number;
     size: number;
-    tickSize?: string;
+    tickSize?: TickSize;
     negRisk?: boolean;
 };
 
@@ -33,7 +34,7 @@ export type PreflightOrderResult = {
     sizeUnit: 'USD_NOTIONAL' | 'SHARES';
     notionalUsd: number;
     size: number;
-    tickSize?: string;
+    tickSize?: TickSize;
     negRisk?: boolean;
     ok: boolean;
     error?: string;
@@ -107,7 +108,19 @@ type SignedOrderCandidate = {
     sizeUnit: 'USD_NOTIONAL' | 'SHARES';
     notionalUsd: number;
     size: number;
-    signedOrder: unknown;
+    signedOrder: Awaited<ReturnType<ClobClient['createOrder']>>;
+};
+
+type CreateOrderOptionsArg = NonNullable<Parameters<ClobClient['createOrder']>[1]>;
+type DedupeStoreLike = {
+    set(
+        key: string,
+        value: string,
+        options?: {
+            NX?: boolean;
+            PX?: number;
+        },
+    ): Promise<unknown>;
 };
 
 function asRecord(input: unknown): Record<string, unknown> | null {
@@ -152,6 +165,14 @@ function parseLiveOrderType(input: string | undefined): OrderType {
         return OrderType.FAK;
     }
     return OrderType.FOK;
+}
+
+function parseTickSize(input: unknown): TickSize | undefined {
+    const raw = asString(input);
+    if (raw === '0.1' || raw === '0.01' || raw === '0.001' || raw === '0.0001') {
+        return raw;
+    }
+    return undefined;
 }
 
 function maskSignature(signature: string | undefined): string | undefined {
@@ -211,7 +232,7 @@ function parseExecutionCandidate(input: unknown): ParsedExecutionCandidate | nul
             continue;
         }
 
-        const tickSize = asString(order.tick_size) || undefined;
+        const tickSize = parseTickSize(order.tick_size);
         const negRisk = typeof order.neg_risk === 'boolean' ? order.neg_risk : undefined;
 
         orders.push({
@@ -268,12 +289,19 @@ export class PolymarketPreflightService {
     private readonly retryOnError: boolean;
     private readonly livePostingEnabled: boolean;
     private readonly liveStrategyAllowlist: Set<string>;
+    private readonly redisDedupeEnabled: boolean;
+    private readonly dedupeStore: DedupeStoreLike | null;
+    private readonly dedupeKeyPrefix: string;
+    private readonly preflightDedupeTtlMs: number;
+    private readonly executionDedupeTtlMs: number;
+    private readonly preflightRetentionMs: number;
+    private readonly executionRetentionMs: number;
 
     private client: ClobClient | null = null;
     private initPromise: Promise<void> | null = null;
     private disabledReason: string | null = null;
 
-    constructor() {
+    constructor(dedupeStore?: DedupeStoreLike | null) {
         this.host = process.env.POLYMARKET_CLOB_HOST || 'https://clob.polymarket.com';
         this.chainId = Number(process.env.POLY_CHAIN_ID || '137');
         this.signatureType = Number(process.env.POLY_SIGNATURE_TYPE || '1');
@@ -286,11 +314,25 @@ export class PolymarketPreflightService {
         this.liveOrderType = parseLiveOrderType(process.env.POLY_LIVE_ORDER_TYPE);
         this.retryOnError = process.env.POLY_PREFLIGHT_RETRY_ON_ERROR === 'true';
         this.livePostingEnabled = process.env.LIVE_ORDER_POSTING_ENABLED === 'true';
+        this.redisDedupeEnabled = process.env.POLY_REDIS_DEDUPE_ENABLED !== 'false';
+        this.dedupeStore = dedupeStore || null;
+        this.dedupeKeyPrefix = (process.env.POLY_REDIS_DEDUPE_PREFIX || 'poly:dedupe').trim() || 'poly:dedupe';
+        this.preflightRetentionMs = Math.max(this.minIntervalMs * 4, 60_000);
+        this.executionRetentionMs = Math.max(this.executionMinIntervalMs * 4, 60_000);
+        this.preflightDedupeTtlMs = Math.max(
+            this.minIntervalMs,
+            Number(process.env.POLY_PREFLIGHT_REDIS_DEDUPE_TTL_MS || String(this.preflightRetentionMs)),
+        );
+        this.executionDedupeTtlMs = Math.max(
+            this.executionMinIntervalMs,
+            Number(process.env.POLY_EXECUTION_REDIS_DEDUPE_TTL_MS || String(this.executionRetentionMs)),
+        );
         this.liveStrategyAllowlist = new Set(
-            (process.env.POLY_LIVE_STRATEGY_ALLOWLIST || 'ATOMIC_ARB,GRAPH_ARB')
+            (process.env.POLY_LIVE_STRATEGY_ALLOWLIST || '*')
                 .split(',')
                 .map((entry) => entry.trim().toUpperCase())
-                .filter((entry) => entry.length > 0),
+                .filter((entry) => entry.length > 0)
+                .map((entry) => (entry === 'ALL' ? '*' : entry)),
         );
 
         if (!this.privateKey) {
@@ -356,24 +398,79 @@ export class PolymarketPreflightService {
         }
     }
 
-    private shouldThrottlePreflight(candidate: ParsedExecutionCandidate): boolean {
+    private dedupeKey(kind: 'preflight' | 'execution', fingerprint: string): string {
+        const digest = createHash('sha1').update(fingerprint).digest('hex');
+        return `${this.dedupeKeyPrefix}:${kind}:${digest}`;
+    }
+
+    private async claimDedupeSlot(kind: 'preflight' | 'execution', fingerprint: string, ttlMs: number): Promise<boolean> {
+        if (!this.redisDedupeEnabled || !this.dedupeStore) {
+            return true;
+        }
+        try {
+            const result = await this.dedupeStore.set(
+                this.dedupeKey(kind, fingerprint),
+                String(Date.now()),
+                { NX: true, PX: ttlMs },
+            );
+            if (typeof result === 'string') {
+                return result.toUpperCase() === 'OK';
+            }
+            return Boolean(result);
+        } catch (error) {
+            logger.warn(
+                `[PolymarketPreflight] redis dedupe claim failed kind=${kind} key=${this.dedupeKey(kind, fingerprint)} error=${String(error)}`,
+            );
+            return true;
+        }
+    }
+
+    private async shouldThrottlePreflight(candidate: ParsedExecutionCandidate): Promise<boolean> {
         const now = Date.now();
+        this.pruneThrottleMaps(now);
         const last = this.lastPreflightByFingerprint.get(candidate.fingerprint) || 0;
         if (now - last < this.minIntervalMs) {
+            return true;
+        }
+        const claimed = await this.claimDedupeSlot('preflight', candidate.fingerprint, this.preflightDedupeTtlMs);
+        if (!claimed) {
+            this.lastPreflightByFingerprint.set(candidate.fingerprint, now);
             return true;
         }
         this.lastPreflightByFingerprint.set(candidate.fingerprint, now);
         return false;
     }
 
-    private shouldThrottleExecution(candidate: ParsedExecutionCandidate): boolean {
+    private async shouldThrottleExecution(candidate: ParsedExecutionCandidate): Promise<boolean> {
         const now = Date.now();
+        this.pruneThrottleMaps(now);
         const last = this.lastExecutionByFingerprint.get(candidate.fingerprint) || 0;
         if (now - last < this.executionMinIntervalMs) {
             return true;
         }
+        const claimed = await this.claimDedupeSlot('execution', candidate.fingerprint, this.executionDedupeTtlMs);
+        if (!claimed) {
+            this.lastExecutionByFingerprint.set(candidate.fingerprint, now);
+            return true;
+        }
         this.lastExecutionByFingerprint.set(candidate.fingerprint, now);
         return false;
+    }
+
+    private pruneThrottleMaps(now: number): void {
+        const preflightCutoff = now - this.preflightRetentionMs;
+        const executionCutoff = now - this.executionRetentionMs;
+
+        for (const [fingerprint, ts] of this.lastPreflightByFingerprint.entries()) {
+            if (ts < preflightCutoff) {
+                this.lastPreflightByFingerprint.delete(fingerprint);
+            }
+        }
+        for (const [fingerprint, ts] of this.lastExecutionByFingerprint.entries()) {
+            if (ts < executionCutoff) {
+                this.lastExecutionByFingerprint.delete(fingerprint);
+            }
+        }
     }
 
     private isStrategyLiveEnabled(strategy: string): boolean {
@@ -423,6 +520,11 @@ export class PolymarketPreflightService {
                     ? order.negRisk
                     : await this.client!.getNegRisk(order.tokenId);
 
+                const createOrderOptions: CreateOrderOptionsArg = {
+                    tickSize,
+                    negRisk,
+                };
+
                 const signedOrder = await this.client!.createOrder(
                     {
                         tokenID: order.tokenId,
@@ -430,10 +532,7 @@ export class PolymarketPreflightService {
                         size: order.size,
                         side: order.side,
                     },
-                    {
-                        tickSize: tickSize as any,
-                        negRisk,
-                    },
+                    createOrderOptions,
                 );
 
                 signedOrders.push({
@@ -583,7 +682,7 @@ export class PolymarketPreflightService {
             return null;
         }
 
-        if (this.shouldThrottlePreflight(candidate)) {
+        if (await this.shouldThrottlePreflight(candidate)) {
             return null;
         }
 
@@ -619,7 +718,7 @@ export class PolymarketPreflightService {
             return null;
         }
 
-        if (this.shouldThrottleExecution(candidate)) {
+        if (await this.shouldThrottleExecution(candidate)) {
             return null;
         }
 
@@ -761,7 +860,7 @@ export class PolymarketPreflightService {
 
         const orderResults = await Promise.all(signedOrders.map(async (order): Promise<LiveExecutionOrderResult> => {
             try {
-                const response = await this.client!.postOrder(order.signedOrder as any, this.liveOrderType);
+                const response = await this.client!.postOrder(order.signedOrder, this.liveOrderType);
                 const orderId = asString(asRecord(response)?.orderID);
                 const status = asString(asRecord(response)?.status);
                 const txHashesRaw = asRecord(response)?.transactionsHashes;

@@ -1,6 +1,7 @@
 import { Sequelize } from 'sequelize';
 import dotenv from 'dotenv';
 import path from 'path';
+import { logger } from '../utils/logger';
 
 dotenv.config({ path: path.join(__dirname, '../../../.env') }); // Re-resolve root .env if needed, though docker handles this
 
@@ -8,7 +9,9 @@ const dbUrl = process.env.DATABASE_URL || 'postgres://postgres:postgres@localhos
 
 export const sequelize = new Sequelize(dbUrl, {
     dialect: 'postgres',
-    logging: process.env.NODE_ENV === 'development' ? console.log : false,
+    logging: process.env.NODE_ENV === 'development'
+        ? (message) => logger.debug(`[Sequelize] ${message}`)
+        : false,
     pool: {
         max: 20,
         min: 0,
@@ -26,20 +29,20 @@ export const connectDB = async () => {
     while (retries > 0) {
         try {
             await sequelize.authenticate();
-            console.log('PostgreSQL Connection has been established successfully.');
+            logger.info('PostgreSQL connection established');
 
             // Sync models - In production, use migrations instead of sync()
             if (process.env.NODE_ENV !== 'production') {
                 await sequelize.sync({ alter: true });
-                console.log('Database synced (alter: true)');
+                logger.info('PostgreSQL schema sync complete (alter=true)');
             }
             return;
         } catch (error) {
-            console.error(`Unable to connect to the database (retries left: ${retries}):`, error);
+            logger.error(`Unable to connect to the database (retries left: ${retries}): ${String(error)}`);
             retries -= 1;
             await new Promise(res => setTimeout(res, 5000));
         }
     }
-    console.error('Failed to connect to database after multiple attempts.');
+    logger.error('Failed to connect to database after multiple attempts.');
     process.exit(1);
 };

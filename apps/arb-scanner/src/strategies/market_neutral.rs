@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use chrono::{Timelike, Utc};
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
-use redis::AsyncCommands;
 use serde_json::Value;
 use statrs::distribution::{ContinuousCDF, Normal};
 use std::collections::VecDeque;
@@ -19,6 +18,7 @@ use crate::strategies::control::{
     compute_strategy_bet_size,
     is_strategy_enabled,
     publish_heartbeat,
+    publish_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -61,6 +61,8 @@ const MAX_HOLD_MS: i64 = 300_000;
 const DEFAULT_MAX_TRADES_PER_WINDOW: usize = 3;
 const DEFAULT_MAX_CONSECUTIVE_LOSSES: u32 = 3;
 const DEFAULT_MAX_POSITION_FRACTION: f64 = 0.20;
+const RESOLUTION_GRACE_SECS: i64 = 180;
+const RESOLUTION_CHECK_COOLDOWN_MS: i64 = 2_000;
 
 #[derive(Debug, Clone, Copy)]
 struct StrategyParams {
@@ -220,6 +222,7 @@ fn parse_coinbase_message_sequence(payload: &str) -> Option<u64> {
 struct Position {
     execution_id: String,
     market_id: String,
+    yes_token: String,
     entry_price: f64,
     size: f64,
     timestamp_ms: i64,
@@ -513,6 +516,7 @@ impl Strategy for MarketNeutralStrategy {
             let mut book = BinaryBook::default();
             let mut last_live_preview_ms = 0_i64;
             let mut last_entry_ms = 0_i64;
+            let mut last_resolution_lookup_ms = 0_i64;
             let mut trades_this_window = 0_usize;
             let mut consecutive_losses = 0_u32;
 
@@ -587,7 +591,7 @@ impl Strategy for MarketNeutralStrategy {
                                             "hold_ms": hold_ms,
                                         }
                                     });
-                                    let _: () = conn.publish("strategy:pnl", stale_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "strategy:pnl", stale_msg.to_string()).await;
                                     info!("{} STALE_FORCE_CLOSE after {}ms", strategy_id, hold_ms);
                                 }
                             }
@@ -641,7 +645,7 @@ impl Strategy for MarketNeutralStrategy {
                                     "active_market_id": target_market.market_id.clone(),
                                 }
                             });
-                            let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                            publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
                             warn!("{} MARKET_ROLLOVER close emitted to prevent cross-market state leakage", strategy_id);
                         }
 
@@ -653,16 +657,33 @@ impl Strategy for MarketNeutralStrategy {
                                 pos_lock.take()
                             };
                             if let Some(pos) = maybe_pos {
-                                let best_bid = book.yes.best_bid;
-                                let mid = book.yes.mid();
-                                let mut exit_price = if best_bid.is_finite() && best_bid > 0.0 {
-                                    best_bid
-                                } else if mid.is_finite() && mid > 0.0 {
-                                    mid
+                                let resolved_price = if now_ms - last_resolution_lookup_ms >= RESOLUTION_CHECK_COOLDOWN_MS {
+                                    last_resolution_lookup_ms = now_ms;
+                                    self
+                                        .client
+                                        .fetch_resolved_outcome_price(&pos.market_id, &pos.yes_token, true)
+                                        .await
                                 } else {
-                                    pos.entry_price
+                                    None
                                 };
-                                exit_price = exit_price.clamp(0.001, 0.999);
+                                let (exit_price, exit_source) = if let Some(price) = resolved_price {
+                                    (price.clamp(0.0, 1.0), "RESOLVED_OUTCOME")
+                                } else if now_ts <= expiry_ts + RESOLUTION_GRACE_SECS {
+                                    let mut pos_lock = self.open_position.write().await;
+                                    *pos_lock = Some(pos);
+                                    publish_heartbeat(&mut conn, &heartbeat_id).await;
+                                    continue;
+                                } else {
+                                    let best_bid = book.yes.best_bid;
+                                    let mid = book.yes.mid();
+                                    if best_bid.is_finite() && best_bid >= 0.0 {
+                                        (best_bid.clamp(0.0, 1.0), "BOOK_BID_AFTER_GRACE")
+                                    } else if mid.is_finite() && mid >= 0.0 {
+                                        (mid.clamp(0.0, 1.0), "BOOK_MID_AFTER_GRACE")
+                                    } else {
+                                        (pos.entry_price.clamp(0.0, 1.0), "ENTRY_FALLBACK_AFTER_GRACE")
+                                    }
+                                };
 
                                 let gross_return = ((exit_price - pos.entry_price) / pos.entry_price).max(-0.999);
                                 let pnl = realized_pnl(pos.size, gross_return, cost_model);
@@ -689,6 +710,7 @@ impl Strategy for MarketNeutralStrategy {
                                         "reason": "TIME_EXPIRY",
                                         "entry": pos.entry_price,
                                         "exit": exit_price,
+                                        "exit_source": exit_source,
                                         "hold_ms": now_ms - pos.timestamp_ms,
                                         "gross_return": gross_return,
                                         "net_return": net_return,
@@ -697,7 +719,7 @@ impl Strategy for MarketNeutralStrategy {
                                         "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
                                     }
                                 });
-                                let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                                publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
 
                                 let settle_msg = serde_json::json!({
                                     "execution_id": execution_id,
@@ -712,10 +734,11 @@ impl Strategy for MarketNeutralStrategy {
                                         "pnl": pnl,
                                         "net_return": net_return,
                                         "hold_ms": now_ms - pos.timestamp_ms,
+                                        "exit_source": exit_source,
                                         "reason": "TIME_EXPIRY",
                                     }
                                 });
-                                let _: () = conn.publish("arbitrage:execution", settle_msg.to_string()).await.unwrap_or_default();
+                                publish_event(&mut conn, "arbitrage:execution", settle_msg.to_string()).await;
                                 info!("{} TIME_EXPIRY close pnl=${:.2}", strategy_id, pnl);
                             }
                             break;
@@ -835,7 +858,7 @@ impl Strategy for MarketNeutralStrategy {
                                 "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
                             }),
                         );
-                        let _: () = conn.publish("arbitrage:scan", scan_msg.to_string()).await.unwrap_or_default();
+                        publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
 
                         let trading_mode = read_trading_mode(&mut conn).await;
                         if trading_mode == TradingMode::Live {
@@ -893,7 +916,7 @@ impl Strategy for MarketNeutralStrategy {
                                             }
                                         }
                                     });
-                                    let _: () = conn.publish("arbitrage:execution", preview_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
                                     last_live_preview_ms = now_ms;
                                     last_entry_ms = now_ms;
                                 }
@@ -1012,7 +1035,7 @@ impl Strategy for MarketNeutralStrategy {
                                     "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
                                 }
                             });
-                            let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                            publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
                         }
 
                         if let Some(entry_price) = entry_signal_price {
@@ -1044,6 +1067,7 @@ impl Strategy for MarketNeutralStrategy {
                                     *pos_lock = Some(Position {
                                         execution_id: id.clone(),
                                         market_id: target_market.market_id.clone(),
+                                        yes_token: target_market.yes_token.clone(),
                                         entry_price,
                                         size,
                                         timestamp_ms: now_ms,
@@ -1077,7 +1101,7 @@ impl Strategy for MarketNeutralStrategy {
                                         "slug": self.current_window_slug(),
                                     }
                                 });
-                                let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                                publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
                             } else {
                                 let _ = release_sim_notional_for_strategy(&mut conn, &strategy_id, size).await;
                             }

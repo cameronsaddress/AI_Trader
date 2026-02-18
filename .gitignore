@@ -14,6 +14,7 @@ packages/*/node_modules/
 apps/backend/dist/
 apps/frontend/dist/
 apps/arb-scanner/target/
+packages/shared/dist/
 apps/*/tsconfig.tsbuildinfo
 *.tsbuildinfo
 
@@ -34,3 +35,7 @@ CLAUDE.md
 # OS/editor
 .DS_Store
 .vscode/
+
+# Python artifacts
+**/__pycache__/
+*.pyc

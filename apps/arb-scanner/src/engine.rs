@@ -24,6 +24,14 @@ pub struct MarketTarget {
     pub best_ask: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MarketResolution {
+    pub closed: bool,
+    pub winner_token_id: Option<String>,
+    pub yes_price: Option<f64>,
+    pub no_price: Option<f64>,
+}
+
 pub struct PolymarketClient {
     pub http_client: HttpClient,
 }
@@ -40,8 +48,8 @@ fn first_two_from_array(values: &[Value]) -> Option<(String, String)> {
         return None;
     }
 
-    let second = ids.pop().unwrap_or_default();
-    let first = ids.pop().unwrap_or_default();
+    let second = ids.pop()?;
+    let first = ids.pop()?;
     if first.is_empty() || second.is_empty() {
         None
     } else {
@@ -118,6 +126,34 @@ fn parse_f64(value: Option<&Value>) -> Option<f64> {
         .or_else(|| value.as_str().and_then(|raw| raw.trim().parse::<f64>().ok()))
 }
 
+fn parse_price_pair(value: Option<&Value>) -> Option<(f64, f64)> {
+    let value = value?;
+
+    if let Some(arr) = value.as_array() {
+        if arr.len() >= 2 {
+            let yes = parse_f64(arr.first()).filter(|v| v.is_finite())?;
+            let no = parse_f64(arr.get(1)).filter(|v| v.is_finite())?;
+            return Some((yes, no));
+        }
+    }
+
+    if let Some(raw) = value.as_str() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Ok(parsed) = serde_json::from_str::<Vec<Value>>(trimmed) {
+            if parsed.len() >= 2 {
+                let yes = parse_f64(parsed.first()).filter(|v| v.is_finite())?;
+                let no = parse_f64(parsed.get(1)).filter(|v| v.is_finite())?;
+                return Some((yes, no));
+            }
+        }
+    }
+
+    None
+}
+
 fn parse_expiry_ts(raw: Option<&Value>) -> Option<i64> {
     let raw = raw?.as_str()?.trim();
     if raw.is_empty() {
@@ -126,6 +162,10 @@ fn parse_expiry_ts(raw: Option<&Value>) -> Option<i64> {
     DateTime::parse_from_rfc3339(raw)
         .map(|dt| dt.timestamp())
         .ok()
+}
+
+fn preview_text(raw: &str, limit: usize) -> String {
+    raw.chars().take(limit).collect::<String>()
 }
 
 fn extract_token_pair(market: &Value) -> Option<(String, String)> {
@@ -254,24 +294,172 @@ impl PolymarketClient {
         info!("Falling back to CLOB API: {}", url);
         match self.http_client.get(&url).send().await {
             Ok(resp) => {
-                if let Ok(text) = resp.text().await {
-                    if let Ok(val) = serde_json::from_str::<Value>(&text) {
-                        let markets = val
-                            .get("data")
-                            .and_then(|d| d.as_array())
-                            .or_else(|| val.as_array());
+                let status = resp.status();
+                let text = match resp.text().await {
+                    Ok(body) => body,
+                    Err(err) => {
+                        warn!("CLOB API fallback read failed for {}: {}", condition_id, err);
+                        return None;
+                    }
+                };
+                if !status.is_success() {
+                    warn!(
+                        "CLOB API fallback status {} for {} body={}",
+                        status.as_u16(),
+                        condition_id,
+                        preview_text(&text, 180)
+                    );
+                    return None;
+                }
+                if let Ok(val) = serde_json::from_str::<Value>(&text) {
+                    let markets = val
+                        .get("data")
+                        .and_then(|d| d.as_array())
+                        .or_else(|| val.as_array());
 
-                        if let Some(market) = markets.and_then(|m| m.first()) {
-                            if let Some(pair) = extract_token_pair(market) {
-                                return Some(pair);
-                            }
+                    if let Some(market) = markets.and_then(|m| m.first()) {
+                        if let Some(pair) = extract_token_pair(market) {
+                            return Some(pair);
                         }
                     }
+                } else {
+                    warn!(
+                        "CLOB API fallback JSON parse failed for {} body={}",
+                        condition_id,
+                        preview_text(&text, 180)
+                    );
                 }
             }
             Err(e) => error!("CLOB API Fallback failed: {}", e),
         }
         None
+    }
+
+    pub async fn fetch_market_resolution(&self, condition_id: &str) -> Option<MarketResolution> {
+        let trimmed = condition_id.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let url = format!("{}?condition_id={}", CLOB_API_URL, trimmed);
+        let response = match self.http_client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                warn!("Market resolution fetch failed for {}: {}", trimmed, err);
+                return None;
+            }
+        };
+        let status = response.status();
+        let text = match response.text().await {
+            Ok(body) => body,
+            Err(err) => {
+                warn!("Market resolution body read failed for {}: {}", trimmed, err);
+                return None;
+            }
+        };
+        if !status.is_success() {
+            warn!(
+                "Market resolution status {} for {} body={}",
+                status.as_u16(),
+                trimmed,
+                preview_text(&text, 180)
+            );
+            return None;
+        }
+        let parsed = match serde_json::from_str::<Value>(&text) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    "Market resolution JSON parse failed for {}: {} body={}",
+                    trimmed,
+                    err,
+                    preview_text(&text, 180)
+                );
+                return None;
+            }
+        };
+        let markets = parsed
+            .get("data")
+            .and_then(|data| data.as_array())
+            .or_else(|| parsed.as_array());
+        let Some(markets) = markets else {
+            warn!("Market resolution payload missing market array for {}", trimmed);
+            return None;
+        };
+        let market = markets.first()?;
+
+        let closed = parse_bool(market.get("closed")).unwrap_or(false);
+        let mut winner_token_id: Option<String> = None;
+        if let Some(tokens) = market.get("tokens").and_then(|value| value.as_array()) {
+            for token in tokens {
+                let winner = parse_bool(token.get("winner")).unwrap_or(false);
+                if !winner {
+                    continue;
+                }
+                winner_token_id = token
+                    .get("token_id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| token.get("tokenId").and_then(|v| v.as_str()))
+                    .map(|id| id.trim().to_ascii_lowercase())
+                    .filter(|id| !id.is_empty());
+                if winner_token_id.is_some() {
+                    break;
+                }
+            }
+        }
+
+        let (mut yes_price, mut no_price) = parse_price_pair(
+            market
+                .get("outcomePrices")
+                .or_else(|| market.get("outcome_prices")),
+        ).unwrap_or((f64::NAN, f64::NAN));
+        if !yes_price.is_finite() {
+            yes_price = parse_f64(
+                market
+                    .get("yes_price")
+                    .or_else(|| market.get("yesPrice")),
+            ).unwrap_or(f64::NAN);
+        }
+        if !no_price.is_finite() {
+            no_price = parse_f64(
+                market
+                    .get("no_price")
+                    .or_else(|| market.get("noPrice")),
+            ).unwrap_or(f64::NAN);
+        }
+
+        Some(MarketResolution {
+            closed,
+            winner_token_id,
+            yes_price: if yes_price.is_finite() { Some(yes_price.clamp(0.0, 1.0)) } else { None },
+            no_price: if no_price.is_finite() { Some(no_price.clamp(0.0, 1.0)) } else { None },
+        })
+    }
+
+    pub async fn fetch_resolved_outcome_price(
+        &self,
+        condition_id: &str,
+        token_id: &str,
+        is_yes_token: bool,
+    ) -> Option<f64> {
+        let resolution = self.fetch_market_resolution(condition_id).await?;
+
+        if let Some(winner_token_id) = resolution.winner_token_id.as_deref() {
+            let normalized_token = token_id.trim().to_ascii_lowercase();
+            if !normalized_token.is_empty() {
+                return Some(if winner_token_id == normalized_token { 1.0 } else { 0.0 });
+            }
+        }
+
+        if !resolution.closed {
+            return None;
+        }
+
+        if is_yes_token {
+            resolution.yes_price
+        } else {
+            resolution.no_price
+        }
     }
 
     pub async fn fetch_active_binary_markets(&self, limit: usize) -> Vec<MarketTarget> {
@@ -287,7 +475,22 @@ impl PolymarketClient {
 
         match self.http_client.get(&url).send().await {
             Ok(resp) => {
-                let text = resp.text().await.unwrap_or_default();
+                let status = resp.status();
+                let text = match resp.text().await {
+                    Ok(body) => body,
+                    Err(err) => {
+                        warn!("Active market universe body read failed: {}", err);
+                        return targets;
+                    }
+                };
+                if !status.is_success() {
+                    warn!(
+                        "Active market universe status {} body={}",
+                        status.as_u16(),
+                        preview_text(&text, 180)
+                    );
+                    return targets;
+                }
                 if let Ok(events) = serde_json::from_str::<Value>(&text) {
                     if let Some(event_arr) = events.as_array() {
                         for event in event_arr {
@@ -335,6 +538,11 @@ impl PolymarketClient {
                             }
                         }
                     }
+                } else {
+                    warn!(
+                        "Active market universe JSON parse failed body={}",
+                        preview_text(&text, 180)
+                    );
                 }
             }
             Err(e) => error!("Active market universe fetch failed: {}", e),
@@ -372,7 +580,23 @@ impl PolymarketClient {
 
         match self.http_client.get(&url).send().await {
             Ok(resp) => {
-                let text = resp.text().await.unwrap_or_default();
+                let status = resp.status();
+                let text = match resp.text().await {
+                    Ok(body) => body,
+                    Err(err) => {
+                        warn!("Market slug body read failed for {}: {}", trimmed, err);
+                        return None;
+                    }
+                };
+                if !status.is_success() {
+                    warn!(
+                        "Market slug status {} for {} body={}",
+                        status.as_u16(),
+                        trimmed,
+                        preview_text(&text, 180)
+                    );
+                    return None;
+                }
                 if let Ok(events) = serde_json::from_str::<Value>(&text) {
                     if let Some(event_arr) = events.as_array() {
                         if let Some(event) = event_arr.first() {
@@ -416,6 +640,12 @@ impl PolymarketClient {
                             }
                         }
                     }
+                } else {
+                    warn!(
+                        "Market slug JSON parse failed for {} body={}",
+                        trimmed,
+                        preview_text(&text, 180)
+                    );
                 }
             }
             Err(e) => error!("API Refresh failed: {}", e),

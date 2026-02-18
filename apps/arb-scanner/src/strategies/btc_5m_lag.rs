@@ -21,6 +21,7 @@ use crate::strategies::control::{
     compute_strategy_bet_size,
     is_strategy_enabled,
     publish_heartbeat,
+    publish_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -476,14 +477,27 @@ async fn persist_open_position(
     pos: &Position,
 ) {
     let key = open_position_redis_key(strategy_id);
-    let payload = serde_json::to_string(&PersistedPosition::from_position(pos)).unwrap_or_default();
-    let _: () = conn.set(&key, payload).await.unwrap_or_default();
-    let _: () = conn.expire(&key, OPEN_POSITION_TTL_SECS).await.unwrap_or_default();
+    let payload = match serde_json::to_string(&PersistedPosition::from_position(pos)) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            warn!("[{}] failed to encode persisted open position: {}", strategy_id, error);
+            return;
+        }
+    };
+    if let Err(error) = conn.set::<_, _, ()>(&key, payload).await {
+        warn!("[{}] failed to persist open position {}: {}", strategy_id, key, error);
+        return;
+    }
+    if let Err(error) = conn.expire::<_, ()>(&key, OPEN_POSITION_TTL_SECS).await {
+        warn!("[{}] failed to set TTL for {}: {}", strategy_id, key, error);
+    }
 }
 
 async fn clear_open_position(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) {
     let key = open_position_redis_key(strategy_id);
-    let _: () = conn.del(&key).await.unwrap_or_default();
+    if let Err(error) = conn.del::<_, ()>(&key).await {
+        warn!("[{}] failed to clear open position {}: {}", strategy_id, key, error);
+    }
 }
 
 async fn read_cached_window_start_spot(
@@ -506,7 +520,9 @@ async fn cache_window_start_spot(
     let key = window_start_spot_redis_key(window_start_ts);
     let ok: bool = conn.set_nx(&key, spot).await.unwrap_or(false);
     if ok {
-        let _: () = conn.expire(&key, WINDOW_START_SPOT_TTL_SECS).await.unwrap_or_default();
+        if let Err(error) = conn.expire::<_, ()>(&key, WINDOW_START_SPOT_TTL_SECS).await {
+            warn!("[BTC_5M] failed to set window spot TTL {}: {}", key, error);
+        }
     }
 }
 
@@ -1015,6 +1031,15 @@ struct MlFeatures {
     sma_20: f64,
     price: f64,
     timestamp: i64,
+    ml_prob_up: Option<f64>,
+    ml_signal_confidence: Option<f64>,
+    ml_signal_edge: Option<f64>,
+    ml_model: Option<String>,
+    ml_model_ready: bool,
+    ml_model_samples: Option<f64>,
+    ml_model_eval_auc: Option<f64>,
+    ml_model_eval_logloss: Option<f64>,
+    ml_model_eval_brier: Option<f64>,
 }
 
 async fn read_ml_features(conn: &mut redis::aio::MultiplexedConnection, symbol: &str) -> Option<MlFeatures> {
@@ -1023,10 +1048,22 @@ async fn read_ml_features(conn: &mut redis::aio::MultiplexedConnection, symbol: 
     let raw = raw?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
     Some(MlFeatures {
-        rsi_14: parsed.get("rsi_14")?.as_f64()?,
-        sma_20: parsed.get("sma_20")?.as_f64()?,
-        price: parsed.get("price")?.as_f64().unwrap_or(0.0),
-        timestamp: parsed.get("timestamp")?.as_i64().unwrap_or(0),
+        rsi_14: parsed.get("rsi_14").and_then(|v| v.as_f64()).unwrap_or(50.0),
+        sma_20: parsed.get("sma_20").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        price: parsed.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        timestamp: parsed.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0),
+        ml_prob_up: parsed.get("ml_prob_up").and_then(|v| v.as_f64()),
+        ml_signal_confidence: parsed.get("ml_signal_confidence").and_then(|v| v.as_f64()),
+        ml_signal_edge: parsed.get("ml_signal_edge").and_then(|v| v.as_f64()),
+        ml_model: parsed.get("ml_model").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        ml_model_ready: parsed
+            .get("ml_model_ready")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        ml_model_samples: parsed.get("ml_model_samples").and_then(|v| v.as_f64()),
+        ml_model_eval_auc: parsed.get("ml_model_eval_auc").and_then(|v| v.as_f64()),
+        ml_model_eval_logloss: parsed.get("ml_model_eval_logloss").and_then(|v| v.as_f64()),
+        ml_model_eval_brier: parsed.get("ml_model_eval_brier").and_then(|v| v.as_f64()),
     })
 }
 
@@ -1255,6 +1292,7 @@ impl Strategy for Btc5mLagStrategy {
             );
         }
         let mut last_live_preview_ms = 0_i64;
+        let mut last_hold_scan_ms = 0_i64;
 
         loop {
             let target_market = self.fetch_target_market().await;
@@ -1312,9 +1350,9 @@ impl Strategy for Btc5mLagStrategy {
 
             loop {
                 tokio::select! {
-                    Some(msg) = poly_ws.next() => {
+                    msg = poly_ws.next() => {
                         match msg {
-                            Ok(Message::Text(text)) => {
+                            Some(Ok(Message::Text(text))) => {
                                 update_book_from_market_ws(
                                     &text,
                                     &target_market.yes_token,
@@ -1322,14 +1360,18 @@ impl Strategy for Btc5mLagStrategy {
                                     &mut book,
                                 );
                             }
-                            Ok(Message::Ping(payload)) => {
+                            Some(Ok(Message::Ping(payload))) => {
                                 let _ = poly_ws.send(Message::Pong(payload)).await;
                             }
-                            Ok(Message::Close(_)) => break,
-                            Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => {}
-                            Ok(_) => {}
-                            Err(e) => {
+                            Some(Ok(Message::Close(_))) => break,
+                            Some(Ok(Message::Binary(_))) | Some(Ok(Message::Pong(_))) => {}
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => {
                                 error!("BTC_5M Polymarket WS error: {}", e);
+                                break;
+                            }
+                            None => {
+                                warn!("BTC_5M Polymarket WS stream ended");
                                 break;
                             }
                         }
@@ -1477,7 +1519,7 @@ impl Strategy for Btc5mLagStrategy {
                                         "slug": slug.clone(),
                                     }
                                 });
-                                let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                                publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
 
                                 let settle_msg = serde_json::json!({
                                     "execution_id": execution_id,
@@ -1498,7 +1540,7 @@ impl Strategy for Btc5mLagStrategy {
                                         "slug": slug,
                                     }
                                 });
-                                let _: () = conn.publish("arbitrage:execution", settle_msg.to_string()).await.unwrap_or_default();
+                                publish_event(&mut conn, "arbitrage:execution", settle_msg.to_string()).await;
 
                                 publish_heartbeat(&mut conn, self.heartbeat_id()).await;
                                 break;
@@ -1554,7 +1596,7 @@ impl Strategy for Btc5mLagStrategy {
                                     "slug": target_market.slug,
                                 }
                             });
-                            let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                            publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
 
                             let settle_msg = serde_json::json!({
                                 "execution_id": execution_id,
@@ -1575,7 +1617,7 @@ impl Strategy for Btc5mLagStrategy {
                                     "slug": target_market.slug,
                                 }
                             });
-                            let _: () = conn.publish("arbitrage:execution", settle_msg.to_string()).await.unwrap_or_default();
+                            publish_event(&mut conn, "arbitrage:execution", settle_msg.to_string()).await;
                             break;
                         }
 
@@ -1592,6 +1634,34 @@ impl Strategy for Btc5mLagStrategy {
                         if open_position.is_none() {
                             let cooldown_until = read_risk_guard_cooldown(&mut conn, self.strategy_id()).await;
                             if cooldown_until > 0 && now_ms < cooldown_until {
+                                if now_ms - last_hold_scan_ms >= 1000 {
+                                    let spot_hint = self.latest_spot_price.read().await.0;
+                                    let scan_msg = build_scan_payload(
+                                        &target_market.market_id,
+                                        "BTC 5m Engine",
+                                        self.strategy_id(),
+                                        "WINDOW_EXPECTED_RETURN",
+                                        "RATIO",
+                                        [spot_hint.max(0.0), 0.5],
+                                        0.5,
+                                        "FAIR_PROB",
+                                        0.0,
+                                        Self::expected_net_return_threshold(),
+                                        false,
+                                        format!("Cooldown hold: risk guard active until {}", cooldown_until),
+                                        now_ms,
+                                        serde_json::json!({
+                                            "warmup_reason": "RISK_GUARD_COOLDOWN",
+                                            "cooldown_until": cooldown_until,
+                                            "spot": spot_hint,
+                                            "slug": target_market.slug,
+                                            "window_start_ts": window_start_ts,
+                                            "expiry_ts": expiry_ts,
+                                        }),
+                                    );
+                                    publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
+                                    last_hold_scan_ms = now_ms;
+                                }
                                 publish_heartbeat(&mut conn, self.heartbeat_id()).await;
                                 continue;
                             }
@@ -1600,6 +1670,34 @@ impl Strategy for Btc5mLagStrategy {
                             let max_dd = Self::max_drawdown_pct();
                             if check_drawdown_breached(&mut conn, max_dd).await {
                                 warn!("[BTC_5M] Max drawdown ({:.1}%) breached — skipping entry", max_dd);
+                                if now_ms - last_hold_scan_ms >= 1000 {
+                                    let spot_hint = self.latest_spot_price.read().await.0;
+                                    let scan_msg = build_scan_payload(
+                                        &target_market.market_id,
+                                        "BTC 5m Engine",
+                                        self.strategy_id(),
+                                        "WINDOW_EXPECTED_RETURN",
+                                        "RATIO",
+                                        [spot_hint.max(0.0), 0.5],
+                                        0.5,
+                                        "FAIR_PROB",
+                                        0.0,
+                                        Self::expected_net_return_threshold(),
+                                        false,
+                                        format!("Risk hold: max drawdown {:.1}% breached", max_dd),
+                                        now_ms,
+                                        serde_json::json!({
+                                            "warmup_reason": "MAX_DRAWDOWN_BREACH",
+                                            "max_drawdown_pct": max_dd,
+                                            "spot": spot_hint,
+                                            "slug": target_market.slug,
+                                            "window_start_ts": window_start_ts,
+                                            "expiry_ts": expiry_ts,
+                                        }),
+                                    );
+                                    publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
+                                    last_hold_scan_ms = now_ms;
+                                }
                                 publish_heartbeat(&mut conn, self.heartbeat_id()).await;
                                 continue;
                             }
@@ -1609,6 +1707,39 @@ impl Strategy for Btc5mLagStrategy {
                             || now_ms - book.yes_update_ms > BOOK_STALE_MS
                             || now_ms - book.no_update_ms > BOOK_STALE_MS
                         {
+                            if now_ms - last_hold_scan_ms >= 1000 {
+                                let yes_age_ms = now_ms.saturating_sub(book.yes_update_ms);
+                                let no_age_ms = now_ms.saturating_sub(book.no_update_ms);
+                                let spot_hint = self.latest_spot_price.read().await.0;
+                                let scan_msg = build_scan_payload(
+                                    &target_market.market_id,
+                                    "BTC 5m Engine",
+                                    self.strategy_id(),
+                                    "WINDOW_EXPECTED_RETURN",
+                                    "RATIO",
+                                    [spot_hint.max(0.0), 0.5],
+                                    0.5,
+                                    "FAIR_PROB",
+                                    0.0,
+                                    Self::expected_net_return_threshold(),
+                                    false,
+                                    "Hold: book invalid or stale".to_string(),
+                                    now_ms,
+                                    serde_json::json!({
+                                        "warmup_reason": "BOOK_INVALID_OR_STALE",
+                                        "spot": spot_hint,
+                                        "yes_valid": book.yes.is_valid(),
+                                        "no_valid": book.no.is_valid(),
+                                        "yes_age_ms": yes_age_ms,
+                                        "no_age_ms": no_age_ms,
+                                        "slug": target_market.slug,
+                                        "window_start_ts": window_start_ts,
+                                        "expiry_ts": expiry_ts,
+                                    }),
+                                );
+                                publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
+                                last_hold_scan_ms = now_ms;
+                            }
                             publish_heartbeat(&mut conn, self.heartbeat_id()).await;
                             continue;
                         }
@@ -1623,10 +1754,22 @@ impl Strategy for Btc5mLagStrategy {
                             continue;
                         }
 
-                        let (spot, spot_ts_ms) = *self.latest_spot_price.read().await;
+                        let (raw_spot, spot_ts_ms) = *self.latest_spot_price.read().await;
+                        let mut spot = raw_spot;
                         if spot <= 0.0 || now_ms - spot_ts_ms > SPOT_STALE_MS {
-                            publish_heartbeat(&mut conn, self.heartbeat_id()).await;
-                            continue;
+                            // If Coinbase stalls, continue with the reliability-weighted CEX median
+                            // instead of freezing BTC_5M scans and starving downstream consumers.
+                            let cex_snapshot = { cex_prices.read().await.clone() };
+                            let venue_entries: Vec<(&str, f64, i64)> = cex_snapshot
+                                .iter()
+                                .map(|(venue, (px, ts_ms))| (*venue, *px, *ts_ms))
+                                .collect();
+                            if let Some(fallback_spot) = reliability_weighted_median(&venue_entries, now_ms, SPOT_STALE_MS) {
+                                spot = fallback_spot;
+                            } else {
+                                publish_heartbeat(&mut conn, self.heartbeat_id()).await;
+                                continue;
+                            }
                         }
 
                         // 3D: Early exit on strong adverse signal — only after 30s of holding.
@@ -1696,7 +1839,7 @@ impl Strategy for Btc5mLagStrategy {
                                             "slug": pos.slug.clone(),
                                         }
                                     });
-                                    let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
 
                                     let settle_msg = serde_json::json!({
                                         "execution_id": execution_id,
@@ -1720,7 +1863,7 @@ impl Strategy for Btc5mLagStrategy {
                                             "slug": pos.slug.clone(),
                                         }
                                     });
-                                    let _: () = conn.publish("arbitrage:execution", settle_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "arbitrage:execution", settle_msg.to_string()).await;
                                     clear_open_position(&mut conn, self.strategy_id()).await;
                                     open_position = None;
                                     warn!(
@@ -1768,6 +1911,36 @@ impl Strategy for Btc5mLagStrategy {
                             }
                         };
                         if window_start_spot <= 0.0 {
+                            let scan_msg = build_scan_payload(
+                                &target_market.market_id,
+                                "BTC 5m Engine",
+                                self.strategy_id(),
+                                "WINDOW_EXPECTED_RETURN",
+                                "RATIO",
+                                [spot, 0.5],
+                                0.5,
+                                "FAIR_PROB",
+                                0.0,
+                                Self::expected_net_return_threshold(),
+                                false,
+                                format!(
+                                    "Warmup hold: missing window_start_spot for {} (waiting for boundary sample)",
+                                    target_market.slug
+                                ),
+                                now_ms,
+                                serde_json::json!({
+                                    "spot": spot,
+                                    "cex_mid": cex_mid,
+                                    "cex_prices": Value::Object(cex_prices_json.clone()),
+                                    "window_start_spot": 0.0,
+                                    "window_start_spot_ready": false,
+                                    "warmup_reason": "WINDOW_START_SPOT_MISSING",
+                                    "slug": target_market.slug,
+                                    "window_start_ts": window_start_ts,
+                                    "expiry_ts": expiry_ts,
+                                }),
+                            );
+                            publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
                             publish_heartbeat(&mut conn, self.heartbeat_id()).await;
                             continue;
                         }
@@ -2015,14 +2188,151 @@ impl Strategy for Btc5mLagStrategy {
                             0.0
                         };
 
-                        let total_signal_penalty = momentum_penalty + regime_penalty + spread_penalty;
+                        // ── ML Model Signal Adjustment ──
+                        // Use supervised probability signal as an additive filter:
+                        // - disagreement raises threshold (penalty)
+                        // - strong alignment can grant a bounded threshold bonus
+                        let model_signal_enabled: bool = std::env::var("BTC_5M_MODEL_SIGNAL_FILTER_ENABLED")
+                            .ok()
+                            .map(|v| v != "0" && v.to_lowercase() != "false")
+                            .unwrap_or(true);
+                        let model_signal_conf_min: f64 = std::env::var("BTC_5M_MODEL_SIGNAL_CONFIDENCE_MIN")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(0.22)
+                            .clamp(0.05_f64, 0.95_f64);
+                        let model_signal_penalty_bps: f64 = std::env::var("BTC_5M_MODEL_SIGNAL_PENALTY_BPS")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(90.0)
+                            .clamp(0.0_f64, 500.0_f64);
+                        let model_signal_bonus_bps: f64 = std::env::var("BTC_5M_MODEL_SIGNAL_BONUS_BPS")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(35.0)
+                            .clamp(0.0_f64, 300.0_f64);
+                        let model_signal_min_samples: f64 = std::env::var("BTC_5M_MODEL_SIGNAL_MIN_SAMPLES")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(240.0)
+                            .clamp(40.0_f64, 20_000.0_f64);
+                        let model_signal_min_auc: f64 = std::env::var("BTC_5M_MODEL_SIGNAL_MIN_AUC")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(0.52)
+                            .clamp(0.50_f64, 0.95_f64);
+                        let model_signal_max_logloss: f64 = std::env::var("BTC_5M_MODEL_SIGNAL_MAX_LOGLOSS")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(0.72)
+                            .clamp(0.40_f64, 1.50_f64);
+                        let model_signal_max_brier: f64 = std::env::var("BTC_5M_MODEL_SIGNAL_MAX_BRIER")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(0.28)
+                            .clamp(0.10_f64, 0.50_f64);
+
+                        let mut model_signal_penalty: f64 = 0.0;
+                        let mut model_signal_bonus: f64 = 0.0;
+                        let mut model_signal_label = "NONE";
+                        let mut model_signal_side_prob: f64 = 0.5;
+                        let mut model_signal_confidence: f64 = 0.0;
+                        let mut model_signal_edge: f64 = 0.0;
+                        let mut model_signal_ready = false;
+                        let mut model_signal_name = "NONE".to_string();
+                        let mut model_signal_quality_ok = false;
+                        let mut model_signal_model_auc = 0.0;
+                        let mut model_signal_model_logloss = 0.0;
+                        let mut model_signal_model_brier = 0.0;
+                        let mut model_signal_model_samples = 0.0;
+
+                        if model_signal_enabled {
+                            if ml_is_fresh {
+                                if let Some(features) = ml.as_ref() {
+                                    if let Some(name) = features.ml_model.as_ref() {
+                                        model_signal_name = name.clone();
+                                    }
+                                    model_signal_edge = features.ml_signal_edge.unwrap_or(0.0).clamp(-1.0, 1.0);
+                                    model_signal_ready = features.ml_model_ready;
+                                    model_signal_model_auc = features.ml_model_eval_auc.unwrap_or(0.0);
+                                    model_signal_model_logloss = features.ml_model_eval_logloss.unwrap_or(0.0);
+                                    model_signal_model_brier = features.ml_model_eval_brier.unwrap_or(0.0);
+                                    model_signal_model_samples = features.ml_model_samples.unwrap_or(0.0);
+
+                                    if features.ml_model_ready {
+                                        let samples_ok = features
+                                            .ml_model_samples
+                                            .map(|value| value >= model_signal_min_samples)
+                                            .unwrap_or(false);
+                                        let auc_ok = features
+                                            .ml_model_eval_auc
+                                            .map(|value| value >= model_signal_min_auc)
+                                            .unwrap_or(false);
+                                        let logloss_ok = features
+                                            .ml_model_eval_logloss
+                                            .map(|value| value <= model_signal_max_logloss)
+                                            .unwrap_or(false);
+                                        let brier_ok = features
+                                            .ml_model_eval_brier
+                                            .map(|value| value <= model_signal_max_brier)
+                                            .unwrap_or(false);
+                                        model_signal_quality_ok = samples_ok && auc_ok && logloss_ok && brier_ok;
+
+                                        if model_signal_quality_ok {
+                                            if let Some(prob_up_raw) = features.ml_prob_up {
+                                                let prob_up = prob_up_raw.clamp(0.0, 1.0);
+                                                model_signal_side_prob = match best_side {
+                                                    Side::Up => prob_up,
+                                                    Side::Down => 1.0 - prob_up,
+                                                };
+                                                let inferred_conf = (model_signal_side_prob - 0.5).abs() * 2.0;
+                                                model_signal_confidence = features
+                                                    .ml_signal_confidence
+                                                    .unwrap_or(inferred_conf)
+                                                    .clamp(0.0, 1.0);
+                                                if model_signal_confidence >= model_signal_conf_min {
+                                                    let conf_scale = ((model_signal_confidence - model_signal_conf_min)
+                                                        / (1.0_f64 - model_signal_conf_min).max(0.05_f64))
+                                                        .clamp(0.0_f64, 1.0_f64);
+                                                    let side_edge = ((model_signal_side_prob - 0.5) * 2.0).clamp(-1.0, 1.0);
+                                                    if side_edge >= 0.0 {
+                                                        model_signal_bonus =
+                                                            (model_signal_bonus_bps / 10_000.0) * side_edge * conf_scale;
+                                                        model_signal_label = "MODEL_ALIGNED";
+                                                    } else {
+                                                        model_signal_penalty =
+                                                            (model_signal_penalty_bps / 10_000.0) * (-side_edge) * conf_scale;
+                                                        model_signal_label = "MODEL_DISAGREE";
+                                                    }
+                                                } else {
+                                                    model_signal_label = "MODEL_LOW_CONF";
+                                                }
+                                            } else {
+                                                model_signal_label = "MODEL_NO_PROB";
+                                            }
+                                        } else {
+                                            model_signal_label = "MODEL_QUALITY_LOW";
+                                        }
+                                    } else {
+                                        model_signal_label = "MODEL_NOT_READY";
+                                    }
+                                } else {
+                                    model_signal_label = "MODEL_MISSING";
+                                }
+                            } else {
+                                model_signal_label = "MODEL_STALE";
+                            }
+                        }
+
+                        let total_signal_penalty =
+                            momentum_penalty + regime_penalty + spread_penalty + model_signal_penalty;
                         let non_negative_signal_penalty = total_signal_penalty.max(0.0);
                         let now_utc = Utc::now();
                         let hour_utc = now_utc.hour();
                         let day_of_week = now_utc.weekday().num_days_from_sunday();
                         let seasonality = seasonality_multiplier(hour_utc, day_of_week);
                         let threshold_before_seasonality =
-                            (effective_min_edge_base + non_negative_signal_penalty).max(0.0);
+                            (effective_min_edge_base + non_negative_signal_penalty - model_signal_bonus).max(0.0);
                         // Seasonality > 1.0 means favorable window: lower threshold.
                         let effective_min_edge = (threshold_before_seasonality / seasonality).max(0.0);
 
@@ -2089,13 +2399,14 @@ impl Strategy for Btc5mLagStrategy {
                             )
                         } else if best_net_expected < effective_min_edge {
                             format!(
-                                "{} expected net {:.1}bps below adaptive threshold {:.1}bps (base+vol {:.1} + fair {:.1} + signal {:.1}, seasonality {:.2}x)",
+                                "{} expected net {:.1}bps below adaptive threshold {:.1}bps (base+vol {:.1} + fair {:.1} + signal {:.1} - model bonus {:.1}, seasonality {:.2}x)",
                                 best_side_label,
                                 best_net_expected * 10_000.0,
                                 effective_min_edge * 10_000.0,
                                 base_edge_with_vol * 10_000.0,
                                 fair_price_penalty * 10_000.0,
                                 non_negative_signal_penalty * 10_000.0,
+                                model_signal_bonus * 10_000.0,
                                 seasonality,
                             )
                         } else {
@@ -2201,10 +2512,26 @@ impl Strategy for Btc5mLagStrategy {
                                 "regime_penalty_bps": regime_penalty * 10_000.0,
                                 "regime_label": regime_label,
                                 "spread_penalty_bps": spread_penalty * 10_000.0,
+                                "model_signal_penalty_bps": model_signal_penalty * 10_000.0,
+                                "model_signal_bonus_bps": model_signal_bonus * 10_000.0,
+                                "model_signal_label": model_signal_label,
+                                "model_signal_model": model_signal_name,
+                                "model_signal_ready": model_signal_ready,
+                                "model_signal_quality_ok": model_signal_quality_ok,
+                                "model_signal_model_auc": model_signal_model_auc,
+                                "model_signal_model_logloss": model_signal_model_logloss,
+                                "model_signal_model_brier": model_signal_model_brier,
+                                "model_signal_model_samples": model_signal_model_samples,
+                                "model_signal_side_prob": model_signal_side_prob,
+                                "model_signal_confidence": model_signal_confidence,
+                                "model_signal_edge": model_signal_edge,
                                 "total_signal_penalty_bps": total_signal_penalty * 10_000.0,
                                 "total_signal_penalty_non_negative_bps": non_negative_signal_penalty * 10_000.0,
                                 "rsi_14": ml.as_ref().map(|f| f.rsi_14).unwrap_or(-1.0),
                                 "sma_20": ml.as_ref().map(|f| f.sma_20).unwrap_or(-1.0),
+                                "ml_prob_up": ml.as_ref().and_then(|f| f.ml_prob_up).unwrap_or(0.5),
+                                "ml_signal_confidence_raw": ml.as_ref().and_then(|f| f.ml_signal_confidence).unwrap_or(0.0),
+                                "ml_signal_edge_raw": ml.as_ref().and_then(|f| f.ml_signal_edge).unwrap_or(0.0),
                                 "ml_feature_timestamp": ml.as_ref().map(|f| f.timestamp).unwrap_or(0),
                                 "slug": target_market.slug,
                                 "window_start_ts": window_start_ts,
@@ -2212,7 +2539,7 @@ impl Strategy for Btc5mLagStrategy {
                                 "max_drawdown_pct": Self::max_drawdown_pct(),
                             }),
                         );
-                        let _: () = conn.publish("arbitrage:scan", scan_msg.to_string()).await.unwrap_or_default();
+                        publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
 
                         if mode == TradingMode::Live {
                             if let Some(pos) = open_position.take() {
@@ -2256,6 +2583,10 @@ impl Strategy for Btc5mLagStrategy {
                                             "dynamic_size_scale": dynamic_size_scale,
                                             "raw_size": raw_size,
                                             "effective_threshold": effective_min_edge,
+                                            "model_signal_label": model_signal_label,
+                                            "model_signal_confidence": model_signal_confidence,
+                                            "model_signal_bonus_bps": model_signal_bonus * 10_000.0,
+                                            "model_signal_penalty_bps": model_signal_penalty * 10_000.0,
                                             "seasonality_multiplier": seasonality,
                                             "sigma_annualized": sigma,
                                             "seconds_to_expiry": remaining_seconds,
@@ -2275,7 +2606,7 @@ impl Strategy for Btc5mLagStrategy {
                                             }
                                         }
                                     });
-                                    let _: () = conn.publish("arbitrage:execution", preview_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
                                     last_live_preview_ms = now_ms;
                                 }
                             }
@@ -2353,7 +2684,7 @@ impl Strategy for Btc5mLagStrategy {
                                         "slug": target_market.slug,
                                     }
                                 });
-                                let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                                publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
                             }
                         }
 

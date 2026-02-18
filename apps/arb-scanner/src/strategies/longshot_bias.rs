@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
-use redis::AsyncCommands;
 use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -15,6 +14,7 @@ use crate::strategies::control::{
     compute_strategy_bet_size,
     is_strategy_enabled,
     publish_heartbeat,
+    publish_event,
     read_risk_config,
     read_risk_guard_cooldown,
     read_sim_available_cash,
@@ -39,6 +39,7 @@ const MAX_UNIVERSE_MARKETS: usize = 40;
 const MAX_OPEN_POSITIONS: usize = 6;
 const MAX_PARITY_DEVIATION: f64 = 0.04;
 const MAX_HOLD_MS: i64 = 300_000;
+const RESOLUTION_GRACE_MS: i64 = 180_000;
 const STRATEGY_ID: &str = "LONGSHOT_BIAS";
 
 fn longshot_price_ceiling() -> f64 {
@@ -74,6 +75,7 @@ fn fee_curve_rate() -> f64 {
 struct Position {
     execution_id: String,
     market_id: String,
+    token_id: String,
     question: String,
     fade_side: &'static str,
     entry_side: &'static str,
@@ -246,7 +248,7 @@ impl Strategy for LongshotBiasStrategy {
                                             "hold_ms": hold_ms,
                                         }
                                     });
-                                    let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
                                     let exec_msg = serde_json::json!({
                                         "execution_id": pos.execution_id,
                                         "market": "Longshot Bias",
@@ -263,29 +265,38 @@ impl Strategy for LongshotBiasStrategy {
                                             "pnl": 0.0,
                                         }
                                     });
-                                    let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
                                     info!("[LONGSHOT] STALE_FORCE_CLOSE {}", pos.question);
                                     continue;
                                 }
 
                                 let secs_left = pos.expiry_ts - now_ms / 1000;
                                 if secs_left <= 0 {
-                                    // Settle from executable book price at expiry instead of assuming a payout of 1.0.
-                                    // This avoids overstating wins when the outcome does not resolve in our favor.
-                                    let (exit_price, exit_source) = match books.get(&pos.market_id) {
-                                        Some(book) => {
-                                            let bid = if pos.entry_side == "YES" {
-                                                book.yes.best_bid
-                                            } else {
-                                                book.no.best_bid
-                                            };
-                                            if bid.is_finite() && bid > 0.0 && bid < 1.0 {
-                                                (bid, "BOOK_BID")
-                                            } else {
-                                                (0.0, "NO_LIQUID_BID")
+                                    let (exit_price, exit_source) = if let Some(resolved_price) = self
+                                        .client
+                                        .fetch_resolved_outcome_price(&pos.market_id, &pos.token_id, pos.entry_side == "YES")
+                                        .await
+                                    {
+                                        (resolved_price.clamp(0.0, 1.0), "RESOLVED_OUTCOME")
+                                    } else if now_ms <= (pos.expiry_ts * 1000) + RESOLUTION_GRACE_MS {
+                                        keep.push(pos);
+                                        continue;
+                                    } else {
+                                        match books.get(&pos.market_id) {
+                                            Some(book) => {
+                                                let bid = if pos.entry_side == "YES" {
+                                                    book.yes.best_bid
+                                                } else {
+                                                    book.no.best_bid
+                                                };
+                                                if bid.is_finite() && (0.0..=1.0).contains(&bid) {
+                                                    (bid, "BOOK_BID_AFTER_GRACE")
+                                                } else {
+                                                    (0.0, "NO_LIQUID_BID_AFTER_GRACE")
+                                                }
                                             }
+                                            None => (0.0, "BOOK_MISSING_AFTER_GRACE"),
                                         }
-                                        None => (0.0, "BOOK_MISSING"),
                                     };
                                     let gross = if pos.entry_price > 0.0 && exit_price >= 0.0 {
                                         ((exit_price / pos.entry_price) - 1.0).max(-0.999)
@@ -321,7 +332,7 @@ impl Strategy for LongshotBiasStrategy {
                                             "hold_ms": hold_ms,
                                         }
                                     });
-                                    let _: () = conn.publish("strategy:pnl", pnl_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
                                     let exec_msg = serde_json::json!({
                                         "execution_id": pos.execution_id,
                                         "market": "Longshot Bias",
@@ -343,7 +354,7 @@ impl Strategy for LongshotBiasStrategy {
                                             "net_return": net,
                                         }
                                     });
-                                    let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
                                     info!("[LONGSHOT] SETTLED {} pnl=${:.2}", pos.question, pnl);
                                 } else {
                                     keep.push(pos);
@@ -376,7 +387,7 @@ impl Strategy for LongshotBiasStrategy {
                                 let opp_ask = book.no.best_ask;
                                 if opp_ask > 0.0 && opp_ask <= 0.98 {
                                     let ne = bias - polymarket_taker_fee(opp_ask, fee_rate) - cost_model.slippage_bps_per_side / 10_000.0;
-                                    if ne >= threshold && (best.is_none() || ne > best.as_ref().unwrap().ne) {
+                                    if ne >= threshold && best.as_ref().is_none_or(|current| ne > current.ne) {
                                         best = Some(Opp { mid: mid.clone(), fade: "YES", entry: "NO", ep: opp_ask, lp: ym, bias, ne, exp });
                                     }
                                 }
@@ -387,7 +398,7 @@ impl Strategy for LongshotBiasStrategy {
                                 let opp_ask = book.yes.best_ask;
                                 if opp_ask > 0.0 && opp_ask <= 0.98 {
                                     let ne = bias - polymarket_taker_fee(opp_ask, fee_rate) - cost_model.slippage_bps_per_side / 10_000.0;
-                                    if ne >= threshold && (best.is_none() || ne > best.as_ref().unwrap().ne) {
+                                    if ne >= threshold && best.as_ref().is_none_or(|current| ne > current.ne) {
                                         best = Some(Opp { mid: mid.clone(), fade: "NO", entry: "YES", ep: opp_ask, lp: nm, bias, ne, exp });
                                     }
                                 }
@@ -410,7 +421,7 @@ impl Strategy for LongshotBiasStrategy {
                                     "slug": market.slug, "positions_count": positions.len(),
                                 }),
                             );
-                            let _: () = conn.publish("arbitrage:scan", scan.to_string()).await.unwrap_or_default();
+                            publish_event(&mut conn, "arbitrage:scan", scan.to_string()).await;
                         }
 
                         // ── Execute best entry ──
@@ -462,12 +473,14 @@ impl Strategy for LongshotBiasStrategy {
                                             }
                                         }
                                     });
-                                    let _: () = conn.publish("arbitrage:execution", preview_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "arbitrage:execution", preview_msg.to_string()).await;
                                     last_entry_ts = now_ms;
                                 } else if sz >= 1.0 && reserve_sim_notional_for_strategy(&mut conn, STRATEGY_ID, sz).await {
                                     let eid = Uuid::new_v4().to_string();
+                                    let token_id = if opp.entry == "YES" { market.yes_token.clone() } else { market.no_token.clone() };
                                     positions.push(Position {
                                         execution_id: eid.clone(), market_id: opp.mid.clone(),
+                                        token_id,
                                         question: market.question.clone(), fade_side: opp.fade,
                                         entry_side: opp.entry, entry_price: opp.ep,
                                         longshot_price: opp.lp, size: sz,
@@ -495,7 +508,7 @@ impl Strategy for LongshotBiasStrategy {
                                             "variant": variant,
                                         }
                                     });
-                                    let _: () = conn.publish("arbitrage:execution", exec_msg.to_string()).await.unwrap_or_default();
+                                    publish_event(&mut conn, "arbitrage:execution", exec_msg.to_string()).await;
                                 }
                             }
                         }
