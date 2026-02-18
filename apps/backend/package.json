@@ -13,7 +13,7 @@
         "@ai-trader/shared": "*",
         "@anthropic-ai/sdk": "^0.12.0",
         "@ethersproject/wallet": "^5.8.0",
-        "@polymarket/clob-client": "^5.2.1",
+        "@polymarket/clob-client": "^5.2.3",
         "axios": "^1.6.7",
         "cors": "^2.8.5",
         "dotenv": "^16.4.1",
