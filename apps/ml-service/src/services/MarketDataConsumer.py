@@ -20,8 +20,12 @@ SCAN_STRATEGY_SYMBOL_MAP = {
     "BTC_5M": "BTC-USD",
     "BTC_15M": "BTC-USD",
     "CEX_SNIPER": "BTC-USD",
+    "CEX_ARB": "BTC-USD",
+    "OBI_SCALPER": "BTC-USD",
     "GRAPH_ARB": "BTC-USD",
+    "ETH_5M": "ETH-USD",
     "ETH_15M": "ETH-USD",
+    "SOL_5M": "SOL-USD",
     "SOL_15M": "SOL-USD",
 }
 
@@ -101,24 +105,34 @@ class MarketDataConsumer:
                 self._record_exception("redis_close", exc)
             self.redis = None
 
+    def _normalize_epoch_ms(self, raw_epoch: float) -> int:
+        if not math.isfinite(raw_epoch):
+            return int(time.time() * 1000)
+        magnitude = abs(raw_epoch)
+        # Accept seconds/ms/us/ns and normalize to milliseconds.
+        if magnitude < 1e11:
+            return int(raw_epoch * 1000.0)
+        if magnitude > 1e16:
+            return int(raw_epoch / 1_000_000.0)
+        if magnitude > 1e14:
+            return int(raw_epoch / 1_000.0)
+        return int(raw_epoch)
+
     def _normalize_timestamp_ms(self, raw_timestamp):
         if isinstance(raw_timestamp, (int, float)) and not isinstance(raw_timestamp, bool):
             if math.isfinite(float(raw_timestamp)):
-                return int(float(raw_timestamp))
+                return self._normalize_epoch_ms(float(raw_timestamp))
 
         if isinstance(raw_timestamp, str):
             value = raw_timestamp.strip()
             if value:
+                parsed_num = None
                 try:
                     parsed_num = float(value)
-                    if math.isfinite(parsed_num):
-                        return int(parsed_num)
-                except ValueError as exc:
-                    self._record_exception(
-                        "normalize_timestamp.numeric_parse",
-                        exc,
-                        {"timestamp_preview": value[:64]},
-                    )
+                except ValueError:
+                    parsed_num = None
+                if parsed_num is not None and math.isfinite(parsed_num):
+                    return self._normalize_epoch_ms(parsed_num)
 
                 try:
                     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -127,7 +141,7 @@ class MarketDataConsumer:
                     return int(dt.timestamp() * 1000)
                 except ValueError as exc:
                     self._record_exception(
-                        "normalize_timestamp.iso_parse",
+                        "normalize_timestamp.parse",
                         exc,
                         {"timestamp_preview": value[:64]},
                     )

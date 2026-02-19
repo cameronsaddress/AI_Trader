@@ -63,6 +63,36 @@ fn min_edge_bps() -> f64 {
 fn fee_curve_rate() -> f64 {
     std::env::var("AS_MM_FEE_CURVE_BASE_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.02)
 }
+fn max_position_notional() -> f64 {
+    std::env::var("AS_MM_MAX_POSITION_NOTIONAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &f64| v.is_finite())
+        .unwrap_or(35.0)
+        .clamp(1.0, 500.0)
+}
+fn max_net_edge_bps() -> f64 {
+    std::env::var("AS_MM_MAX_NET_EDGE_BPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &f64| v.is_finite())
+        .unwrap_or(2_000.0)
+        .clamp(50.0, 20_000.0)
+}
+fn min_entry_tte_secs() -> i64 {
+    std::env::var("AS_MM_MIN_ENTRY_TTE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
+        .clamp(MIN_TIME_TO_EXPIRY_SECS, MAX_TIME_TO_EXPIRY_SECS)
+}
+fn post_sl_cooldown_ms() -> i64 {
+    std::env::var("AS_MM_POST_SL_COOLDOWN_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90_000)
+        .clamp(5_000, 15 * 60 * 1_000)
+}
 
 #[derive(Debug, Clone, Copy)]
 enum Side { Yes, No }
@@ -141,6 +171,7 @@ impl Strategy for AsMarketMakerStrategy {
         let mut positions: Vec<Position> = Vec::new();
         let mut books: HashMap<String, BinaryBook> = HashMap::new();
         let mut mid_history: HashMap<String, Vec<(i64, f64)>> = HashMap::new();
+        let mut market_stop_cooldown_until: HashMap<String, i64> = HashMap::new();
         let mut last_entry_ts = 0_i64;
         let mut last_seen_reset_ts = 0_i64;
 
@@ -154,10 +185,27 @@ impl Strategy for AsMarketMakerStrategy {
 
             let now_secs = Utc::now().timestamp();
             let all = self.client.fetch_active_binary_markets(MAX_UNIVERSE_MARKETS).await;
-            let filtered: Vec<MarketTarget> = all.into_iter().filter(|m| {
+            let mut filtered: Vec<MarketTarget> = all.into_iter().filter(|m| {
                 let exp = m.expiry_ts.unwrap_or(i64::MAX);
                 exp > now_secs + MIN_TIME_TO_EXPIRY_SECS && exp <= now_secs + MAX_TIME_TO_EXPIRY_SECS
             }).collect();
+            if filtered.is_empty() {
+                filtered = self
+                    .client
+                    .fetch_crypto_window_universe(
+                        &["BTC", "ETH", "SOL"],
+                        &[300, 900],
+                        MIN_TIME_TO_EXPIRY_SECS,
+                        MAX_TIME_TO_EXPIRY_SECS,
+                    )
+                    .await;
+                if !filtered.is_empty() {
+                    info!(
+                        "[AS_MM] Switched to crypto-window fallback universe ({} markets)",
+                        filtered.len()
+                    );
+                }
+            }
 
             if filtered.is_empty() {
                 warn!("[AS_MM] No eligible markets");
@@ -222,6 +270,7 @@ impl Strategy for AsMarketMakerStrategy {
                             let rel = positions.iter().map(|p| p.size).sum::<f64>();
                             positions.clear();
                             books.clear();
+                            market_stop_cooldown_until.clear();
                             if rel > 0.0 { let _ = release_sim_notional_for_strategy(&mut conn, STRATEGY_ID, rel).await; }
                             continue;
                         }
@@ -243,6 +292,7 @@ impl Strategy for AsMarketMakerStrategy {
                             let release_notional = positions.iter().map(|pos| pos.size).sum::<f64>();
                             let cleared = positions.len();
                             positions.clear();
+                            market_stop_cooldown_until.clear();
                             if release_notional > 0.0 {
                                 let _ = release_sim_notional_for_strategy(&mut conn, STRATEGY_ID, release_notional).await;
                             }
@@ -253,7 +303,10 @@ impl Strategy for AsMarketMakerStrategy {
                         let gamma_val = gamma();
                         let kappa_val = kappa();
                         let min_edge = min_edge_bps() / 10_000.0;
+                        let max_edge = max_net_edge_bps() / 10_000.0;
+                        let min_tte_secs = min_entry_tte_secs();
                         let fee_rate = fee_curve_rate();
+                        market_stop_cooldown_until.retain(|_, until| *until > now_ms);
 
                         // ── Exit management ──
                         if mode != TradingMode::Live {
@@ -264,7 +317,14 @@ impl Strategy for AsMarketMakerStrategy {
                                     None => { keep.push(pos); continue; }
                                 };
                                 if now_ms - book.last_update_ms > BOOK_STALE_MS { keep.push(pos); continue; }
-                                let mid = match pos.side { Side::Yes => book.yes.mid(), Side::No => book.no.mid() };
+                                let mid = match pos.side {
+                                    Side::Yes => {
+                                        if book.yes.best_bid > 0.0 { book.yes.best_bid } else { book.yes.mid() }
+                                    }
+                                    Side::No => {
+                                        if book.no.best_bid > 0.0 { book.no.best_bid } else { book.no.mid() }
+                                    }
+                                };
                                 if mid <= 0.0 { keep.push(pos); continue; }
                                 let age = now_ms - pos.timestamp_ms;
                                 let gross = (mid / pos.entry_price) - 1.0;
@@ -276,6 +336,12 @@ impl Strategy for AsMarketMakerStrategy {
                                     let cost = cost_model.round_trip_cost_rate();
                                     let net = gross - cost;
                                     let pnl = pos.size * net;
+                                    if r == "SL" {
+                                        market_stop_cooldown_until.insert(
+                                            pos.market_id.clone(),
+                                            now_ms + post_sl_cooldown_ms(),
+                                        );
+                                    }
                                     let _ = settle_sim_position_for_strategy(&mut conn, STRATEGY_ID, pos.size, pnl).await;
                                     let bankroll = read_sim_available_cash(&mut conn).await;
                                     // PnL channel — for trade recording + bankroll tracking
@@ -338,6 +404,12 @@ impl Strategy for AsMarketMakerStrategy {
                         let mut best: Option<(String, Side, f64, f64, f64, f64, f64, f64, i64)> = None;
 
                         for (mid, market) in &market_by_id {
+                            if market_stop_cooldown_until
+                                .get(mid)
+                                .is_some_and(|until| now_ms < *until)
+                            {
+                                continue;
+                            }
                             let book = match books.get(mid) { Some(b) => b, None => continue };
                             if now_ms - book.last_update_ms > BOOK_STALE_MS { continue; }
                             let ym = book.yes.mid(); let nm = book.no.mid();
@@ -346,7 +418,7 @@ impl Strategy for AsMarketMakerStrategy {
                             if parity > MAX_PARITY_DEVIATION { continue; }
                             let exp = match market.expiry_ts { Some(t) => t, None => continue };
                             let ste = exp - now_ms / 1000;
-                            if ste < MIN_TIME_TO_EXPIRY_SECS { continue; }
+                            if ste < min_tte_secs { continue; }
                             let tte = ste as f64 / (365.25 * 24.0 * 3600.0);
 
                             let hist = mid_history.entry(mid.clone()).or_default();
@@ -364,41 +436,47 @@ impl Strategy for AsMarketMakerStrategy {
                             let r_no = reservation_price(nm, -inv, gamma_val, sigma, tte);
                             let theo_ask_no = r_no + hs;
 
-                            let ya = book.yes.best_ask; let na = book.no.best_ask;
+                            let yb = book.yes.best_bid; let ya = book.yes.best_ask;
+                            let nb = book.no.best_bid; let na = book.no.best_ask;
                             let ys = (book.yes.best_ask - book.yes.best_bid).max(0.0);
                             let ns = (book.no.best_ask - book.no.best_bid).max(0.0);
                             let book_age_ms = now_ms.saturating_sub(book.last_update_ms);
 
                             // YES opportunity
-                            if (MIN_ENTRY_PRICE..=MAX_ENTRY_PRICE).contains(&ya) && ys <= MAX_SPREAD {
-                                let e = theo_ask_yes - ya;
+                            if (MIN_ENTRY_PRICE..=MAX_ENTRY_PRICE).contains(&yb) && yb > 0.0 && yb < ya && ys <= MAX_SPREAD {
+                                let e = theo_ask_yes - yb;
                                 let maker_entry_cost = cost_model.maker_side_cost_rate();
                                 let taker_exit_cost = polymarket_taker_fee(
                                     theo_ask_yes.clamp(0.001, 0.999),
                                     fee_rate,
                                 ) + (cost_model.slippage_bps_per_side / 10_000.0);
                                 let ne = e - maker_entry_cost - taker_exit_cost;
+                                if ne > max_edge { continue; }
                                 if ne > min_edge && best.as_ref().is_none_or(|current| ne > current.2) {
-                                    best = Some((mid.clone(), Side::Yes, ne, ya, r_yes, hs, sigma, tte, book_age_ms));
+                                    best = Some((mid.clone(), Side::Yes, ne, yb, r_yes, hs, sigma, tte, book_age_ms));
                                 }
                             }
                             // NO opportunity
-                            if (MIN_ENTRY_PRICE..=MAX_ENTRY_PRICE).contains(&na) && ns <= MAX_SPREAD {
-                                let e = theo_ask_no - na;
+                            if (MIN_ENTRY_PRICE..=MAX_ENTRY_PRICE).contains(&nb) && nb > 0.0 && nb < na && ns <= MAX_SPREAD {
+                                let e = theo_ask_no - nb;
                                 let maker_entry_cost = cost_model.maker_side_cost_rate();
                                 let taker_exit_cost = polymarket_taker_fee(
                                     theo_ask_no.clamp(0.001, 0.999),
                                     fee_rate,
                                 ) + (cost_model.slippage_bps_per_side / 10_000.0);
                                 let ne = e - maker_entry_cost - taker_exit_cost;
+                                if ne > max_edge { continue; }
                                 if ne > min_edge && best.as_ref().is_none_or(|current| ne > current.2) {
-                                    best = Some((mid.clone(), Side::No, ne, na, r_no, hs, sigma, tte, book_age_ms));
+                                    best = Some((mid.clone(), Side::No, ne, nb, r_no, hs, sigma, tte, book_age_ms));
                                 }
                             }
 
-                            let be = (theo_ask_yes - ya).max(theo_ask_no - na);
-                            let sp = be > min_edge;
-                            let reason = if !sp { format!("Edge {:.1}bp < {:.1}bp", be*1e4, min_edge*1e4) }
+                            let be = (theo_ask_yes - yb).max(theo_ask_no - nb);
+                            let anomaly = be > max_edge;
+                            let sp = be > min_edge && !anomaly;
+                            let reason = if anomaly {
+                                format!("Edge {:.1}bp above anomaly cap {:.1}bp", be*1e4, max_edge*1e4)
+                            } else if !sp { format!("Edge {:.1}bp < {:.1}bp", be*1e4, min_edge*1e4) }
                                 else { format!("Edge {:.1}bp > {:.1}bp", be*1e4, min_edge*1e4) };
                             let scan = build_scan_payload(mid, &market.question, STRATEGY_ID,
                                 "AS_SPREAD_CAPTURE", "SPREAD_BPS", [ym, nm], hs*1e4,
@@ -409,6 +487,8 @@ impl Strategy for AsMarketMakerStrategy {
                                     "gamma": gamma_val, "kappa": kappa_val, "inventory": inv,
                                     "fee_curve_rate": fee_rate, "question": market.question,
                                     "slug": market.slug, "positions_count": positions.len(),
+                                    "min_entry_tte_secs": min_tte_secs,
+                                    "max_net_edge_bps": max_edge * 1e4,
                                 }),
                             );
                             publish_event(&mut conn, "arbitrage:scan", scan.to_string()).await;
@@ -424,7 +504,9 @@ impl Strategy for AsMarketMakerStrategy {
                                 let market = match market_by_id.get(&mid) { Some(m) => m, None => continue };
                                 let cash = read_sim_available_cash(&mut conn).await;
                                 let cfg = read_risk_config(&mut conn).await;
-                                let sz = compute_strategy_bet_size(&mut conn, STRATEGY_ID, cash, &cfg, 1.0, 0.15).await;
+                                let sz = compute_strategy_bet_size(&mut conn, STRATEGY_ID, cash, &cfg, 1.0, 0.15)
+                                    .await
+                                    .min(max_position_notional());
                                 if sz >= 1.0 && mode == TradingMode::Live {
                                     let eid = Uuid::new_v4().to_string();
                                     let sl = match side { Side::Yes => "YES", Side::No => "NO" };
@@ -449,10 +531,13 @@ impl Strategy for AsMarketMakerStrategy {
                                             "sigma": sigma,
                                             "tte_years": tte,
                                             "book_age_ms": book_age_ms,
+                                            "maker_intent": true,
                                             "variant": variant,
                                             "preflight": {
                                                 "venue": "POLYMARKET",
                                                 "strategy": STRATEGY_ID,
+                                                "maker_intent": true,
+                                                "order_type": "GTC",
                                                 "orders": [
                                                     {
                                                         "token_id": token_id,

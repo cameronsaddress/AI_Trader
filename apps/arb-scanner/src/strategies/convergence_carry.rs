@@ -3,7 +3,7 @@ use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
@@ -66,6 +66,7 @@ const TAKE_PROFIT_PCT: f64 = 0.07;
 const STOP_LOSS_PCT: f64 = -0.04;
 const MAX_HOLD_MS: i64 = 120_000;
 const MAX_OPEN_POSITIONS: usize = 4;
+const REGIME_HISTORY_MAX_POINTS: usize = 320;
 const CONVERGENCE_CARRY_STRATEGY_ID: &str = "CONVERGENCE_CARRY";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -181,6 +182,57 @@ impl ConvergenceCarryStrategy {
             Side::No => "NO",
         }
     }
+
+    fn side_history_key(market_id: &str, side: Side) -> String {
+        format!("{}:{}", market_id, Self::side_label(side))
+    }
+
+    fn push_side_price(
+        history_by_key: &mut HashMap<String, VecDeque<(i64, f64)>>,
+        market_id: &str,
+        side: Side,
+        timestamp_ms: i64,
+        price: f64,
+    ) {
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        let key = Self::side_history_key(market_id, side);
+        let history = history_by_key.entry(key).or_default();
+        if let Some((last_ts, last_price)) = history.back_mut() {
+            if *last_ts == timestamp_ms {
+                *last_price = price;
+                return;
+            }
+        }
+        history.push_back((timestamp_ms, price));
+        while history.len() > REGIME_HISTORY_MAX_POINTS {
+            history.pop_front();
+        }
+    }
+
+    fn side_price_history_snapshot(
+        history_by_key: &HashMap<String, VecDeque<(i64, f64)>>,
+        market_id: &str,
+        side: Side,
+        entry_ts_ms: i64,
+        entry_price: f64,
+        now_ms: i64,
+        now_price: f64,
+    ) -> Vec<(i64, f64)> {
+        let key = Self::side_history_key(market_id, side);
+        let mut history: Vec<(i64, f64)> = history_by_key
+            .get(&key)
+            .map(|rows| rows.iter().copied().collect())
+            .unwrap_or_default();
+        if history.first().map(|(ts, _)| *ts > entry_ts_ms).unwrap_or(true) {
+            history.insert(0, (entry_ts_ms, entry_price));
+        }
+        if history.last().map(|(ts, _)| *ts < now_ms).unwrap_or(true) {
+            history.push((now_ms, now_price));
+        }
+        history
+    }
 }
 
 #[async_trait]
@@ -199,6 +251,7 @@ impl Strategy for ConvergenceCarryStrategy {
         let variant = strategy_variant();
         let cost_model = SimCostModel::from_env();
         let mut books: HashMap<String, BinaryBook> = HashMap::new();
+        let mut side_price_history: HashMap<String, VecDeque<(i64, f64)>> = HashMap::new();
         let mut open_positions: Vec<Position> = Vec::new();
         let mut last_seen_reset_ts = 0_i64;
         let mut last_entry_ms = 0_i64;
@@ -224,7 +277,7 @@ impl Strategy for ConvergenceCarryStrategy {
 
         loop {
             let now_secs = Utc::now().timestamp();
-            let universe = self
+            let mut universe = self
                 .client
                 .fetch_active_binary_markets(MAX_UNIVERSE_MARKETS)
                 .await
@@ -234,6 +287,23 @@ impl Strategy for ConvergenceCarryStrategy {
                     expiry > now_secs + MIN_TIME_TO_EXPIRY_SECS && expiry <= now_secs + MAX_TIME_TO_EXPIRY_SECS
                 })
                 .collect::<Vec<_>>();
+            if universe.is_empty() {
+                universe = self
+                    .client
+                    .fetch_crypto_window_universe(
+                        &["BTC", "ETH", "SOL"],
+                        &[300, 900],
+                        MIN_TIME_TO_EXPIRY_SECS,
+                        MAX_TIME_TO_EXPIRY_SECS,
+                    )
+                    .await;
+                if !universe.is_empty() {
+                    info!(
+                        "Convergence carry switched to crypto-window fallback universe ({} markets)",
+                        universe.len()
+                    );
+                }
+            }
 
             if universe.is_empty() {
                 warn!("Convergence carry: no eligible markets in configured horizon");
@@ -331,6 +401,7 @@ impl Strategy for ConvergenceCarryStrategy {
                             open_positions.clear();
                             clear_strategy_open_positions(&mut conn, CONVERGENCE_CARRY_STRATEGY_ID).await;
                             books.clear();
+                            side_price_history.clear();
                             last_entry_ms = 0;
                             if release_notional > 0.0 {
                                 let _ = release_sim_notional_for_strategy(&mut conn, CONVERGENCE_CARRY_STRATEGY_ID, release_notional).await;
@@ -358,12 +429,40 @@ impl Strategy for ConvergenceCarryStrategy {
                                     if mark > 0.0 && pos.entry_price > 0.0 {
                                         let gross_return = (mark - pos.entry_price) / pos.entry_price;
                                         let pnl = realized_pnl(pos.size, gross_return, cost_model);
-                                        let _ = settle_sim_position_for_strategy(&mut conn, CONVERGENCE_CARRY_STRATEGY_ID, pos.size, pnl).await;
+                                        let bankroll = settle_sim_position_for_strategy(
+                                            &mut conn,
+                                            CONVERGENCE_CARRY_STRATEGY_ID,
+                                            pos.size,
+                                            pnl,
+                                        ).await;
+                                        let pnl_msg = serde_json::json!({
+                                            "execution_id": pos.execution_id,
+                                            "strategy": "CONVERGENCE_CARRY",
+                                            "variant": variant.as_str(),
+                                            "pnl": pnl,
+                                            "notional": pos.size,
+                                            "timestamp": now_ms,
+                                            "bankroll": bankroll,
+                                            "mode": "PAPER",
+                                            "details": {
+                                                "action": "CLOSE_POSITION",
+                                                "reason": "STRATEGY_DISABLED_MARK_TO_MARKET",
+                                                "market_id": pos.market_id,
+                                                "question": pos.question,
+                                                "side": Self::side_label(pos.side),
+                                                "entry": pos.entry_price,
+                                                "exit": mark,
+                                                "gross_return": gross_return,
+                                                "hold_ms": now_ms.saturating_sub(pos.timestamp_ms),
+                                            }
+                                        });
+                                        publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
                                     } else {
                                         released += pos.size;
                                     }
                                 }
                                 clear_strategy_open_positions(&mut conn, CONVERGENCE_CARRY_STRATEGY_ID).await;
+                                side_price_history.clear();
                                 if released > 0.0 {
                                     let _ = release_sim_notional_for_strategy(&mut conn, CONVERGENCE_CARRY_STRATEGY_ID, released).await;
                                 }
@@ -383,6 +482,14 @@ impl Strategy for ConvergenceCarryStrategy {
                                 let _ = release_sim_notional_for_strategy(&mut conn, CONVERGENCE_CARRY_STRATEGY_ID, release_notional).await;
                             }
                             info!("Convergence Carry: cleared {} paper position(s) on LIVE transition", cleared);
+                        }
+
+                        for (market_id, book) in &books {
+                            if !book.yes.is_valid() || !book.no.is_valid() || now_ms - book.last_update_ms > BOOK_STALE_MS {
+                                continue;
+                            }
+                            Self::push_side_price(&mut side_price_history, market_id, Side::Yes, now_ms, book.yes.best_bid);
+                            Self::push_side_price(&mut side_price_history, market_id, Side::No, now_ms, book.no.best_bid);
                         }
 
                         // Exit management first.
@@ -429,10 +536,15 @@ impl Strategy for ConvergenceCarryStrategy {
                                 };
 
                                 // Adaptive exit via vol-regime detection
-                                let price_history_slice: Vec<(i64, f64)> = vec![
-                                    (pos.timestamp_ms, pos.entry_price),
-                                    (now_ms, mark),
-                                ];
+                                let price_history_slice = Self::side_price_history_snapshot(
+                                    &side_price_history,
+                                    &pos.market_id,
+                                    pos.side,
+                                    pos.timestamp_ms,
+                                    pos.entry_price,
+                                    now_ms,
+                                    mark,
+                                );
                                 let (tp_mult, sl_mult) = if let Some(regime) = detect_regime(&price_history_slice) {
                                     regime_exit_multipliers(&regime)
                                 } else {

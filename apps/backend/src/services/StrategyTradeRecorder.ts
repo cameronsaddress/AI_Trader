@@ -93,6 +93,13 @@ type StrategyTradeRecord = {
     label_eligible?: boolean;
 };
 
+export type StrategyTradeRecorderSummary = {
+    row_count: number;
+    paper_row_count: number;
+    pnl_sum: number;
+    paper_pnl_sum: number;
+};
+
 type Row = Record<string, unknown>;
 
 const CSV_HEADER_V4 = 'timestamp,strategy,variant,pnl,notional,mode,reason,gross_return,net_return,round_trip_cost_rate,cost_drag_return,execution_id,side,entry_price,closure_class,label_eligible\n';
@@ -147,6 +154,15 @@ function parseCsvLine(line: string): string[] {
     }
     out.push(current);
     return out;
+}
+
+function normalizeMode(mode: string | undefined): string {
+    const upper = (mode || '').trim().toUpperCase();
+    return upper.length > 0 ? upper : 'PAPER';
+}
+
+function isPaperMode(mode: string | undefined): boolean {
+    return normalizeMode(mode) === 'PAPER';
 }
 
 async function migrateCsvToLatestHeader(filePath: string): Promise<void> {
@@ -314,6 +330,9 @@ export class StrategyTradeRecorder {
     private initialized = false;
     private writeQueue: Promise<void> = Promise.resolve();
     private rowCount = 0;
+    private paperRowCount = 0;
+    private pnlSum = 0;
+    private paperPnlSum = 0;
     private extendedCsv = true;
     private includeExecutionId = true;
     private includeSide = true;
@@ -338,6 +357,9 @@ export class StrategyTradeRecorder {
             const content = await fs.readFile(this.filePath, 'utf8');
             const nonEmptyLines = content.split('\n').map((line) => line.trim()).filter((line) => line.length > 0);
             this.rowCount = Math.max(0, nonEmptyLines.length - 1);
+            this.paperRowCount = 0;
+            this.pnlSum = 0;
+            this.paperPnlSum = 0;
             const firstLine = nonEmptyLines[0] || '';
             if (firstLine === LEGACY_CSV_HEADER) {
                 this.extendedCsv = false;
@@ -346,17 +368,35 @@ export class StrategyTradeRecorder {
                 this.includeEntryPrice = false;
                 this.includeClosureTaxonomy = false;
             } else if (firstLine.length > 0) {
-                const columns = firstLine.split(',').map((col) => col.trim());
+                const columns = parseCsvLine(firstLine).map((col) => col.trim().replace(/^"|"$/g, '').toLowerCase());
                 this.extendedCsv = columns.includes('gross_return') && columns.includes('cost_drag_return');
                 this.includeExecutionId = columns.includes('execution_id');
                 this.includeSide = columns.includes('side');
                 this.includeEntryPrice = columns.includes('entry_price');
                 this.includeClosureTaxonomy = columns.includes('closure_class') && columns.includes('label_eligible');
+
+                const pnlIndex = columns.indexOf('pnl');
+                const modeIndex = columns.indexOf('mode');
+                if (pnlIndex >= 0 && nonEmptyLines.length > 1) {
+                    for (let i = 1; i < nonEmptyLines.length; i += 1) {
+                        const cells = parseCsvLine(nonEmptyLines[i] as string);
+                        const pnl = parseNumber(cells[pnlIndex]) ?? 0;
+                        this.pnlSum += pnl;
+                        const mode = modeIndex >= 0 ? cells[modeIndex] : undefined;
+                        if (isPaperMode(mode)) {
+                            this.paperRowCount += 1;
+                            this.paperPnlSum += pnl;
+                        }
+                    }
+                }
             }
         } catch (error) {
             logger.warn(`[StrategyTradeRecorder] initializing new dataset file path=${this.filePath} error=${String(error)}`);
             await fs.writeFile(this.filePath, CSV_HEADER_V4, { encoding: 'utf8' });
             this.rowCount = 0;
+            this.paperRowCount = 0;
+            this.pnlSum = 0;
+            this.paperPnlSum = 0;
             this.extendedCsv = true;
             this.includeExecutionId = true;
             this.includeSide = true;
@@ -386,6 +426,11 @@ export class StrategyTradeRecorder {
                 includeClosureTaxonomy: this.includeClosureTaxonomy,
             }), { encoding: 'utf8' });
             this.rowCount += 1;
+            this.pnlSum += parsed.pnl;
+            if (isPaperMode(parsed.mode)) {
+                this.paperRowCount += 1;
+                this.paperPnlSum += parsed.pnl;
+            }
         }).catch((error) => {
             logger.error(`[StrategyTradeRecorder] failed to persist trade row: ${String(error)}`);
         });
@@ -407,6 +452,9 @@ export class StrategyTradeRecorder {
             this.includeEntryPrice = true;
             this.includeClosureTaxonomy = true;
             this.rowCount = 0;
+            this.paperRowCount = 0;
+            this.pnlSum = 0;
+            this.paperPnlSum = 0;
         });
 
         this.writeQueue = task.catch((error) => {
@@ -422,5 +470,18 @@ export class StrategyTradeRecorder {
         }
         await this.writeQueue;
         return this.rowCount;
+    }
+
+    public async getSummary(): Promise<StrategyTradeRecorderSummary> {
+        if (!this.initialized) {
+            await this.init();
+        }
+        await this.writeQueue;
+        return {
+            row_count: this.rowCount,
+            paper_row_count: this.paperRowCount,
+            pnl_sum: this.pnlSum,
+            paper_pnl_sum: this.paperPnlSum,
+        };
     }
 }

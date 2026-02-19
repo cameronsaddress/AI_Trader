@@ -57,6 +57,7 @@ const MAX_ENTRY_PRICE: f64 = 0.85;
 const MAX_ABS_SETTLEMENT_RETURN: f64 = 0.20;
 const MAX_POSITION_FRACTION: f64 = 0.05;
 const ENTRY_EXPIRY_CUTOFF_MS: i64 = 30_000;
+const REGIME_HISTORY_MAX_POINTS: usize = 320;
 
 fn coinbase_ws_url() -> String {
     std::env::var("COINBASE_WS_URL").unwrap_or_else(|_| COINBASE_ADVANCED_WS_URL.to_string())
@@ -424,6 +425,8 @@ impl Strategy for ObiScalperStrategy {
 
         let mut last_signal_ms = 0_i64;
         let mut obi_history: VecDeque<f64> = VecDeque::new();
+        let mut yes_mid_history: VecDeque<(i64, f64)> = VecDeque::new();
+        let mut no_mid_history: VecDeque<(i64, f64)> = VecDeque::new();
         let mut open_position: Option<Position> = None;
         let mut pass_streak = 0_u32;
         let mut last_seen_reset_ts = 0_i64;
@@ -437,6 +440,8 @@ impl Strategy for ObiScalperStrategy {
             };
 
             info!("OBI Scalper locked on market: {}", target_market.slug);
+            yes_mid_history.clear();
+            no_mid_history.clear();
 
             let poly_url = match Url::parse(WS_URL) {
                 Ok(url) => url,
@@ -582,6 +587,19 @@ impl Strategy for ObiScalperStrategy {
                         let no_ask = poly_book.no.best_ask;
                         let yes_mid = poly_book.yes.mid();
                         let no_mid = poly_book.no.mid();
+
+                        if yes_mid > 0.0 && yes_mid.is_finite() {
+                            yes_mid_history.push_back((now_ms, yes_mid));
+                            while yes_mid_history.len() > REGIME_HISTORY_MAX_POINTS {
+                                yes_mid_history.pop_front();
+                            }
+                        }
+                        if no_mid > 0.0 && no_mid.is_finite() {
+                            no_mid_history.push_back((now_ms, no_mid));
+                            while no_mid_history.len() > REGIME_HISTORY_MAX_POINTS {
+                                no_mid_history.pop_front();
+                            }
+                        }
 
                         let poly_entry_spread_bps = if obi >= 0.0 {
                             if yes_mid > 0.0 {
@@ -779,6 +797,8 @@ impl Strategy for ObiScalperStrategy {
                             last_seen_reset_ts = reset_ts;
                             open_position = None;
                             obi_history.clear();
+                            yes_mid_history.clear();
+                            no_mid_history.clear();
                             pass_streak = 0;
                             last_signal_ms = 0;
                             publish_heartbeat(&mut conn, "obi_scalper").await;
@@ -795,10 +815,25 @@ impl Strategy for ObiScalperStrategy {
                                 let hold_ms = now_ms - pos.timestamp_ms;
 
                                 // Adaptive exit via vol-regime detection
-                                let price_history_slice: Vec<(i64, f64)> = vec![
-                                    (pos.timestamp_ms, pos.entry_mid),
-                                    (now_ms, mark_price),
-                                ];
+                                let mut price_history_slice: Vec<(i64, f64)> = if matches!(pos.side, PositionSide::Long) {
+                                    yes_mid_history.iter().copied().collect()
+                                } else {
+                                    no_mid_history.iter().copied().collect()
+                                };
+                                if price_history_slice
+                                    .first()
+                                    .map(|(ts, _)| *ts > pos.timestamp_ms)
+                                    .unwrap_or(true)
+                                {
+                                    price_history_slice.insert(0, (pos.timestamp_ms, pos.entry_mid));
+                                }
+                                if price_history_slice
+                                    .last()
+                                    .map(|(ts, _)| *ts < now_ms)
+                                    .unwrap_or(true)
+                                {
+                                    price_history_slice.push((now_ms, mark_price));
+                                }
                                 let (tp_mult, sl_mult) = if let Some(regime) = detect_regime(&price_history_slice) {
                                     regime_exit_multipliers(&regime)
                                 } else {

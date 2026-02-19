@@ -160,7 +160,7 @@ impl Strategy for GraphArbStrategy {
 
         loop {
             let now_ts = Utc::now().timestamp();
-            let universe = self
+            let mut universe = self
                 .client
                 .fetch_active_binary_markets(MAX_UNIVERSE_MARKETS)
                 .await
@@ -170,6 +170,23 @@ impl Strategy for GraphArbStrategy {
                     expiry > now_ts + ENTRY_EXPIRY_CUTOFF_SECS && expiry <= now_ts + max_horizon_secs
                 })
                 .collect::<Vec<_>>();
+            if universe.is_empty() {
+                universe = self
+                    .client
+                    .fetch_crypto_window_universe(
+                        &["BTC", "ETH", "SOL"],
+                        &[300, 900],
+                        ENTRY_EXPIRY_CUTOFF_SECS,
+                        max_horizon_secs,
+                    )
+                    .await;
+                if !universe.is_empty() {
+                    info!(
+                        "Graph arb switched to crypto-window fallback universe ({} markets)",
+                        universe.len()
+                    );
+                }
+            }
 
             if universe.is_empty() {
                 warn!("Graph arb: no eligible markets found in horizon window");

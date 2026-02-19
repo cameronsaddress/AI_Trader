@@ -264,6 +264,34 @@ services:
     restart: unless-stopped
     mem_limit: 256m
 
+  arb-scanner-eth-5m:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=ETH_5M
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - SIM_FEE_BPS_PER_SIDE=0
+      - SIM_SLIPPAGE_BPS_PER_SIDE=2
+    dns:
+      - 8.8.8.8
+    depends_on:
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
+
   arb-scanner-sol:
     build:
       context: ../apps/arb-scanner
@@ -276,6 +304,34 @@ services:
       - STRATEGY_VARIANT=baseline
       - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+    dns:
+      - 8.8.8.8
+    depends_on:
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
+
+  arb-scanner-sol-5m:
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=SOL_5M
+      - STRATEGY_VARIANT=baseline
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - SIM_FEE_BPS_PER_SIDE=0
+      - SIM_SLIPPAGE_BPS_PER_SIDE=2
     dns:
       - 8.8.8.8
     depends_on:

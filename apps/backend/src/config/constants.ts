@@ -204,6 +204,25 @@ export const DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_CRITICAL = Math.max(
 export const DATA_INTEGRITY_ALERT_RING_LIMIT = Math.max(10, Number(process.env.DATA_INTEGRITY_ALERT_RING_LIMIT || '120'));
 export const STRATEGY_SAMPLE_RETENTION = Math.max(100, Number(process.env.STRATEGY_SAMPLE_RETENTION || '2000'));
 
+// ── PnL Parity Watchdog ─────────────────────────────────────────────
+export const LEDGER_PNL_PARITY_ENABLED = process.env.LEDGER_PNL_PARITY_ENABLED !== 'false';
+export const LEDGER_PNL_PARITY_INTERVAL_MS = Math.max(
+    10_000,
+    Number(process.env.LEDGER_PNL_PARITY_INTERVAL_MS || '30000'),
+);
+export const LEDGER_PNL_PARITY_WARN_ABS_USD = Math.max(
+    0.10,
+    Number(process.env.LEDGER_PNL_PARITY_WARN_ABS_USD || '2'),
+);
+export const LEDGER_PNL_PARITY_CRITICAL_ABS_USD = Math.max(
+    LEDGER_PNL_PARITY_WARN_ABS_USD,
+    Number(process.env.LEDGER_PNL_PARITY_CRITICAL_ABS_USD || '10'),
+);
+export const LEDGER_PNL_PARITY_MIN_PAPER_ROWS = Math.max(
+    1,
+    Number(process.env.LEDGER_PNL_PARITY_MIN_PAPER_ROWS || '5'),
+);
+
 // ── Strategy Governance ─────────────────────────────────────────────
 export const STRATEGY_GOVERNANCE_ENABLED = process.env.STRATEGY_GOVERNANCE_ENABLED !== 'false';
 export const STRATEGY_GOVERNANCE_AUTOPILOT = process.env.STRATEGY_GOVERNANCE_AUTOPILOT === 'true';

@@ -643,7 +643,7 @@ impl Strategy for MarketNeutralStrategy {
                                 ws_disconnected = true;
                                 disconnect_reason = e.to_string();
                                 if is_transient_ws_error(&e) {
-                                    warn!(
+                                    info!(
                                         "{} fair-value Polymarket WS transient error; reconnecting ({})",
                                         self.asset, disconnect_reason
                                     );

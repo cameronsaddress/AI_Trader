@@ -23,6 +23,7 @@ type ParsedExecutionCandidate = {
     mode: string;
     orders: PreflightOrderCandidate[];
     fingerprint: string;
+    orderType?: OrderType;
 };
 
 export type PreflightOrderResult = {
@@ -171,6 +172,27 @@ function parseLiveOrderType(input: string | undefined): OrderType {
     return OrderType.FOK;
 }
 
+function parseOrderTypeOverride(input: unknown): OrderType | undefined {
+    const raw = asString(input);
+    if (!raw) {
+        return undefined;
+    }
+    const normalized = raw.toUpperCase();
+    if (normalized === 'GTC') {
+        return OrderType.GTC;
+    }
+    if (normalized === 'GTD') {
+        return OrderType.GTD;
+    }
+    if (normalized === 'FAK') {
+        return OrderType.FAK;
+    }
+    if (normalized === 'FOK') {
+        return OrderType.FOK;
+    }
+    return undefined;
+}
+
 function parseTickSize(input: unknown): TickSize | undefined {
     const raw = asString(input);
     if (raw === '0.1' || raw === '0.01' || raw === '0.001' || raw === '0.0001') {
@@ -263,9 +285,15 @@ function parseExecutionCandidate(input: unknown): ParsedExecutionCandidate | nul
         || 'UNKNOWN';
     const market = asString(payload.market) || 'Polymarket';
     const timestamp = asNumber(payload.timestamp) ?? Date.now();
+    const makerIntent = preflight?.maker_intent === true || details?.maker_intent === true || payload.maker_intent === true;
+    const orderType = parseOrderTypeOverride(preflight?.order_type)
+        || parseOrderTypeOverride(details?.order_type)
+        || parseOrderTypeOverride(payload.order_type)
+        || (makerIntent ? OrderType.GTC : undefined);
     const fingerprint = `${strategy}:${orders
         .map((order) => `${order.tokenId}:${order.side}:${order.price.toFixed(4)}:${order.sizeUnit}:${order.inputSize.toFixed(4)}`)
         .join('|')}`;
+    const fingerprintWithOrderType = `${fingerprint}:${orderType || 'DEFAULT'}`;
 
     return {
         market,
@@ -273,7 +301,8 @@ function parseExecutionCandidate(input: unknown): ParsedExecutionCandidate | nul
         timestamp,
         mode: 'LIVE_DRY_RUN',
         orders,
-        fingerprint,
+        fingerprint: fingerprintWithOrderType,
+        orderType,
     };
 }
 
@@ -963,9 +992,10 @@ export class PolymarketPreflightService {
             };
         }
 
+        const orderType = candidate.orderType || this.liveOrderType;
         const orderResults = await Promise.all(signedOrders.map(async (order): Promise<LiveExecutionOrderResult> => {
             try {
-                const response = await this.client!.postOrder(order.signedOrder, this.liveOrderType);
+                const response = await this.client!.postOrder(order.signedOrder, orderType);
                 const orderId = asString(asRecord(response)?.orderID);
                 const status = asString(asRecord(response)?.status);
                 const txHashesRaw = asRecord(response)?.transactionsHashes;

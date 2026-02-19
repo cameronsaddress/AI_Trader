@@ -3,7 +3,7 @@ use chrono::{Timelike, Utc};
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
@@ -56,6 +56,29 @@ fn min_expected_net_return() -> f64 {
     std::env::var("MAKER_MM_MIN_EXPECTED_NET_RETURN")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(0.001) // 10 bps default (was 90)
 }
+fn max_expected_net_return() -> f64 {
+    std::env::var("MAKER_MM_MAX_EXPECTED_NET_RETURN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &f64| v.is_finite())
+        .unwrap_or(0.25)
+        .clamp(0.02, 2.0)
+}
+fn max_position_notional() -> f64 {
+    std::env::var("MAKER_MM_MAX_POSITION_NOTIONAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &f64| v.is_finite())
+        .unwrap_or(35.0)
+        .clamp(1.0, 500.0)
+}
+fn min_entry_tte_secs() -> i64 {
+    std::env::var("MAKER_MM_MIN_ENTRY_TTE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
+        .clamp(MIN_TIME_TO_EXPIRY_SECS, MAX_TIME_TO_EXPIRY_SECS)
+}
 fn fee_curve_rate() -> f64 {
     std::env::var("POLYMARKET_FEE_CURVE_RATE")
         .ok()
@@ -66,6 +89,7 @@ fn fee_curve_rate() -> f64 {
 const TAKE_PROFIT_PCT: f64 = 0.018;
 const STOP_LOSS_PCT: f64 = -0.015;
 const MAX_HOLD_MS: i64 = 90_000;
+const REGIME_HISTORY_MAX_POINTS: usize = 320;
 const MAKER_MM_STRATEGY_ID: &str = "MAKER_MM";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -157,6 +181,57 @@ impl MakerMmStrategy {
             Side::No => "NO",
         }
     }
+
+    fn side_history_key(market_id: &str, side: Side) -> String {
+        format!("{}:{}", market_id, Self::side_label(side))
+    }
+
+    fn push_side_price(
+        history_by_key: &mut HashMap<String, VecDeque<(i64, f64)>>,
+        market_id: &str,
+        side: Side,
+        timestamp_ms: i64,
+        price: f64,
+    ) {
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        let key = Self::side_history_key(market_id, side);
+        let history = history_by_key.entry(key).or_default();
+        if let Some((last_ts, last_price)) = history.back_mut() {
+            if *last_ts == timestamp_ms {
+                *last_price = price;
+                return;
+            }
+        }
+        history.push_back((timestamp_ms, price));
+        while history.len() > REGIME_HISTORY_MAX_POINTS {
+            history.pop_front();
+        }
+    }
+
+    fn side_price_history_snapshot(
+        history_by_key: &HashMap<String, VecDeque<(i64, f64)>>,
+        market_id: &str,
+        side: Side,
+        entry_ts_ms: i64,
+        entry_price: f64,
+        now_ms: i64,
+        now_price: f64,
+    ) -> Vec<(i64, f64)> {
+        let key = Self::side_history_key(market_id, side);
+        let mut history: Vec<(i64, f64)> = history_by_key
+            .get(&key)
+            .map(|rows| rows.iter().copied().collect())
+            .unwrap_or_default();
+        if history.first().map(|(ts, _)| *ts > entry_ts_ms).unwrap_or(true) {
+            history.insert(0, (entry_ts_ms, entry_price));
+        }
+        if history.last().map(|(ts, _)| *ts < now_ms).unwrap_or(true) {
+            history.push((now_ms, now_price));
+        }
+        history
+    }
 }
 
 #[async_trait]
@@ -176,6 +251,7 @@ impl Strategy for MakerMmStrategy {
         let cost_model = SimCostModel::from_env();
 
         let mut books: HashMap<String, BinaryBook> = HashMap::new();
+        let mut side_price_history: HashMap<String, VecDeque<(i64, f64)>> = HashMap::new();
         let mut open_positions: Vec<Position> = Vec::new();
         let mut last_seen_reset_ts = 0_i64;
         let mut last_entry_ms = 0_i64;
@@ -201,7 +277,7 @@ impl Strategy for MakerMmStrategy {
 
         loop {
             let now_secs = Utc::now().timestamp();
-            let universe = self
+            let mut universe = self
                 .client
                 .fetch_active_binary_markets(MAX_UNIVERSE_MARKETS)
                 .await
@@ -211,6 +287,23 @@ impl Strategy for MakerMmStrategy {
                     expiry > now_secs + MIN_TIME_TO_EXPIRY_SECS && expiry <= now_secs + MAX_TIME_TO_EXPIRY_SECS
                 })
                 .collect::<Vec<_>>();
+            if universe.is_empty() {
+                universe = self
+                    .client
+                    .fetch_crypto_window_universe(
+                        &["BTC", "ETH", "SOL"],
+                        &[300, 900],
+                        MIN_TIME_TO_EXPIRY_SECS,
+                        MAX_TIME_TO_EXPIRY_SECS,
+                    )
+                    .await;
+                if !universe.is_empty() {
+                    info!(
+                        "Maker MM switched to crypto-window fallback universe ({} markets)",
+                        universe.len()
+                    );
+                }
+            }
 
             if universe.is_empty() {
                 warn!("Maker MM: no eligible markets in horizon window");
@@ -308,6 +401,7 @@ impl Strategy for MakerMmStrategy {
                             open_positions.clear();
                             clear_strategy_open_positions(&mut conn, MAKER_MM_STRATEGY_ID).await;
                             books.clear();
+                            side_price_history.clear();
                             last_entry_ms = 0;
                             if release_notional > 0.0 {
                                 let _ = release_sim_notional_for_strategy(&mut conn, MAKER_MM_STRATEGY_ID, release_notional).await;
@@ -321,6 +415,7 @@ impl Strategy for MakerMmStrategy {
                                 let release_notional = open_positions.iter().map(|pos| pos.size).sum::<f64>();
                                 open_positions.clear();
                                 clear_strategy_open_positions(&mut conn, MAKER_MM_STRATEGY_ID).await;
+                                side_price_history.clear();
                                 if release_notional > 0.0 {
                                     let _ = release_sim_notional_for_strategy(&mut conn, MAKER_MM_STRATEGY_ID, release_notional).await;
                                 }
@@ -349,6 +444,14 @@ impl Strategy for MakerMmStrategy {
                             info!("Maker MM: cleared {} paper position(s) on LIVE transition", cleared);
                         }
 
+                        for (market_id, book) in &books {
+                            if !book.yes.is_valid() || !book.no.is_valid() || now_ms - book.last_update_ms > BOOK_STALE_MS {
+                                continue;
+                            }
+                            Self::push_side_price(&mut side_price_history, market_id, Side::Yes, now_ms, book.yes.best_bid);
+                            Self::push_side_price(&mut side_price_history, market_id, Side::No, now_ms, book.no.best_bid);
+                        }
+
                         // Exit management.
                         if trading_mode != TradingMode::Live {
                             let prior_len = open_positions.len();
@@ -374,10 +477,15 @@ impl Strategy for MakerMmStrategy {
                                 let gross_return = (bid - pos.entry_price) / pos.entry_price;
 
                                 // Adaptive exit via vol-regime detection
-                                let price_history_slice: Vec<(i64, f64)> = vec![
-                                    (pos.timestamp_ms, pos.entry_price),
-                                    (now_ms, bid),
-                                ];
+                                let price_history_slice = Self::side_price_history_snapshot(
+                                    &side_price_history,
+                                    &pos.market_id,
+                                    pos.side,
+                                    pos.timestamp_ms,
+                                    pos.entry_price,
+                                    now_ms,
+                                    bid,
+                                );
                                 let (tp_mult, sl_mult) = if let Some(regime) = detect_regime(&price_history_slice) {
                                     regime_exit_multipliers(&regime)
                                 } else {
@@ -452,6 +560,8 @@ impl Strategy for MakerMmStrategy {
                             Utc::now().hour(),
                             0.0,
                         ) / 10_000.0;
+                        let min_entry_tte = min_entry_tte_secs();
+                        let max_expected = max_expected_net_return();
                         for market in market_by_id.values() {
                             let Some(book) = books.get(&market.market_id) else {
                                 continue;
@@ -463,7 +573,7 @@ impl Strategy for MakerMmStrategy {
 
                             let expiry_ts = market.expiry_ts.unwrap_or(i64::MAX);
                             let time_to_expiry = expiry_ts.saturating_sub(now_ts);
-                            if time_to_expiry <= MIN_TIME_TO_EXPIRY_SECS || time_to_expiry > MAX_TIME_TO_EXPIRY_SECS {
+                            if time_to_expiry <= min_entry_tte || time_to_expiry > MAX_TIME_TO_EXPIRY_SECS {
                                 continue;
                             }
 
@@ -492,6 +602,9 @@ impl Strategy for MakerMmStrategy {
                             let entry_cost_rate = cost_model.maker_side_cost_rate();
                             let exit_cost_rate = polymarket_taker_fee(ask, fee_curve_rate()) + dynamic_slippage_rate;
                             let expected_net_return = gross_capture - entry_cost_rate - exit_cost_rate;
+                            if expected_net_return > max_expected {
+                                continue;
+                            }
                             let threshold = min_expected_net_return();
 
                             match best_candidate {
@@ -559,9 +672,11 @@ impl Strategy for MakerMmStrategy {
                                 "entry_price": entry_price,
                                 "spread": spread,
                                 "time_to_expiry_secs": time_to_expiry,
+                                "min_entry_tte_secs": min_entry_tte,
                                 "entry_cost_maker_rate": cost_model.maker_side_cost_rate(),
                                 "exit_cost_taker_rate": polymarket_taker_fee(entry_price + spread, fee_curve_rate()) + dynamic_slippage_rate,
                                 "slippage_rate": dynamic_slippage_rate,
+                                "max_expected_net_return": max_expected,
                             }),
                         );
                         publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
@@ -585,7 +700,7 @@ impl Strategy for MakerMmStrategy {
                                     &risk_cfg,
                                     10.0,
                                     0.10,
-                                ).await;
+                                ).await.min(max_position_notional());
                                 if size > 0.0 {
                                     let token_id = if matches!(side, Side::Yes) {
                                         market.yes_token.clone()
@@ -613,6 +728,8 @@ impl Strategy for MakerMmStrategy {
                                             "preflight": {
                                                 "venue": "POLYMARKET",
                                                 "strategy": "MAKER_MM",
+                                                "maker_intent": true,
+                                                "order_type": "GTC",
                                                 "orders": [
                                                     {
                                                         "token_id": token_id,
@@ -651,7 +768,7 @@ impl Strategy for MakerMmStrategy {
                             &risk_cfg,
                             10.0,
                             0.10,
-                        ).await;
+                        ).await.min(max_position_notional());
 
                         if size > 0.0 && reserve_sim_notional_for_strategy(&mut conn, MAKER_MM_STRATEGY_ID, size).await {
                             let execution_id = Uuid::new_v4().to_string();

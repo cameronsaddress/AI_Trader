@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
-use log::{error, info, warn};
+use log::{error, info};
 use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -136,13 +136,30 @@ impl Strategy for LongshotBiasStrategy {
 
             let now_secs = Utc::now().timestamp();
             let all = self.client.fetch_active_binary_markets(MAX_UNIVERSE_MARKETS).await;
-            let filtered: Vec<MarketTarget> = all.into_iter().filter(|m| {
+            let mut filtered: Vec<MarketTarget> = all.into_iter().filter(|m| {
                 let exp = m.expiry_ts.unwrap_or(i64::MAX);
                 exp > now_secs + MIN_TIME_TO_EXPIRY_SECS && exp <= now_secs + MAX_TIME_TO_EXPIRY_SECS
             }).collect();
+            if filtered.is_empty() {
+                filtered = self
+                    .client
+                    .fetch_crypto_window_universe(
+                        &["BTC", "ETH", "SOL"],
+                        &[300, 900],
+                        MIN_TIME_TO_EXPIRY_SECS,
+                        MAX_TIME_TO_EXPIRY_SECS,
+                    )
+                    .await;
+                if !filtered.is_empty() {
+                    info!(
+                        "[LONGSHOT] Switched to crypto-window fallback universe ({} markets)",
+                        filtered.len()
+                    );
+                }
+            }
 
             if filtered.is_empty() {
-                warn!("[LONGSHOT] No eligible markets");
+                info!("[LONGSHOT] No eligible markets");
                 sleep(Duration::from_secs(4)).await;
                 continue;
             }

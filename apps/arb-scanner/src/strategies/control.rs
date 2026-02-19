@@ -296,9 +296,9 @@ pub fn strategy_underlying(strategy_id: &str) -> &'static str {
         "BTC_5M" | "BTC_15M" => "BTC",
         "ETH_5M" | "ETH_15M" => "ETH",
         "SOL_5M" | "SOL_15M" => "SOL",
-        "CEX_SNIPER" | "OBI_SCALPER" | "SYNDICATE" => "BTC",
+        "CEX_SNIPER" | "OBI_SCALPER" => "BTC",
         "ATOMIC_ARB" | "GRAPH_ARB" | "CONVERGENCE_CARRY" | "MAKER_MM"
-            | "AS_MARKET_MAKER" | "LONGSHOT_BIAS" => "POLY_EVENT",
+            | "AS_MARKET_MAKER" | "LONGSHOT_BIAS" | "SYNDICATE" => "POLY_EVENT",
         _ => "UNKNOWN",
     }
 }
@@ -608,10 +608,13 @@ pub async fn settle_sim_position_for_strategy(
             release_notional = 0
         end
         local release = math.min(release_notional, reserved)
+        local strategy_release = math.min(release_notional, strategy_reserved)
+        local family_release = math.min(release_notional, family_reserved)
+        local underlying_release = math.min(release_notional, underlying_reserved)
         reserved = reserved - release
-        strategy_reserved = math.max(0, strategy_reserved - release)
-        family_reserved = math.max(0, family_reserved - release)
-        underlying_reserved = math.max(0, underlying_reserved - release)
+        strategy_reserved = math.max(0, strategy_reserved - strategy_release)
+        family_reserved = math.max(0, family_reserved - family_release)
+        underlying_reserved = math.max(0, underlying_reserved - underlying_release)
         cash = cash + release + pnl
         if cash < 0 then
             cash = 0
@@ -651,11 +654,11 @@ pub async fn settle_sim_position_for_strategy(
             let reserved_before = read_sim_reserved_notional(conn).await;
             let release = release_notional.min(reserved_before).max(0.0);
             let strategy_reserved_before = read_strategy_reserved_notional(conn, strategy_id).await;
-            let strategy_release = release.min(strategy_reserved_before);
+            let strategy_release = release_notional.max(0.0).min(strategy_reserved_before);
             let family_reserved_before = read_family_reserved_notional(conn, family_id).await;
-            let family_release = release.min(family_reserved_before);
+            let family_release = release_notional.max(0.0).min(family_reserved_before);
             let und_reserved_before = read_underlying_reserved_notional(conn, underlying_id).await;
-            let und_release = release.min(und_reserved_before);
+            let und_release = release_notional.max(0.0).min(und_reserved_before);
             let write_result = redis::pipe()
                 .atomic()
                 .cmd("INCRBYFLOAT")
@@ -1165,6 +1168,7 @@ mod tests {
         assert_eq!(strategy_underlying("MAKER_MM"), "POLY_EVENT");
         assert_eq!(strategy_underlying("AS_MARKET_MAKER"), "POLY_EVENT");
         assert_eq!(strategy_underlying("LONGSHOT_BIAS"), "POLY_EVENT");
+        assert_eq!(strategy_underlying("SYNDICATE"), "POLY_EVENT");
         assert_eq!(strategy_underlying("unknown"), "UNKNOWN");
     }
 }

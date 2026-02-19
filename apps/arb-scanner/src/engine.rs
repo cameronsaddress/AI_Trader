@@ -569,6 +569,87 @@ impl PolymarketClient {
         targets
     }
 
+    /// Fallback universe for strategies that require short-horizon tradable markets.
+    /// Pulls canonical crypto window markets (5m/15m) and filters by expiry horizon.
+    pub async fn fetch_crypto_window_universe(
+        &self,
+        assets: &[&str],
+        windows_seconds: &[i64],
+        min_seconds_to_expiry: i64,
+        max_seconds_to_expiry: i64,
+    ) -> Vec<MarketTarget> {
+        let default_assets = ["BTC", "ETH", "SOL"];
+        let default_windows = [300_i64, 900_i64];
+        let resolved_assets: Vec<&str> = if assets.is_empty() {
+            default_assets.to_vec()
+        } else {
+            assets
+                .iter()
+                .map(|asset| asset.trim())
+                .filter(|asset| !asset.is_empty())
+                .collect()
+        };
+        let resolved_windows: Vec<i64> = if windows_seconds.is_empty() {
+            default_windows.to_vec()
+        } else {
+            windows_seconds
+                .iter()
+                .copied()
+                .map(|window| window.clamp(60, 24 * 60 * 60))
+                .collect()
+        };
+        let min_horizon = min_seconds_to_expiry.max(0);
+        let max_horizon = max_seconds_to_expiry.max(min_horizon + 1);
+        let now = Utc::now().timestamp();
+
+        let mut targets: Vec<MarketTarget> = Vec::new();
+        let mut seen_conditions: HashSet<String> = HashSet::new();
+
+        for asset in resolved_assets {
+            for window_seconds in &resolved_windows {
+                let market = match self.fetch_current_market_window(asset, *window_seconds).await {
+                    Some(found) => found,
+                    None => continue,
+                };
+                let expiry_ts = match market.expiry_ts {
+                    Some(expiry) => expiry,
+                    None => continue,
+                };
+                let seconds_to_expiry = expiry_ts - now;
+                if seconds_to_expiry <= min_horizon || seconds_to_expiry > max_horizon {
+                    continue;
+                }
+                if seen_conditions.insert(market.market_id.clone()) {
+                    targets.push(market);
+                }
+            }
+        }
+
+        targets.sort_by(|a, b| {
+            let a_expiry = a.expiry_ts.unwrap_or(i64::MAX);
+            let b_expiry = b.expiry_ts.unwrap_or(i64::MAX);
+            match a_expiry.cmp(&b_expiry) {
+                Ordering::Equal => {
+                    let a_liq = a.liquidity.or(a.volume).unwrap_or(0.0);
+                    let b_liq = b.liquidity.or(b.volume).unwrap_or(0.0);
+                    b_liq.partial_cmp(&a_liq).unwrap_or(Ordering::Equal)
+                }
+                ordering => ordering,
+            }
+        });
+
+        if !targets.is_empty() {
+            info!(
+                "Loaded {} crypto window fallback markets (horizon {}s-{}s)",
+                targets.len(),
+                min_horizon,
+                max_horizon
+            );
+        }
+
+        targets
+    }
+
     async fn fetch_market_by_slug(&self, slug: &str) -> Option<MarketTarget> {
         let trimmed = slug.trim();
         if trimmed.is_empty() {
@@ -662,10 +743,31 @@ impl PolymarketClient {
         let window = window_seconds.clamp(60, 24 * 60 * 60);
         let minutes = (window / 60).max(1);
         let now = Utc::now();
-        let ts = now.timestamp() - (now.timestamp().rem_euclid(window));
-        // slug pattern: btc-updown-15m-TIMESTAMP, btc-updown-5m-TIMESTAMP, etc.
-        let slug = format!("{}-updown-{}m-{}", asset.to_lowercase(), minutes, ts);
-        self.fetch_market_by_slug(&slug).await
+        let current_window_start = now.timestamp() - (now.timestamp().rem_euclid(window));
+        let current_ts = now.timestamp();
+        // Also probe adjacent windows so scanners remain populated during listing handoffs.
+        let candidate_starts = [
+            current_window_start,
+            current_window_start + window,
+            current_window_start - window,
+        ];
+
+        for start_ts in candidate_starts {
+            // slug pattern: btc-updown-15m-TIMESTAMP, btc-updown-5m-TIMESTAMP, etc.
+            let slug = format!("{}-updown-{}m-{}", asset.to_lowercase(), minutes, start_ts);
+            let Some(target) = self.fetch_market_by_slug(&slug).await else {
+                continue;
+            };
+            if let Some(expiry_ts) = target.expiry_ts {
+                // Skip windows that are already effectively expired.
+                if expiry_ts <= current_ts + 5 {
+                    continue;
+                }
+            }
+            return Some(target);
+        }
+
+        None
     }
 
     // Backwards-compatible fetcher for the 15m up/down markets per asset.

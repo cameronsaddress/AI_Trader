@@ -21,7 +21,12 @@ import { HyperliquidExecutor, TradingMode } from './services/HyperliquidExecutor
 import { PolymarketPreflightService } from './services/PolymarketPreflightService';
 import type { PolymarketLiveExecutionResult } from './services/PolymarketPreflightService';
 import { PolymarketSettlementService, settlementEventToExecutionLog } from './services/PolymarketSettlementService';
-import { StrategyTradeRecorder, classifyClosureReason, inferTradeClosureReason } from './services/StrategyTradeRecorder';
+import {
+    StrategyTradeRecorder,
+    classifyClosureReason,
+    inferTradeClosureReason,
+    type StrategyTradeRecorderSummary,
+} from './services/StrategyTradeRecorder';
 import { FeatureRegistryRecorder } from './services/FeatureRegistryRecorder';
 import { RejectedSignalRecorder } from './services/RejectedSignalRecorder';
 import { extractBearerToken } from './middleware/auth';
@@ -173,6 +178,9 @@ import {
     DATA_INTEGRITY_ALERT_COOLDOWN_MS, DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_WARN,
     DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_CRITICAL, DATA_INTEGRITY_ALERT_RING_LIMIT,
     STRATEGY_SAMPLE_RETENTION,
+    LEDGER_PNL_PARITY_ENABLED, LEDGER_PNL_PARITY_INTERVAL_MS,
+    LEDGER_PNL_PARITY_WARN_ABS_USD, LEDGER_PNL_PARITY_CRITICAL_ABS_USD,
+    LEDGER_PNL_PARITY_MIN_PAPER_ROWS,
     STRATEGY_GOVERNANCE_ENABLED, STRATEGY_GOVERNANCE_AUTOPILOT,
     STRATEGY_GOVERNANCE_INTERVAL_MS, STRATEGY_GOVERNANCE_MIN_TRADES,
     STRATEGY_GOVERNANCE_MIN_TRADES_DEMOTE, STRATEGY_GOVERNANCE_ACTION_COOLDOWN_MS,
@@ -576,6 +584,37 @@ const ledgerHealthModule = createLedgerHealthModule({
     recordError: recordSilentCatch,
 });
 let ledgerHealthState: LedgerHealthState = ledgerHealthModule.getLedgerHealthState();
+type PnlParityStatus = 'HEALTHY' | 'WARN' | 'CRITICAL';
+type PnlParityState = {
+    enabled: boolean;
+    status: PnlParityStatus;
+    checked_at: number;
+    ledger_realized_pnl: number;
+    trade_log_paper_pnl: number;
+    delta_abs_usd: number;
+    delta_signed_usd: number;
+    row_count: number;
+    paper_row_count: number;
+    min_paper_rows: number;
+    warn_abs_usd: number;
+    critical_abs_usd: number;
+    issues: string[];
+};
+let pnlParityState: PnlParityState = {
+    enabled: LEDGER_PNL_PARITY_ENABLED,
+    status: 'HEALTHY',
+    checked_at: 0,
+    ledger_realized_pnl: 0,
+    trade_log_paper_pnl: 0,
+    delta_abs_usd: 0,
+    delta_signed_usd: 0,
+    row_count: 0,
+    paper_row_count: 0,
+    min_paper_rows: LEDGER_PNL_PARITY_MIN_PAPER_ROWS,
+    warn_abs_usd: LEDGER_PNL_PARITY_WARN_ABS_USD,
+    critical_abs_usd: LEDGER_PNL_PARITY_CRITICAL_ABS_USD,
+    issues: LEDGER_PNL_PARITY_ENABLED ? ['pending first check'] : ['disabled via LEDGER_PNL_PARITY_ENABLED=false'],
+};
 const featureRegistryRows: FeatureSnapshot[] = [];
 const featureRegistryIndexById = new Map<string, number>();
 const featureRegistryCountsByStrategy: Record<string, { rows: number; labeled_rows: number; unlabeled_rows: number }> = {};
@@ -726,6 +765,96 @@ const CROSS_HORIZON_REFRESH_DEBOUNCE_MS = Math.max(
     Math.min(1_500, Math.floor(CROSS_HORIZON_ROUTER_INTERVAL_MS / 2)),
 );
 const heartbeats: Record<string, number> = {};
+const SCANNER_HEARTBEAT_MAX_AGE_MS = Math.max(
+    15_000,
+    Number(process.env.SCANNER_HEARTBEAT_MAX_AGE_MS || '60000'),
+);
+const OPTIONAL_SCANNER_HEARTBEAT_IDS = new Set<string>(
+    (process.env.SCANNER_OPTIONAL_HEARTBEAT_IDS || '')
+        .split(',')
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0),
+);
+const STRATEGY_HEARTBEAT_ID_MAP: Record<string, string> = {
+    BTC_5M: 'btc_5m',
+    BTC_15M: 'btc_15m',
+    ETH_5M: 'eth_5m',
+    ETH_15M: 'eth_15m',
+    SOL_5M: 'sol_5m',
+    SOL_15M: 'sol_15m',
+    CEX_SNIPER: 'cex_arb',
+    SYNDICATE: 'SYNDICATE',
+    ATOMIC_ARB: 'atomic_arb',
+    OBI_SCALPER: 'obi_scalper',
+    GRAPH_ARB: 'graph_arb',
+    CONVERGENCE_CARRY: 'convergence_carry',
+    MAKER_MM: 'maker_mm',
+    AS_MARKET_MAKER: 'AS_MARKET_MAKER',
+    LONGSHOT_BIAS: 'LONGSHOT_BIAS',
+};
+
+type ScannerHeartbeatSnapshot = {
+    monitored_ids: string[];
+    stale_ids: string[];
+    missing_ids: string[];
+    last_heartbeat_ms: number;
+    alive: boolean;
+};
+
+function strategyHeartbeatId(strategyIdRaw: string): string {
+    const strategyId = strategyIdRaw.trim().toUpperCase();
+    return STRATEGY_HEARTBEAT_ID_MAP[strategyId] || strategyId.toLowerCase();
+}
+
+function monitoredScannerHeartbeatIds(): string[] {
+    const monitored = new Set<string>();
+    for (const strategyId of STRATEGY_IDS) {
+        if (strategyStatus[strategyId] === false) {
+            continue;
+        }
+        monitored.add(strategyHeartbeatId(strategyId));
+    }
+
+    // Fallback for edge cases where all strategies are disabled.
+    if (monitored.size === 0) {
+        for (const id of SCANNER_HEARTBEAT_IDS) {
+            if ((heartbeats[id] || 0) > 0) {
+                monitored.add(id);
+            }
+        }
+    }
+    return [...monitored.values()];
+}
+
+function scannerHeartbeatSnapshot(now = Date.now()): ScannerHeartbeatSnapshot {
+    const monitoredIds = monitoredScannerHeartbeatIds();
+    const staleIds: string[] = [];
+    const missingIds: string[] = [];
+    let lastHeartbeatMs = 0;
+
+    for (const id of monitoredIds) {
+        const beat = heartbeats[id] || 0;
+        lastHeartbeatMs = Math.max(lastHeartbeatMs, beat);
+        if (beat <= 0) {
+            if (OPTIONAL_SCANNER_HEARTBEAT_IDS.has(id)) {
+                continue;
+            }
+            missingIds.push(id);
+            continue;
+        }
+        if (now - beat > SCANNER_HEARTBEAT_MAX_AGE_MS) {
+            staleIds.push(id);
+        }
+    }
+
+    return {
+        monitored_ids: monitoredIds,
+        stale_ids: staleIds,
+        missing_ids: missingIds,
+        last_heartbeat_ms: lastHeartbeatMs,
+        alive: monitoredIds.length > 0 && staleIds.length === 0 && missingIds.length === 0,
+    };
+}
 const riskGuardBootResumeTimers = new Map<string, NodeJS.Timeout>();
 const scheduledTaskStops: Array<() => void> = [];
 let bootstrapComplete = false;
@@ -1050,6 +1179,61 @@ function strategyFamily(strategyRaw: string): string {
         return 'BIAS_EXPLOITATION';
     }
     return 'GENERIC';
+}
+
+function strategyUnderlying(strategyRaw: string): string {
+    const strategy = strategyRaw.trim().toUpperCase();
+    if (strategy === 'BTC_5M' || strategy === 'BTC_15M') {
+        return 'BTC';
+    }
+    if (strategy === 'ETH_5M' || strategy === 'ETH_15M') {
+        return 'ETH';
+    }
+    if (strategy === 'SOL_5M' || strategy === 'SOL_15M') {
+        return 'SOL';
+    }
+    if (strategy === 'CEX_SNIPER' || strategy === 'OBI_SCALPER') {
+        return 'BTC';
+    }
+    if (
+        strategy === 'ATOMIC_ARB'
+        || strategy === 'GRAPH_ARB'
+        || strategy === 'CONVERGENCE_CARRY'
+        || strategy === 'MAKER_MM'
+        || strategy === 'AS_MARKET_MAKER'
+        || strategy === 'LONGSHOT_BIAS'
+        || strategy === 'SYNDICATE'
+    ) {
+        return 'POLY_EVENT';
+    }
+    return 'UNKNOWN';
+}
+
+function normalizeFeatureToken(raw: string): string {
+    const normalized = raw
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9_]+/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^_+|_+$/g, '');
+    return normalized.length > 0 ? normalized : 'UNKNOWN';
+}
+
+function buildStrategyContextFeatures(scan: StrategyScanState): Record<string, number> {
+    const strategy = normalizeFeatureToken(scan.strategy);
+    const family = normalizeFeatureToken(strategyFamily(scan.strategy));
+    const underlying = normalizeFeatureToken(strategyUnderlying(scan.strategy));
+    const metricFamily = normalizeFeatureToken(scan.metric_family || 'UNKNOWN');
+    const directionality = normalizeFeatureToken(scan.directionality || 'UNKNOWN');
+
+    return {
+        ctx_bias: 1,
+        [`ctx_strategy__${strategy}`]: 1,
+        [`ctx_family__${family}`]: 1,
+        [`ctx_underlying__${underlying}`]: 1,
+        [`ctx_metric_family__${metricFamily}`]: 1,
+        [`ctx_directionality__${directionality}`]: 1,
+    };
 }
 
 function inferScanDescriptor(strategyRaw: string, signalTypeRaw: string | null, unitRaw: string | null): {
@@ -3042,9 +3226,18 @@ async function isLiveReady(): Promise<LiveReadinessResult> {
     }
 
     const now = Date.now();
-    const scannerLastBeat = Math.max(...SCANNER_HEARTBEAT_IDS.map((id) => heartbeats[id] || 0));
-    if (now - scannerLastBeat > 15_000) {
-        failures.push('Scanner heartbeat stale (no heartbeat in 15s)');
+    const scannerHeartbeat = scannerHeartbeatSnapshot(now);
+    if (!scannerHeartbeat.alive) {
+        const scannerDetails = [
+            scannerHeartbeat.missing_ids.length > 0
+                ? `missing=${scannerHeartbeat.missing_ids.slice(0, 6).join(',')}`
+                : null,
+            scannerHeartbeat.stale_ids.length > 0
+                ? `stale=${scannerHeartbeat.stale_ids.slice(0, 6).join(',')}`
+                : null,
+            scannerHeartbeat.monitored_ids.length === 0 ? 'no_monitored_ids' : null,
+        ].filter((part): part is string => Boolean(part)).join(' | ');
+        failures.push(`Scanner heartbeat unhealthy (${scannerDetails || 'unknown'})`);
     }
 
     try {
@@ -3089,6 +3282,22 @@ async function isLiveReady(): Promise<LiveReadinessResult> {
     const settlementReadiness = settlementService.getReadinessSnapshot();
     for (const issue of settlementReadiness.failures) {
         failures.push(`Settlement: ${issue}`);
+    }
+
+    if (ledgerHealthState.status === 'CRITICAL') {
+        failures.push(`Ledger health CRITICAL (${ledgerHealthState.issues[0] || 'unknown'})`);
+    }
+
+    if (LEDGER_PNL_PARITY_ENABLED) {
+        if (pnlParityState.checked_at <= 0) {
+            failures.push('PnL parity watchdog has not completed an initial check');
+        } else if (now - pnlParityState.checked_at > (LEDGER_PNL_PARITY_INTERVAL_MS * 3)) {
+            failures.push(`PnL parity watchdog stale (${now - pnlParityState.checked_at}ms old)`);
+        } else if (pnlParityState.status === 'CRITICAL') {
+            failures.push(
+                `PnL parity critical (delta ${pnlParityState.delta_abs_usd.toFixed(2)} > ${pnlParityState.critical_abs_usd.toFixed(2)})`,
+            );
+        }
     }
 
     return { ready: failures.length === 0, failures };
@@ -3154,6 +3363,109 @@ async function clearReservedMaps(): Promise<void> {
 async function refreshLedgerHealth(): Promise<void> {
     await ledgerHealthModule.refreshLedgerHealth();
     ledgerHealthState = ledgerHealthModule.getLedgerHealthState();
+}
+
+function buildPnlParityState(
+    ledger: SimulationLedgerSnapshot,
+    summary: StrategyTradeRecorderSummary,
+    status: PnlParityStatus,
+    issues: string[],
+): PnlParityState {
+    const deltaSigned = ledger.realized_pnl - summary.paper_pnl_sum;
+    const deltaAbs = Math.abs(deltaSigned);
+    return {
+        enabled: LEDGER_PNL_PARITY_ENABLED,
+        status,
+        checked_at: Date.now(),
+        ledger_realized_pnl: Math.round(ledger.realized_pnl * 100) / 100,
+        trade_log_paper_pnl: Math.round(summary.paper_pnl_sum * 100) / 100,
+        delta_abs_usd: Math.round(deltaAbs * 100) / 100,
+        delta_signed_usd: Math.round(deltaSigned * 100) / 100,
+        row_count: summary.row_count,
+        paper_row_count: summary.paper_row_count,
+        min_paper_rows: LEDGER_PNL_PARITY_MIN_PAPER_ROWS,
+        warn_abs_usd: LEDGER_PNL_PARITY_WARN_ABS_USD,
+        critical_abs_usd: LEDGER_PNL_PARITY_CRITICAL_ABS_USD,
+        issues,
+    };
+}
+
+async function refreshPnlParityWatchdog(): Promise<void> {
+    if (!LEDGER_PNL_PARITY_ENABLED) {
+        pnlParityState = {
+            enabled: false,
+            status: 'HEALTHY',
+            checked_at: Date.now(),
+            ledger_realized_pnl: 0,
+            trade_log_paper_pnl: 0,
+            delta_abs_usd: 0,
+            delta_signed_usd: 0,
+            row_count: 0,
+            paper_row_count: 0,
+            min_paper_rows: LEDGER_PNL_PARITY_MIN_PAPER_ROWS,
+            warn_abs_usd: LEDGER_PNL_PARITY_WARN_ABS_USD,
+            critical_abs_usd: LEDGER_PNL_PARITY_CRITICAL_ABS_USD,
+            issues: ['disabled via LEDGER_PNL_PARITY_ENABLED=false'],
+        };
+        io.emit('pnl_parity_update', pnlParityState);
+        return;
+    }
+
+    try {
+        const [ledger, summary] = await Promise.all([
+            getSimulationLedgerSnapshot(),
+            strategyTradeRecorder.getSummary(),
+        ]);
+        const deltaAbs = Math.abs(ledger.realized_pnl - summary.paper_pnl_sum);
+        let status: PnlParityStatus = 'HEALTHY';
+        const issues: string[] = [];
+
+        if (summary.paper_row_count < LEDGER_PNL_PARITY_MIN_PAPER_ROWS) {
+            issues.push(
+                `warmup: ${summary.paper_row_count}/${LEDGER_PNL_PARITY_MIN_PAPER_ROWS} paper rows`,
+            );
+        } else if (deltaAbs > LEDGER_PNL_PARITY_CRITICAL_ABS_USD) {
+            status = 'CRITICAL';
+            issues.push(
+                `realized pnl parity delta ${deltaAbs.toFixed(2)} exceeds critical ${LEDGER_PNL_PARITY_CRITICAL_ABS_USD.toFixed(2)}`,
+            );
+        } else if (deltaAbs > LEDGER_PNL_PARITY_WARN_ABS_USD) {
+            status = 'WARN';
+            issues.push(
+                `realized pnl parity delta ${deltaAbs.toFixed(2)} exceeds warn ${LEDGER_PNL_PARITY_WARN_ABS_USD.toFixed(2)}`,
+            );
+        }
+
+        pnlParityState = buildPnlParityState(ledger, summary, status, issues);
+        io.emit('pnl_parity_update', pnlParityState);
+        touchRuntimeModule(
+            'PNL_LEDGER',
+            status === 'CRITICAL' ? 'DEGRADED' : 'ONLINE',
+            status === 'HEALTHY'
+                ? `pnl parity delta ${deltaAbs.toFixed(2)}`
+                : `pnl parity ${status.toLowerCase()}: ${issues[0] || 'drift detected'}`,
+        );
+    } catch (error) {
+        const detail = `pnl parity watchdog failed: ${String(error)}`;
+        recordSilentCatch('PnLParity.Refresh', error, { detail });
+        pnlParityState = {
+            enabled: true,
+            status: 'CRITICAL',
+            checked_at: Date.now(),
+            ledger_realized_pnl: pnlParityState.ledger_realized_pnl,
+            trade_log_paper_pnl: pnlParityState.trade_log_paper_pnl,
+            delta_abs_usd: pnlParityState.delta_abs_usd,
+            delta_signed_usd: pnlParityState.delta_signed_usd,
+            row_count: pnlParityState.row_count,
+            paper_row_count: pnlParityState.paper_row_count,
+            min_paper_rows: LEDGER_PNL_PARITY_MIN_PAPER_ROWS,
+            warn_abs_usd: LEDGER_PNL_PARITY_WARN_ABS_USD,
+            critical_abs_usd: LEDGER_PNL_PARITY_CRITICAL_ABS_USD,
+            issues: [detail],
+        };
+        io.emit('pnl_parity_update', pnlParityState);
+        touchRuntimeModule('PNL_LEDGER', 'DEGRADED', detail);
+    }
 }
 
 function clearStrategyMetrics(): void {
@@ -5615,8 +5927,10 @@ async function persistSignalModelArtifacts(
 function buildScanFeatureMap(scan: StrategyScanState): Record<string, number> {
     const margin = computeScanMargin(scan);
     const normalizedMargin = computeNormalizedMargin(scan);
+    const contextFeatures = buildStrategyContextFeatures(scan);
     return {
         ...(scan.meta_features || {}),
+        ...contextFeatures,
         score: scan.score,
         threshold: scan.threshold,
         margin,
@@ -6805,16 +7119,31 @@ async function runInProcessModelTraining(force = false): Promise<void> {
     try {
         const trained = trainSignalModelInProcess();
         modelTrainerLastLabeledRows = trained.labeled_rows;
+        const eligible = trained.report.eligible === true;
+        const reason = asString(trained.report.reason) || 'training not eligible';
+        const hasPriorEligibleModel = Boolean(signalModelArtifact && modelInferenceState.model_loaded);
+
+        // Protect the active model during low-label windows (common after sim resets):
+        // avoid replacing a good artifact with an ineligible retrain result unless forced.
+        if (!eligible && hasPriorEligibleModel && !force) {
+            await refreshMlPipelineStatus();
+            touchRuntimeModule(
+                'ML_TRAINER',
+                'DEGRADED',
+                `retained prior model; skipped ineligible retrain (${reason})`,
+            );
+            return;
+        }
+
         await persistSignalModelArtifacts(trained.artifact, trained.report);
         await refreshSignalModelArtifact();
         await refreshMlPipelineStatus();
-        const eligible = trained.report.eligible === true;
         touchRuntimeModule(
             'ML_TRAINER',
             eligible ? 'ONLINE' : 'STANDBY',
             eligible
                 ? `trained with ${trained.labeled_rows} rows`
-                : `${asString(trained.report.reason) || 'training not eligible'}`,
+                : reason,
         );
     } catch (error) {
         touchRuntimeModule('ML_TRAINER', 'DEGRADED', `in-process training failed: ${String(error)}`);
@@ -7790,30 +8119,29 @@ redisSubscriber.subscribe('strategy:pnl', (message) => {
         const sample = mode === 'PAPER' ? parseTradeSample(parsed) : null;
         const rejection = sample?.execution_id ? rejectedSignalsByExecutionId.get(sample.execution_id) || null : null;
         if (mode === 'PAPER' && rejection) {
-            const ignoredPayload = {
+            const overlapPayload = {
                 execution_id: sample?.execution_id || executionId,
                 timestamp: Date.now(),
                 strategy: sample?.strategy || pnlStrategy || 'UNKNOWN',
                 market_key: sample?.market_key || pnlMarketKey,
-                reason: 'paper pnl ignored: execution rejected upstream',
+                reason: 'paper pnl matched rejected execution id; recording for ledger parity',
                 rejected_stage: rejection.stage,
                 rejected_reason: rejection.reason,
                 rejected_timestamp: rejection.timestamp,
                 mode,
             };
-            io.emit('strategy_pnl_ignored', ignoredPayload);
+            io.emit('strategy_pnl_rejection_overlap', overlapPayload);
             io.emit('execution_log', {
-                execution_id: ignoredPayload.execution_id,
-                timestamp: ignoredPayload.timestamp,
-                side: 'PNL_IGNORED',
+                execution_id: overlapPayload.execution_id,
+                timestamp: overlapPayload.timestamp,
+                side: 'PNL_REJECTION_OVERLAP',
                 market: asString(asRecord(parsed)?.market) || 'Polymarket',
-                price: ignoredPayload.reason,
-                size: ignoredPayload.strategy,
+                price: overlapPayload.reason,
+                size: overlapPayload.strategy,
                 mode,
-                details: ignoredPayload,
+                details: overlapPayload,
             });
-            touchRuntimeModule('PNL_LEDGER', 'ONLINE', `${ignoredPayload.strategy} pnl ignored (${rejection.stage})`);
-            return;
+            touchRuntimeModule('PNL_LEDGER', 'ONLINE', `${overlapPayload.strategy} pnl recorded with rejection overlap (${rejection.stage})`);
         }
 
         strategyTradeRecorder.record(parsed);
@@ -8248,6 +8576,7 @@ io.on('connection', async (socket) => {
     socket.emit('runtime_status_update', runtimeStatusPayload());
     socket.emit('silent_catch_telemetry_snapshot', silentCatchTelemetryPayload());
     socket.emit('ledger_health_update', ledgerHealthState);
+    socket.emit('pnl_parity_update', pnlParityState);
     socket.emit('meta_controller_update', metaControllerPayload());
     socket.emit('cross_horizon_router_update', crossHorizonRouterState);
     socket.emit('ml_pipeline_status_update', mlPipelineStatus);
@@ -8449,14 +8778,16 @@ app.get('/api/arb/bots', (_req, res) => {
         id,
         active: Boolean(strategyStatus[id]),
     }));
-
-    const scannerLastBeat = Math.max(...SCANNER_HEARTBEAT_IDS.map((id) => heartbeats[id] || 0));
+    const scannerHeartbeat = scannerHeartbeatSnapshot(now);
 
     res.json({
         bots,
         scanner: {
-            alive: now - scannerLastBeat < 15_000,
-            last_heartbeat_ms: scannerLastBeat,
+            alive: scannerHeartbeat.alive,
+            last_heartbeat_ms: scannerHeartbeat.last_heartbeat_ms,
+            monitored_ids: scannerHeartbeat.monitored_ids,
+            stale_ids: scannerHeartbeat.stale_ids,
+            missing_ids: scannerHeartbeat.missing_ids,
         },
     });
 });
@@ -8482,7 +8813,7 @@ app.get('/api/arb/stats', async (_req, res) => {
     const activeMarkets = getActiveMarketCount(now);
     const strategySignals = getStrategySignalSummaries(now);
     const comparableGroups = getComparableGroupSummaries(now);
-    const scannerLastBeat = Math.max(...SCANNER_HEARTBEAT_IDS.map((id) => heartbeats[id] || 0));
+    const scannerHeartbeat = scannerHeartbeatSnapshot(now);
     const settlementSnapshot = settlementService.getSnapshot();
     const trackedSettlements = settlementSnapshot.positions.filter((position) => position.status !== 'REDEEMED');
     const redeemableSettlements = settlementSnapshot.positions.filter((position) => position.status === 'REDEEMABLE');
@@ -8510,8 +8841,8 @@ app.get('/api/arb/stats', async (_req, res) => {
                 mean_normalized_margin: Math.round(group.mean_normalized_margin * 1000) / 1000,
             })),
         },
-        scanner_last_heartbeat_ms: scannerLastBeat,
-        scanner_alive: now - scannerLastBeat < 15_000,
+        scanner_last_heartbeat_ms: scannerHeartbeat.last_heartbeat_ms,
+        scanner_alive: scannerHeartbeat.alive,
         simulation_ledger: {
             cash: Math.round(ledger.cash * 100) / 100,
             reserved: Math.round(ledger.reserved * 100) / 100,
@@ -8552,6 +8883,7 @@ app.get('/api/arb/stats', async (_req, res) => {
             by_stage: rejectedByStage,
         },
         ledger_health: ledgerHealthState,
+        pnl_parity: pnlParityState,
         meta_controller: metaControllerPayload(),
         ml_pipeline: mlPipelineStatus,
         model_inference: modelInferencePayload(),
@@ -8727,6 +9059,10 @@ app.get('/api/arb/governance', (_req, res) => {
 
 app.get('/api/arb/ledger-health', (_req, res) => {
     res.json(ledgerHealthState);
+});
+
+app.get('/api/arb/pnl-parity', (_req, res) => {
+    res.json(pnlParityState);
 });
 
 app.get('/api/ml/feature-registry', (_req, res) => {
@@ -9279,8 +9615,8 @@ registerScheduledTask('SystemHealth', 2000, async () => {
     const memory = process.memoryUsage();
     const now = Date.now();
     refreshModelDriftRuntime(now);
-    const scannerLastBeat = Math.max(...SCANNER_HEARTBEAT_IDS.map((id) => heartbeats[id] || 0));
-    const isScannerAlive = now - scannerLastBeat < 15_000;
+    const scannerHeartbeat = scannerHeartbeatSnapshot(now);
+    const isScannerAlive = scannerHeartbeat.alive;
 
     const metrics = [
         {
@@ -9340,6 +9676,15 @@ registerScheduledTask('LedgerHealth', 5_000, async () => {
     } catch (error) {
         recordSilentCatch('LedgerHealth.Refresh', error);
         touchRuntimeModule('PNL_LEDGER', 'DEGRADED', `ledger health error: ${String(error)}`);
+    }
+});
+
+registerScheduledTask('PnlParity', LEDGER_PNL_PARITY_INTERVAL_MS, async () => {
+    try {
+        await refreshPnlParityWatchdog();
+    } catch (error) {
+        recordSilentCatch('PnLParity.RefreshTask', error);
+        touchRuntimeModule('PNL_LEDGER', 'DEGRADED', `pnl parity task error: ${String(error)}`);
     }
 });
 
@@ -9436,6 +9781,7 @@ async function bootstrap() {
     await bootstrapRejectedSignalHistory();
     await runStrategyGovernanceCycle();
     await refreshLedgerHealth();
+    await refreshPnlParityWatchdog();
     await refreshMetaController();
     await runCrossHorizonRefreshSafely();
     await refreshMlPipelineStatus();
