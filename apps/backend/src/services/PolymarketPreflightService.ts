@@ -54,6 +54,8 @@ export type PolymarketPreflightResult = {
     ok: boolean;
     orders: PreflightOrderResult[];
     error?: string;
+    throttled?: boolean;
+    bypassed?: boolean;
 };
 
 export type LiveExecutionOrderResult = {
@@ -84,6 +86,8 @@ export type PolymarketLiveExecutionResult = {
     dryRun: boolean;
     reason?: string;
     orders: LiveExecutionOrderResult[];
+    throttled?: boolean;
+    bypassed?: boolean;
 };
 
 export type PolymarketPreflightReadiness = {
@@ -507,6 +511,91 @@ export class PolymarketPreflightService {
         };
     }
 
+    private buildThrottledPreflight(candidate: ParsedExecutionCandidate): PolymarketPreflightResult {
+        return {
+            market: candidate.market,
+            strategy: candidate.strategy,
+            mode: candidate.mode,
+            timestamp: Date.now(),
+            total: candidate.orders.length,
+            signed: 0,
+            failed: 0,
+            ok: false,
+            throttled: true,
+            orders: candidate.orders.map((order) => ({
+                tokenId: order.tokenId,
+                conditionId: order.conditionId,
+                side: order.side,
+                price: order.price,
+                inputSize: order.inputSize,
+                sizeUnit: order.sizeUnit,
+                notionalUsd: order.notionalUsd,
+                size: order.size,
+                ok: false,
+                error: 'Preflight throttled by dedupe/min-interval guard',
+            })),
+            error: 'Preflight throttled by dedupe/min-interval guard',
+        };
+    }
+
+    private buildThrottledExecution(candidate: ParsedExecutionCandidate): PolymarketLiveExecutionResult {
+        return {
+            market: candidate.market,
+            strategy: candidate.strategy,
+            mode: candidate.mode,
+            timestamp: Date.now(),
+            total: candidate.orders.length,
+            posted: 0,
+            failed: 0,
+            ok: false,
+            dryRun: true,
+            throttled: true,
+            reason: 'Live execution throttled by dedupe/min-interval guard',
+            orders: candidate.orders.map((order) => ({
+                tokenId: order.tokenId,
+                conditionId: order.conditionId,
+                side: order.side,
+                price: order.price,
+                inputSize: order.inputSize,
+                sizeUnit: order.sizeUnit,
+                notionalUsd: order.notionalUsd,
+                size: order.size,
+                ok: false,
+                error: 'Live execution throttled by dedupe/min-interval guard',
+            })),
+        };
+    }
+
+    private buildBypassedExecution(
+        candidate: ParsedExecutionCandidate,
+        tradingMode: 'PAPER' | 'LIVE',
+    ): PolymarketLiveExecutionResult {
+        return {
+            market: candidate.market,
+            strategy: candidate.strategy,
+            mode: candidate.mode,
+            timestamp: Date.now(),
+            total: candidate.orders.length,
+            posted: 0,
+            failed: 0,
+            ok: true,
+            dryRun: true,
+            bypassed: true,
+            reason: `Execution bypassed in ${tradingMode} mode`,
+            orders: candidate.orders.map((order) => ({
+                tokenId: order.tokenId,
+                conditionId: order.conditionId,
+                side: order.side,
+                price: order.price,
+                inputSize: order.inputSize,
+                sizeUnit: order.sizeUnit,
+                notionalUsd: order.notionalUsd,
+                size: order.size,
+                ok: true,
+            })),
+        };
+    }
+
     private async signCandidateOrders(
         candidate: ParsedExecutionCandidate,
     ): Promise<{ results: PreflightOrderResult[]; signedOrders: SignedOrderCandidate[] }> {
@@ -605,9 +694,16 @@ export class PolymarketPreflightService {
     }
 
     public static toExecutionLog(result: PolymarketPreflightResult): Record<string, unknown> {
+        const side = result.bypassed
+            ? 'PRECHECK_BYPASS'
+            : result.throttled
+                ? 'PRECHECK_THROTTLED'
+                : result.ok
+                    ? 'PRECHECK'
+                    : 'PRECHECK_ERR';
         return {
             timestamp: result.timestamp,
-            side: result.ok ? 'PRECHECK' : 'PRECHECK_ERR',
+            side,
             market: `${result.market} SDK`,
             price: `${result.signed}/${result.total} signed`,
             size: result.strategy,
@@ -620,10 +716,16 @@ export class PolymarketPreflightService {
 
     public static toLiveExecutionLog(result: PolymarketLiveExecutionResult): Record<string, unknown> {
         const side = result.dryRun
-            ? 'LIVE_SAFE'
+            ? (
+                result.throttled
+                    ? 'LIVE_THROTTLED'
+                    : result.bypassed
+                        ? 'LIVE_BYPASS'
+                        : 'LIVE_SAFE'
+            )
             : result.ok
-            ? 'LIVE_POST'
-            : 'LIVE_POST_ERR';
+                ? 'LIVE_POST'
+                : 'LIVE_POST_ERR';
 
         return {
             timestamp: result.timestamp,
@@ -683,7 +785,7 @@ export class PolymarketPreflightService {
         }
 
         if (await this.shouldThrottlePreflight(candidate)) {
-            return null;
+            return this.buildThrottledPreflight(candidate);
         }
 
         if (!(await this.ensureClient()) || !this.client) {
@@ -714,12 +816,15 @@ export class PolymarketPreflightService {
         tradingMode: 'PAPER' | 'LIVE',
     ): Promise<PolymarketLiveExecutionResult | null> {
         const candidate = parseExecutionCandidate(input);
-        if (!candidate || tradingMode !== 'LIVE') {
+        if (!candidate) {
             return null;
+        }
+        if (tradingMode !== 'LIVE') {
+            return this.buildBypassedExecution(candidate, tradingMode);
         }
 
         if (await this.shouldThrottleExecution(candidate)) {
-            return null;
+            return this.buildThrottledExecution(candidate);
         }
 
         if (!this.isStrategyLiveEnabled(candidate.strategy)) {

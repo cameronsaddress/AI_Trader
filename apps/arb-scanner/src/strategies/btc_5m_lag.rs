@@ -534,6 +534,27 @@ fn next_backoff_secs(current: u64) -> u64 {
     (current * 2).clamp(1, 30)
 }
 
+fn is_transient_ws_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("connection reset")
+        || lower.contains("without closing handshake")
+        || lower.contains("broken pipe")
+        || lower.contains("connection closed")
+        || lower.contains("io error")
+        || lower.contains("timed out")
+}
+
+fn is_transient_ws_error(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    if matches!(
+        error,
+        tokio_tungstenite::tungstenite::Error::ConnectionClosed
+            | tokio_tungstenite::tungstenite::Error::AlreadyClosed
+    ) {
+        return true;
+    }
+    is_transient_ws_error_message(&error.to_string())
+}
+
 fn spawn_binance_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
     let ws_url = binance_ws_url();
     tokio::spawn(async move {
@@ -1331,7 +1352,11 @@ impl Strategy for Btc5mLagStrategy {
             let mut poly_ws = match connect_async(request).await {
                 Ok((ws, _)) => ws,
                 Err(e) => {
-                    error!("Polymarket WS connect failed: {}", e);
+                    if is_transient_ws_error(&e) {
+                        warn!("BTC_5M Polymarket WS connect transient failure: {}", e);
+                    } else {
+                        error!("Polymarket WS connect failed: {}", e);
+                    }
                     sleep(Duration::from_secs(3)).await;
                     continue;
                 }
@@ -1369,7 +1394,11 @@ impl Strategy for Btc5mLagStrategy {
                             Some(Ok(Message::Binary(_))) | Some(Ok(Message::Pong(_))) => {}
                             Some(Ok(_)) => {}
                             Some(Err(e)) => {
-                                error!("BTC_5M Polymarket WS error: {}", e);
+                                if is_transient_ws_error(&e) {
+                                    warn!("BTC_5M Polymarket WS transient error; reconnecting ({})", e);
+                                } else {
+                                    error!("BTC_5M Polymarket WS error: {}", e);
+                                }
                                 break;
                             }
                             None => {
@@ -1382,6 +1411,18 @@ impl Strategy for Btc5mLagStrategy {
                         let now_ms = Utc::now().timestamp_millis();
                         let now_ts = Utc::now().timestamp();
                         let mode = read_trading_mode(&mut conn).await;
+                        let reset_ts = read_simulation_reset_ts(&mut conn).await;
+                        if reset_ts > last_seen_reset_ts {
+                            last_seen_reset_ts = reset_ts;
+                            open_position = None;
+                            settlement_wait_start_ms = None;
+                            last_live_preview_ms = 0;
+                            last_hold_scan_ms = 0;
+                            consecutive_losses = 0;
+                            clear_open_position(&mut conn, self.strategy_id()).await;
+                            publish_heartbeat(&mut conn, self.heartbeat_id()).await;
+                            continue;
+                        }
 
                         if now_ts >= expiry_ts {
                             if mode == TradingMode::Live {
@@ -1742,16 +1783,6 @@ impl Strategy for Btc5mLagStrategy {
                                 publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
                                 last_hold_scan_ms = now_ms;
                             }
-                            publish_heartbeat(&mut conn, self.heartbeat_id()).await;
-                            continue;
-                        }
-
-                        let reset_ts = read_simulation_reset_ts(&mut conn).await;
-                        if reset_ts > last_seen_reset_ts {
-                            last_seen_reset_ts = reset_ts;
-                            open_position = None;
-                            last_live_preview_ms = 0;
-                            clear_open_position(&mut conn, self.strategy_id()).await;
                             publish_heartbeat(&mut conn, self.heartbeat_id()).await;
                             continue;
                         }
@@ -2668,6 +2699,7 @@ impl Strategy for Btc5mLagStrategy {
                                 let exec_msg = serde_json::json!({
                                     "execution_id": execution_id,
                                     "market": "BTC 5m Engine",
+                                    "market_id": target_market.market_id.clone(),
                                     "side": "ENTRY",
                                     "price": best_price,
                                     "size": size,
@@ -2676,6 +2708,8 @@ impl Strategy for Btc5mLagStrategy {
                                     "details": {
                                         "strategy": self.strategy_id(),
                                         "side": side_label,
+                                        "token_id": best_token.clone(),
+                                        "condition_id": target_market.market_id.clone(),
                                         "spot": spot,
                                         "window_start_spot": window_start_spot,
                                         "fair_yes": fair_yes,

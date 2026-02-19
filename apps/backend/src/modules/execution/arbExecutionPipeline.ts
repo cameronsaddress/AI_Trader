@@ -394,6 +394,30 @@ export async function processArbitrageExecutionWorker(
             return;
         }
         if (!liveExecution) {
+            const bypassPayload = {
+                execution_id: executionId,
+                timestamp: Date.now(),
+                strategy: modelGate.strategy || intelligenceGate.strategy || parsedStrategy || 'UNKNOWN',
+                market_key: parsedMarketKey,
+                bypassed: true,
+                reason: 'live execution bypassed (no polymarket order payload)',
+                mode: currentTradingMode,
+            };
+            deps.touchRuntimeModule('EXECUTION_PREFLIGHT', 'ONLINE', bypassPayload.reason);
+            deps.pushExecutionTraceEvent(executionId, 'LIVE_EXECUTION', bypassPayload, {
+                strategy: bypassPayload.strategy,
+                market_key: bypassPayload.market_key,
+            });
+            deps.emit('execution_log', {
+                execution_id: executionId,
+                timestamp: bypassPayload.timestamp,
+                side: 'LIVE_EXEC_BYPASS',
+                market: deps.marketLabelFromPayload(parsed),
+                price: bypassPayload.reason,
+                size: bypassPayload.strategy,
+                mode: currentTradingMode,
+                details: bypassPayload,
+            });
             return;
         }
         deps.annotateExecutionId(liveExecution, executionId);
@@ -415,45 +439,51 @@ export async function processArbitrageExecutionWorker(
                 payload: asRecord(liveExecution),
             });
         }
-        try {
-            const settlementEvents = await deps.registerAtomicExecution(liveExecution);
-            await deps.emitSettlementEvents(settlementEvents);
-        } catch (error) {
-            const reason = `settlement error: ${errorMessage(error)}`;
-            const settlementPayload = {
-                execution_id: executionId,
-                timestamp: Date.now(),
-                strategy: liveExecution.strategy || modelGate.strategy || intelligenceGate.strategy || parsedStrategy || 'UNKNOWN',
-                market_key: parsedMarketKey,
-                reason,
-                mode: currentTradingMode,
-            };
-            deps.touchRuntimeModule('SETTLEMENT_ENGINE', 'DEGRADED', reason);
-            deps.emit('execution_log', {
-                execution_id: executionId,
-                timestamp: settlementPayload.timestamp,
-                side: 'SETTLEMENT_ERR',
-                market: deps.marketLabelFromPayload(parsed),
-                price: reason,
-                size: settlementPayload.strategy,
-                mode: currentTradingMode,
-                details: settlementPayload,
-            });
-            deps.recordRejectedSignal?.({
-                stage: 'SETTLEMENT',
-                execution_id: executionId,
-                strategy: settlementPayload.strategy,
-                market_key: settlementPayload.market_key,
-                reason,
-                mode: currentTradingMode,
-                timestamp: settlementPayload.timestamp,
-                payload: asRecord(settlementPayload),
-            });
+        if (currentTradingMode === 'LIVE' && liveExecution.ok && !liveExecution.dryRun) {
+            try {
+                const settlementEvents = await deps.registerAtomicExecution(liveExecution);
+                await deps.emitSettlementEvents(settlementEvents);
+            } catch (error) {
+                const reason = `settlement error: ${errorMessage(error)}`;
+                const settlementPayload = {
+                    execution_id: executionId,
+                    timestamp: Date.now(),
+                    strategy: liveExecution.strategy || modelGate.strategy || intelligenceGate.strategy || parsedStrategy || 'UNKNOWN',
+                    market_key: parsedMarketKey,
+                    reason,
+                    mode: currentTradingMode,
+                };
+                deps.touchRuntimeModule('SETTLEMENT_ENGINE', 'DEGRADED', reason);
+                deps.emit('execution_log', {
+                    execution_id: executionId,
+                    timestamp: settlementPayload.timestamp,
+                    side: 'SETTLEMENT_ERR',
+                    market: deps.marketLabelFromPayload(parsed),
+                    price: reason,
+                    size: settlementPayload.strategy,
+                    mode: currentTradingMode,
+                    details: settlementPayload,
+                });
+                deps.recordRejectedSignal?.({
+                    stage: 'SETTLEMENT',
+                    execution_id: executionId,
+                    strategy: settlementPayload.strategy,
+                    market_key: settlementPayload.market_key,
+                    reason,
+                    mode: currentTradingMode,
+                    timestamp: settlementPayload.timestamp,
+                    payload: asRecord(settlementPayload),
+                });
+            }
         }
         return;
     }
 
-    deps.touchRuntimeModule('EXECUTION_PREFLIGHT', preflight.ok ? 'ONLINE' : 'DEGRADED', `${preflight.strategy} preflight ${preflight.ok ? 'ok' : 'failed'}`);
+    const preflightHealth: RuntimeHealth = preflight.ok || preflight.throttled ? 'ONLINE' : 'DEGRADED';
+    const preflightDetail = preflight.throttled
+        ? `${preflight.strategy} preflight throttled`
+        : `${preflight.strategy} preflight ${preflight.ok ? 'ok' : 'failed'}`;
+    deps.touchRuntimeModule('EXECUTION_PREFLIGHT', preflightHealth, preflightDetail);
     deps.annotateExecutionId(preflight, executionId);
     deps.pushExecutionTraceEvent(executionId, 'PREFLIGHT', preflight, {
         strategy: preflight.strategy || modelGate.strategy || intelligenceGate.strategy || parsedStrategy,
@@ -516,6 +546,30 @@ export async function processArbitrageExecutionWorker(
         return;
     }
     if (!liveExecution) {
+        const bypassPayload = {
+            execution_id: executionId,
+            timestamp: Date.now(),
+            strategy: preflight.strategy || modelGate.strategy || intelligenceGate.strategy || parsedStrategy || 'UNKNOWN',
+            market_key: parsedMarketKey,
+            bypassed: true,
+            reason: 'live execution bypassed (no polymarket order payload)',
+            mode: currentTradingMode,
+        };
+        deps.touchRuntimeModule('EXECUTION_PREFLIGHT', 'ONLINE', bypassPayload.reason);
+        deps.pushExecutionTraceEvent(executionId, 'LIVE_EXECUTION', bypassPayload, {
+            strategy: bypassPayload.strategy,
+            market_key: bypassPayload.market_key,
+        });
+        deps.emit('execution_log', {
+            execution_id: executionId,
+            timestamp: bypassPayload.timestamp,
+            side: 'LIVE_EXEC_BYPASS',
+            market: deps.marketLabelFromPayload(parsed),
+            price: bypassPayload.reason,
+            size: bypassPayload.strategy,
+            mode: currentTradingMode,
+            details: bypassPayload,
+        });
         return;
     }
     deps.annotateExecutionId(liveExecution, executionId);
@@ -537,39 +591,41 @@ export async function processArbitrageExecutionWorker(
             payload: asRecord(liveExecution),
         });
     }
-    try {
-        const settlementEvents = await deps.registerAtomicExecution(liveExecution);
-        await deps.emitSettlementEvents(settlementEvents);
-    } catch (error) {
-        const reason = `settlement error: ${errorMessage(error)}`;
-        const settlementPayload = {
-            execution_id: executionId,
-            timestamp: Date.now(),
-            strategy: liveExecution.strategy || preflight.strategy || modelGate.strategy || intelligenceGate.strategy || parsedStrategy || 'UNKNOWN',
-            market_key: parsedMarketKey,
-            reason,
-            mode: currentTradingMode,
-        };
-        deps.touchRuntimeModule('SETTLEMENT_ENGINE', 'DEGRADED', reason);
-        deps.emit('execution_log', {
-            execution_id: executionId,
-            timestamp: settlementPayload.timestamp,
-            side: 'SETTLEMENT_ERR',
-            market: deps.marketLabelFromPayload(parsed),
-            price: reason,
-            size: settlementPayload.strategy,
-            mode: currentTradingMode,
-            details: settlementPayload,
-        });
-        deps.recordRejectedSignal?.({
-            stage: 'SETTLEMENT',
-            execution_id: executionId,
-            strategy: settlementPayload.strategy,
-            market_key: settlementPayload.market_key,
-            reason,
-            mode: currentTradingMode,
-            timestamp: settlementPayload.timestamp,
-            payload: asRecord(settlementPayload),
-        });
+    if (currentTradingMode === 'LIVE' && liveExecution.ok && !liveExecution.dryRun) {
+        try {
+            const settlementEvents = await deps.registerAtomicExecution(liveExecution);
+            await deps.emitSettlementEvents(settlementEvents);
+        } catch (error) {
+            const reason = `settlement error: ${errorMessage(error)}`;
+            const settlementPayload = {
+                execution_id: executionId,
+                timestamp: Date.now(),
+                strategy: liveExecution.strategy || preflight.strategy || modelGate.strategy || intelligenceGate.strategy || parsedStrategy || 'UNKNOWN',
+                market_key: parsedMarketKey,
+                reason,
+                mode: currentTradingMode,
+            };
+            deps.touchRuntimeModule('SETTLEMENT_ENGINE', 'DEGRADED', reason);
+            deps.emit('execution_log', {
+                execution_id: executionId,
+                timestamp: settlementPayload.timestamp,
+                side: 'SETTLEMENT_ERR',
+                market: deps.marketLabelFromPayload(parsed),
+                price: reason,
+                size: settlementPayload.strategy,
+                mode: currentTradingMode,
+                details: settlementPayload,
+            });
+            deps.recordRejectedSignal?.({
+                stage: 'SETTLEMENT',
+                execution_id: executionId,
+                strategy: settlementPayload.strategy,
+                market_key: settlementPayload.market_key,
+                reason,
+                mode: currentTradingMode,
+                timestamp: settlementPayload.timestamp,
+                payload: asRecord(settlementPayload),
+            });
+        }
     }
 }

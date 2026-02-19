@@ -228,7 +228,7 @@ export const STRATEGY_GOVERNANCE_MIN_TEST_TRADES = Math.max(
 );
 
 // ── Feature Registry ────────────────────────────────────────────────
-export const FEATURE_REGISTRY_MAX_ROWS = Math.max(1000, Number(process.env.FEATURE_REGISTRY_MAX_ROWS || '12000'));
+export const FEATURE_REGISTRY_MAX_ROWS = Math.max(5_000, Number(process.env.FEATURE_REGISTRY_MAX_ROWS || '30000'));
 export const FEATURE_REGISTRY_LABEL_LOOKBACK_MS = Math.max(
     60_000,
     Number(process.env.FEATURE_REGISTRY_LABEL_LOOKBACK_MS || '1800000'),
@@ -321,12 +321,20 @@ export const MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT = Math.min(
 // ── ML Trainer ──────────────────────────────────────────────────────
 export const MODEL_TRAINER_ENABLED = process.env.MODEL_TRAINER_ENABLED !== 'false';
 export const MODEL_TRAINER_INTERVAL_MS = Math.max(30_000, Number(process.env.MODEL_TRAINER_INTERVAL_MS || '120000'));
-export const MODEL_TRAINER_MIN_LABELED_ROWS = Math.max(40, Number(process.env.MODEL_TRAINER_MIN_LABELED_ROWS || '80'));
+export const MODEL_TRAINER_MIN_LABELED_ROWS = Math.max(20, Number(process.env.MODEL_TRAINER_MIN_LABELED_ROWS || '80'));
 export const MODEL_TRAINER_MIN_NEW_LABELS = Math.max(1, Number(process.env.MODEL_TRAINER_MIN_NEW_LABELS || '8'));
 export const MODEL_TRAINER_MAX_ROWS = Math.max(MODEL_TRAINER_MIN_LABELED_ROWS, Number(process.env.MODEL_TRAINER_MAX_ROWS || '3000'));
-export const MODEL_TRAINER_SPLITS = Math.max(3, Number(process.env.MODEL_TRAINER_SPLITS || '5'));
-export const MODEL_TRAINER_PURGE_ROWS = Math.max(8, Number(process.env.MODEL_TRAINER_PURGE_ROWS || '24'));
-export const MODEL_TRAINER_EMBARGO_ROWS = Math.max(8, Number(process.env.MODEL_TRAINER_EMBARGO_ROWS || '24'));
+export const MODEL_TRAINER_SPLITS = Math.max(3, Number(process.env.MODEL_TRAINER_SPLITS || '3'));
+export const MODEL_TRAINER_PURGE_ROWS = Math.max(2, Number(process.env.MODEL_TRAINER_PURGE_ROWS || '4'));
+export const MODEL_TRAINER_EMBARGO_ROWS = Math.max(2, Number(process.env.MODEL_TRAINER_EMBARGO_ROWS || '4'));
+export const MODEL_TRAINER_MIN_TRAIN_ROWS_PER_FOLD = Math.max(
+    8,
+    Number(process.env.MODEL_TRAINER_MIN_TRAIN_ROWS_PER_FOLD || '10'),
+);
+export const MODEL_TRAINER_MIN_TEST_ROWS_PER_FOLD = Math.max(
+    4,
+    Number(process.env.MODEL_TRAINER_MIN_TEST_ROWS_PER_FOLD || '4'),
+);
 export const MODEL_PREDICTION_TRACE_MAX = Math.max(5_000, Number(process.env.MODEL_PREDICTION_TRACE_MAX || '100000'));
 export const MODEL_INFERENCE_MAX_TRACKED_ROWS = Math.max(
     1_000,
@@ -378,7 +386,8 @@ export const RUNTIME_MODULE_CATALOG: Array<Omit<RuntimeModuleState, 'heartbeat_m
         label: 'Intelligence Gate',
         phase: 'PHASE_1',
         health: 'STANDBY',
-        expected_interval_ms: 10_000,
+        // Event-driven module; should not flip OFFLINE when no executions occur.
+        expected_interval_ms: 0,
     },
     {
         id: 'RISK_ALLOCATOR',
@@ -406,7 +415,8 @@ export const RUNTIME_MODULE_CATALOG: Array<Omit<RuntimeModuleState, 'heartbeat_m
         label: 'Execution Preflight',
         phase: 'PHASE_1',
         health: 'STANDBY',
-        expected_interval_ms: 10_000,
+        // Event-driven module; should not flip OFFLINE when no executions occur.
+        expected_interval_ms: 0,
     },
     {
         id: 'TRADING_MODE_GUARD',

@@ -216,6 +216,7 @@ export type StrategyTradeSample = {
     label_eligible?: boolean;
     execution_id?: string;
     market_key?: string | null;
+    feature_row_id?: string;
 };
 
 // ── Walk-forward / governance ───────────────────────────────────────
@@ -426,6 +427,7 @@ export type ExecutionTrace = {
     execution_id: string;
     strategy: string | null;
     market_key: string | null;
+    feature_row_id: string | null;
     created_at: number;
     updated_at: number;
     scan_snapshot: StrategyScanState | null;

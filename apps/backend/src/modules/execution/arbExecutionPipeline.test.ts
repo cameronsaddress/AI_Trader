@@ -221,6 +221,24 @@ describe('processArbitrageExecutionWorker', () => {
         expect(rejected.some((entry) => entry.stage === 'PREFLIGHT')).toBe(true);
     });
 
+    it('records preflight throttle outcomes for replay analysis', async () => {
+        const executeSpy = jest.fn(async () => buildLiveExecution());
+        const { deps, rejected } = createDeps({
+            preflightFromExecution: async () => buildPreflight({
+                ok: false,
+                throttled: true,
+                error: 'Preflight throttled by dedupe/min-interval guard',
+            }),
+            executeFromExecution: executeSpy,
+        });
+
+        await processArbitrageExecutionWorker(buildContext(), deps);
+
+        expect(executeSpy).not.toHaveBeenCalled();
+        expect(rejected.some((entry) => entry.stage === 'PREFLIGHT')).toBe(true);
+        expect(rejected.some((entry) => entry.reason.includes('throttled'))).toBe(true);
+    });
+
     it('records live execution failures for replay analysis', async () => {
         const { deps, rejected } = createDeps({
             executeFromExecution: async () => buildLiveExecution({
@@ -233,6 +251,22 @@ describe('processArbitrageExecutionWorker', () => {
         await processArbitrageExecutionWorker(buildContext(), deps);
 
         expect(rejected.some((entry) => entry.stage === 'LIVE_EXECUTION')).toBe(true);
+    });
+
+    it('skips settlement registration for dry-run live executions', async () => {
+        const settlementSpy = jest.fn(async () => []);
+        const { deps } = createDeps({
+            executeFromExecution: async () => buildLiveExecution({
+                ok: true,
+                dryRun: true,
+                reason: 'LIVE_ORDER_POSTING_ENABLED=false (safe dry-run)',
+            }),
+            registerAtomicExecution: settlementSpy,
+        });
+
+        await processArbitrageExecutionWorker(buildContext(), deps);
+
+        expect(settlementSpy).not.toHaveBeenCalled();
     });
 
     it('records preflight dependency failures without throwing', async () => {

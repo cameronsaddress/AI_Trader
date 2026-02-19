@@ -6,6 +6,8 @@ import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import fs from 'fs/promises';
+import { createReadStream } from 'fs';
+import * as readline from 'readline';
 import path from 'path';
 import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import { Side } from '@polymarket/clob-client';
@@ -19,7 +21,7 @@ import { HyperliquidExecutor, TradingMode } from './services/HyperliquidExecutor
 import { PolymarketPreflightService } from './services/PolymarketPreflightService';
 import type { PolymarketLiveExecutionResult } from './services/PolymarketPreflightService';
 import { PolymarketSettlementService, settlementEventToExecutionLog } from './services/PolymarketSettlementService';
-import { StrategyTradeRecorder } from './services/StrategyTradeRecorder';
+import { StrategyTradeRecorder, classifyClosureReason, inferTradeClosureReason } from './services/StrategyTradeRecorder';
 import { FeatureRegistryRecorder } from './services/FeatureRegistryRecorder';
 import { RejectedSignalRecorder } from './services/RejectedSignalRecorder';
 import { extractBearerToken } from './middleware/auth';
@@ -195,6 +197,7 @@ import {
     MODEL_TRAINER_ENABLED, MODEL_TRAINER_INTERVAL_MS,
     MODEL_TRAINER_MIN_LABELED_ROWS, MODEL_TRAINER_MIN_NEW_LABELS, MODEL_TRAINER_MAX_ROWS,
     MODEL_TRAINER_SPLITS, MODEL_TRAINER_PURGE_ROWS, MODEL_TRAINER_EMBARGO_ROWS,
+    MODEL_TRAINER_MIN_TRAIN_ROWS_PER_FOLD, MODEL_TRAINER_MIN_TEST_ROWS_PER_FOLD,
     MODEL_PREDICTION_TRACE_MAX, MODEL_INFERENCE_MAX_TRACKED_ROWS,
     BACKEND_APP_ROOT, FEATURE_REGISTRY_EVENT_LOG_PATH,
     FEATURE_DATASET_MANIFEST_PATH, SIGNAL_MODEL_REPORT_PATH,
@@ -204,10 +207,23 @@ import {
 
 // Runtime state (not extractable — mutable per-process)
 const executionTraces = new Map<string, ExecutionTrace>();
+const rejectedSignalsByExecutionId = new Map<string, RejectedSignalRecord>();
 const strategyExecutionHistory = new Map<string, Record<string, unknown>[]>();
+type ExecutionHistoryContext = {
+    execution_id: string;
+    strategy: string | null;
+    market_key: string | null;
+    feature_row_id: string | null;
+    timestamp: number;
+};
+const executionHistoryContextById = new Map<string, ExecutionHistoryContext>();
 const STRATEGY_EXECUTION_HISTORY_LIMIT = Math.max(
     100,
     Number(process.env.STRATEGY_EXECUTION_HISTORY_LIMIT || '500'),
+);
+const EXECUTION_HISTORY_CONTEXT_MAX = Math.max(
+    2_000,
+    STRATEGY_IDS.length * STRATEGY_EXECUTION_HISTORY_LIMIT,
 );
 const STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX = (
     process.env.STRATEGY_EXECUTION_HISTORY_REDIS_PREFIX
@@ -232,6 +248,10 @@ interface SilentCatchTelemetryEntry {
 
 const silentCatchTelemetry: Record<string, SilentCatchTelemetryEntry> = {};
 const SILENT_CATCH_LOG_COOLDOWN_MS = 30_000;
+const FEATURE_LABEL_BACKFILL_INTERVAL_MS = Math.max(
+    60_000,
+    Number(process.env.FEATURE_LABEL_BACKFILL_INTERVAL_MS || '180000'),
+);
 
 function toTelemetryErrorMessage(error: unknown): string {
     if (error instanceof Error) {
@@ -609,6 +629,10 @@ const MODEL_INFERENCE_TRIM_BATCH_ROWS = Math.max(
     Math.floor(MODEL_INFERENCE_MAX_TRACKED_ROWS * 0.10),
 );
 const MODEL_INFERENCE_TRIM_TRIGGER_ROWS = MODEL_INFERENCE_MAX_TRACKED_ROWS + MODEL_INFERENCE_TRIM_BATCH_ROWS;
+const MODEL_INFERENCE_PAYLOAD_MAX_ROWS = Math.max(
+    50,
+    Math.min(MODEL_INFERENCE_MAX_TRACKED_ROWS, Number(process.env.MODEL_INFERENCE_PAYLOAD_MAX_ROWS || '300')),
+);
 let modelDriftState: ModelDriftState = {
     status: 'HEALTHY',
     sample_count: 0,
@@ -617,7 +641,9 @@ let modelDriftState: ModelDriftState = {
     calibration_error_ema: 0,
     accuracy_pct: 0,
     gate_enabled: MODEL_PROBABILITY_GATE_ENABLED,
-    gate_enforcing: MODEL_PROBABILITY_GATE_ENABLED && MODEL_PROBABILITY_GATE_ENFORCE_PAPER,
+    gate_enforcing: MODEL_PROBABILITY_GATE_ENABLED
+        && MODEL_PROBABILITY_GATE_ENFORCE_PAPER
+        && !MODEL_PROBABILITY_GATE_REQUIRE_MODEL,
     gate_disabled_until: 0,
     issues: [],
     by_strategy: {},
@@ -736,6 +762,19 @@ type ExecutionNettingMarketState = {
     strategy_directional_notional: Record<string, number>;
     updated_at: number;
 };
+type ScanFeatureSchemaState = {
+    strategy: string;
+    scans: number;
+    expected_keys: string[];
+    missing_streak: number;
+    last_new_keys: string[];
+    last_missing_keys: string[];
+    overflow_events: number;
+    overflow_dropped_features: number;
+    last_overflow_at: number;
+    last_alert_at: number;
+    updated_at: number;
+};
 type ExecutionPreparationStage = 'SHORTFALL' | 'NETTING';
 type ExecutionPreparationResult = {
     ok: boolean;
@@ -803,6 +842,7 @@ let crossHorizonRouterState: CrossHorizonRouterState = {
     reason: 'cross-horizon router not initialized',
 };
 const executionNettingByMarket = new Map<string, ExecutionNettingMarketState>();
+const scanFeatureSchemaByStrategy: Record<string, ScanFeatureSchemaState> = {};
 const runtimeModules: Record<string, RuntimeModuleState> = Object.fromEntries(
     RUNTIME_MODULE_CATALOG.map((module) => [module.id, {
         ...module,
@@ -1347,8 +1387,41 @@ function normalizeTimestampMs(input: unknown): number {
     return Number.isFinite(parsed) ? parsed : Date.now();
 }
 
-const SCAN_META_FEATURE_LIMIT = 32;
-const SCAN_META_FEATURE_MAX_DEPTH = 2;
+const SCAN_META_FEATURE_LIMIT = Math.max(
+    16,
+    Math.min(256, Math.floor(Number(process.env.SCAN_META_FEATURE_LIMIT || '96'))),
+);
+const SCAN_META_FEATURE_MAX_DEPTH = Math.max(
+    1,
+    Math.min(6, Math.floor(Number(process.env.SCAN_META_FEATURE_MAX_DEPTH || '3'))),
+);
+const SCAN_META_FEATURE_DROPPED_KEY_PREVIEW = 8;
+const SCAN_FEATURE_SCHEMA_WARMUP_SCANS = Math.max(
+    2,
+    Math.floor(Number(process.env.SCAN_FEATURE_SCHEMA_WARMUP_SCANS || '12')),
+);
+const SCAN_FEATURE_SCHEMA_MAX_TRACKED_KEYS = Math.max(
+    SCAN_META_FEATURE_LIMIT,
+    Math.min(512, Math.floor(Number(process.env.SCAN_FEATURE_SCHEMA_MAX_TRACKED_KEYS || '192'))),
+);
+const SCAN_FEATURE_SCHEMA_ALERT_COOLDOWN_MS = Math.max(
+    10_000,
+    Number(process.env.SCAN_FEATURE_SCHEMA_ALERT_COOLDOWN_MS || '60000'),
+);
+const SCAN_FEATURE_SCHEMA_MISSING_RATIO_ALERT = Math.min(
+    0.95,
+    Math.max(0.10, Number(process.env.SCAN_FEATURE_SCHEMA_MISSING_RATIO_ALERT || '0.45')),
+);
+const SCAN_FEATURE_SCHEMA_MISSING_STREAK_ALERT = Math.max(
+    2,
+    Math.floor(Number(process.env.SCAN_FEATURE_SCHEMA_MISSING_STREAK_ALERT || '4')),
+);
+
+type ScanMetaFeatureExtraction = {
+    features: Record<string, number>;
+    dropped_count: number;
+    dropped_keys: string[];
+};
 
 function normalizeFeatureColumn(input: string, prefix = 'meta'): string | null {
     const normalized = `${prefix}_${input}`
@@ -1361,13 +1434,51 @@ function normalizeFeatureColumn(input: string, prefix = 'meta'): string | null {
     return normalized.slice(0, 48);
 }
 
+type ScanMetaCollectionState = {
+    count: number;
+    dropped: number;
+    dropped_keys: string[];
+};
+
+function pushDroppedMetaFeatureKey(state: ScanMetaCollectionState, key: string): void {
+    if (!key || state.dropped_keys.length >= SCAN_META_FEATURE_DROPPED_KEY_PREVIEW) {
+        return;
+    }
+    if (!state.dropped_keys.includes(key)) {
+        state.dropped_keys.push(key);
+    }
+}
+
+function countNumericMetaCandidates(input: unknown, depth = 0): number {
+    if (depth > SCAN_META_FEATURE_MAX_DEPTH) {
+        return 0;
+    }
+    if (Array.isArray(input)) {
+        return 0;
+    }
+    const numeric = asNumber(input);
+    if (numeric !== null && Number.isFinite(numeric)) {
+        return 1;
+    }
+    const record = asRecord(input);
+    if (!record) {
+        return 0;
+    }
+    let total = 0;
+    for (const value of Object.values(record)) {
+        total += countNumericMetaCandidates(value, depth + 1);
+    }
+    return total;
+}
+
 function collectNumericMetaFeatures(
     input: unknown,
     prefix: string,
     out: Record<string, number>,
+    state: ScanMetaCollectionState,
     depth = 0,
 ): void {
-    if (Object.keys(out).length >= SCAN_META_FEATURE_LIMIT || depth > SCAN_META_FEATURE_MAX_DEPTH) {
+    if (depth > SCAN_META_FEATURE_MAX_DEPTH) {
         return;
     }
 
@@ -1378,8 +1489,20 @@ function collectNumericMetaFeatures(
     const numeric = asNumber(input);
     if (numeric !== null && Number.isFinite(numeric)) {
         const key = normalizeFeatureColumn(prefix, 'meta');
+        if (!key) {
+            return;
+        }
+        if (Object.prototype.hasOwnProperty.call(out, key)) {
+            return;
+        }
+        if (state.count >= SCAN_META_FEATURE_LIMIT) {
+            state.dropped += 1;
+            pushDroppedMetaFeatureKey(state, key);
+            return;
+        }
         if (key && !Object.prototype.hasOwnProperty.call(out, key)) {
             out[key] = numeric;
+            state.count += 1;
         }
         return;
     }
@@ -1389,23 +1512,51 @@ function collectNumericMetaFeatures(
         return;
     }
 
-    for (const [rawKey, value] of Object.entries(record)) {
-        if (Object.keys(out).length >= SCAN_META_FEATURE_LIMIT) {
-            break;
-        }
+    const entries = Object.entries(record);
+    for (let index = 0; index < entries.length; index += 1) {
+        const [rawKey, value] = entries[index];
         const key = rawKey.trim();
         if (!key) {
             continue;
         }
         const childPrefix = depth === 0 ? key : `${prefix}_${key}`;
-        collectNumericMetaFeatures(value, childPrefix, out, depth + 1);
+        if (state.count >= SCAN_META_FEATURE_LIMIT) {
+            const remainingEntries = entries.slice(index);
+            let dropped = 0;
+            for (const [remainingKey, remainingValue] of remainingEntries) {
+                const normalizedRemainingKey = remainingKey.trim();
+                if (!normalizedRemainingKey) {
+                    continue;
+                }
+                const remainingPrefix = depth === 0
+                    ? normalizedRemainingKey
+                    : `${prefix}_${normalizedRemainingKey}`;
+                const normalizedFeatureKey = normalizeFeatureColumn(remainingPrefix, 'meta');
+                if (normalizedFeatureKey) {
+                    pushDroppedMetaFeatureKey(state, normalizedFeatureKey);
+                }
+                dropped += countNumericMetaCandidates(remainingValue, depth + 1);
+            }
+            state.dropped += dropped;
+            break;
+        }
+        collectNumericMetaFeatures(value, childPrefix, out, state, depth + 1);
     }
 }
 
-function extractScanMetaFeatures(meta: unknown): Record<string, number> {
+function extractScanMetaFeatures(meta: unknown): ScanMetaFeatureExtraction {
     const out: Record<string, number> = {};
-    collectNumericMetaFeatures(meta, 'meta', out, 0);
-    return out;
+    const state: ScanMetaCollectionState = {
+        count: 0,
+        dropped: 0,
+        dropped_keys: [],
+    };
+    collectNumericMetaFeatures(meta, 'meta', out, state, 0);
+    return {
+        features: out,
+        dropped_count: state.dropped,
+        dropped_keys: state.dropped_keys,
+    };
 }
 
 function normalizeMarketKey(input: unknown): string | null {
@@ -2225,6 +2376,98 @@ async function persistStrategyExecutionHistoryEntry(
     );
 }
 
+function parseExecutionHistoryContext(
+    payload: Record<string, unknown>,
+    strategyHint: string | null = null,
+): ExecutionHistoryContext | null {
+    const details = asRecord(payload.details);
+    const executionId = asString(payload.execution_id)
+        || asString(payload.executionId)
+        || asString(details?.execution_id)
+        || asString(details?.executionId);
+    if (!executionId) {
+        return null;
+    }
+
+    const strategyRaw = asString(payload.strategy)
+        || asString(payload.strategy_id)
+        || strategyHint;
+    const strategy = strategyRaw ? strategyRaw.toUpperCase() : null;
+    const marketKey = extractExecutionMarketKey(payload)
+        || asString(payload.market_key)
+        || asString(payload.marketKey)
+        || asString(details?.market_key)
+        || asString(details?.marketKey)
+        || null;
+    const featureRowId = asString(payload.feature_row_id)
+        || asString(payload.featureRowId)
+        || asString(details?.feature_row_id)
+        || asString(details?.featureRowId)
+        || null;
+    const timestamp = asNumber(payload.timestamp)
+        ?? asNumber(details?.timestamp)
+        ?? Date.now();
+
+    return {
+        execution_id: executionId,
+        strategy,
+        market_key: marketKey,
+        feature_row_id: featureRowId,
+        timestamp,
+    };
+}
+
+function upsertExecutionHistoryContext(context: ExecutionHistoryContext): void {
+    const existing = executionHistoryContextById.get(context.execution_id);
+    if (existing) {
+        existing.strategy = existing.strategy || context.strategy;
+        existing.market_key = existing.market_key || context.market_key;
+        existing.feature_row_id = existing.feature_row_id || context.feature_row_id;
+        existing.timestamp = Math.max(existing.timestamp, context.timestamp);
+    } else {
+        executionHistoryContextById.set(context.execution_id, { ...context });
+    }
+
+    if (executionHistoryContextById.size <= EXECUTION_HISTORY_CONTEXT_MAX) {
+        return;
+    }
+
+    const retained = [...executionHistoryContextById.values()]
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, EXECUTION_HISTORY_CONTEXT_MAX);
+    executionHistoryContextById.clear();
+    for (const entry of retained) {
+        executionHistoryContextById.set(entry.execution_id, entry);
+    }
+}
+
+function rebuildExecutionHistoryContextIndex(): void {
+    executionHistoryContextById.clear();
+    for (const [strategy, rows] of strategyExecutionHistory.entries()) {
+        for (const row of rows) {
+            const parsed = parseExecutionHistoryContext(row, strategy);
+            if (!parsed) {
+                continue;
+            }
+            upsertExecutionHistoryContext(parsed);
+        }
+    }
+}
+
+function resolveExecutionHistoryContext(
+    executionId: string,
+    strategyHint: string | null = null,
+): ExecutionHistoryContext | null {
+    const entry = executionHistoryContextById.get(executionId);
+    if (!entry) {
+        return null;
+    }
+    if (strategyHint && entry.strategy && entry.strategy !== strategyHint.toUpperCase()) {
+        return null;
+    }
+    return entry;
+}
+
 async function loadStrategyExecutionHistoryFromRedis(): Promise<void> {
     const restored = await restoreExecutionHistory(
         redisClient,
@@ -2239,6 +2482,7 @@ async function loadStrategyExecutionHistoryFromRedis(): Promise<void> {
             strategyExecutionHistory.set(strategy, rows);
         }
     }
+    rebuildExecutionHistoryContextIndex();
 }
 
 function pushStrategyExecutionHistory(strategyId: string, payload: Record<string, unknown>): void {
@@ -2257,6 +2501,10 @@ function pushStrategyExecutionHistory(strategyId: string, payload: Record<string
         existing.splice(0, existing.length - STRATEGY_EXECUTION_HISTORY_LIMIT);
     }
     strategyExecutionHistory.set(key, existing);
+    const parsed = parseExecutionHistoryContext(normalized, key);
+    if (parsed) {
+        upsertExecutionHistoryContext(parsed);
+    }
     fireAndForget(
         'StrategyExecutionHistory.Persist',
         persistStrategyExecutionHistoryEntry(key, normalized),
@@ -2266,6 +2514,7 @@ function pushStrategyExecutionHistory(strategyId: string, payload: Record<string
 
 async function clearStrategyExecutionHistory(): Promise<void> {
     strategyExecutionHistory.clear();
+    executionHistoryContextById.clear();
     await clearExecutionHistoryStore(
         redisClient,
         STRATEGY_EXECUTION_HISTORY_STORE_CONFIG,
@@ -2293,10 +2542,18 @@ function snapshotScanForExecution(strategy: string | null, marketKey: string | n
     return latestStrategyScans.get(strategy) || null;
 }
 
+function featureRowIdForScan(scan: StrategyScanState | null): string | null {
+    if (!scan) {
+        return null;
+    }
+    return `${scan.strategy}:${scan.market_key}:${scan.timestamp}`;
+}
+
 function upsertExecutionTrace(executionId: string, meta: {
     strategy: string | null;
     market_key: string | null;
     scan_snapshot: StrategyScanState | null;
+    feature_row_id: string | null;
 }): ExecutionTrace {
     const now = Date.now();
     const existing = executionTraces.get(executionId);
@@ -2304,6 +2561,7 @@ function upsertExecutionTrace(executionId: string, meta: {
         existing.strategy = existing.strategy || meta.strategy;
         existing.market_key = existing.market_key || meta.market_key;
         existing.scan_snapshot = existing.scan_snapshot || meta.scan_snapshot;
+        existing.feature_row_id = existing.feature_row_id || meta.feature_row_id;
         existing.updated_at = now;
         return existing;
     }
@@ -2312,6 +2570,7 @@ function upsertExecutionTrace(executionId: string, meta: {
         execution_id: executionId,
         strategy: meta.strategy,
         market_key: meta.market_key,
+        feature_row_id: meta.feature_row_id,
         created_at: now,
         updated_at: now,
         scan_snapshot: meta.scan_snapshot,
@@ -2328,10 +2587,12 @@ function pushExecutionTraceEvent(
     payload: unknown,
     meta: { strategy: string | null; market_key: string | null } = { strategy: null, market_key: null },
 ): void {
+    const scanSnapshot = snapshotScanForExecution(meta.strategy, meta.market_key);
     const trace = upsertExecutionTrace(executionId, {
         strategy: meta.strategy,
         market_key: meta.market_key,
-        scan_snapshot: snapshotScanForExecution(meta.strategy, meta.market_key),
+        scan_snapshot: scanSnapshot,
+        feature_row_id: featureRowIdForScan(scanSnapshot),
     });
     const now = Date.now();
     trace.events.push({ type, timestamp: now, payload });
@@ -2805,6 +3066,26 @@ async function isLiveReady(): Promise<LiveReadinessResult> {
         failures.push('MODEL_PROBABILITY_GATE_ENFORCE_LIVE is disabled');
     }
 
+    if (!mlPipelineStatus.model_eligible) {
+        failures.push(`ML model not eligible (${mlPipelineStatus.model_reason || 'no training report'})`);
+    }
+
+    if (!signalModelArtifact || !modelInferenceState.model_loaded) {
+        failures.push('ML model artifact is not loaded');
+    }
+
+    const latestInferenceTs = Object.values(modelInferenceState.latest)
+        .reduce((latest, entry) => Math.max(latest, entry.timestamp), 0);
+    if (latestInferenceTs <= 0) {
+        failures.push('ML inference stream has no rows');
+    } else {
+        const maxInferenceAgeMs = Math.max(15_000, MODEL_PROBABILITY_GATE_MAX_STALENESS_MS * 3);
+        const inferenceAgeMs = now - latestInferenceTs;
+        if (inferenceAgeMs > maxInferenceAgeMs) {
+            failures.push(`ML inference stale (${inferenceAgeMs}ms > ${maxInferenceAgeMs}ms)`);
+        }
+    }
+
     const settlementReadiness = settlementService.getReadinessSnapshot();
     for (const issue of settlementReadiness.failures) {
         failures.push(`Settlement: ${issue}`);
@@ -2975,6 +3256,12 @@ function clearDataIntegrityState(): void {
     }
 }
 
+function clearScanFeatureSchemaState(): void {
+    for (const strategy of Object.keys(scanFeatureSchemaByStrategy)) {
+        delete scanFeatureSchemaByStrategy[strategy];
+    }
+}
+
 function clearGovernanceState(): void {
     strategyGovernanceState.updated_at = Date.now();
     strategyGovernanceState.autopilot_effective = false;
@@ -3053,6 +3340,58 @@ function ensureStrategyDataIntegrityEntry(strategyId: string): StrategyDataInteg
         };
     }
     return strategyDataIntegrity[strategyId];
+}
+
+function ensureScanFeatureSchemaEntry(strategyId: string): ScanFeatureSchemaState {
+    const key = strategyId.trim().toUpperCase() || 'UNKNOWN';
+    if (!scanFeatureSchemaByStrategy[key]) {
+        scanFeatureSchemaByStrategy[key] = {
+            strategy: key,
+            scans: 0,
+            expected_keys: [],
+            missing_streak: 0,
+            last_new_keys: [],
+            last_missing_keys: [],
+            overflow_events: 0,
+            overflow_dropped_features: 0,
+            last_overflow_at: 0,
+            last_alert_at: 0,
+            updated_at: 0,
+        };
+    }
+    return scanFeatureSchemaByStrategy[key];
+}
+
+function scanFeatureSchemaEntryPayload(strategyId: string): Record<string, unknown> {
+    const state = ensureScanFeatureSchemaEntry(strategyId);
+    const expectedKeyCount = state.expected_keys.length;
+    const missingRatio = expectedKeyCount > 0
+        ? state.last_missing_keys.length / expectedKeyCount
+        : 0;
+    return {
+        strategy: state.strategy,
+        scans: state.scans,
+        expected_key_count: expectedKeyCount,
+        expected_keys_preview: state.expected_keys.slice(0, 24),
+        missing_streak: state.missing_streak,
+        last_new_keys: state.last_new_keys.slice(0, 12),
+        last_missing_keys: state.last_missing_keys.slice(0, 12),
+        missing_ratio: missingRatio,
+        overflow_events: state.overflow_events,
+        overflow_dropped_features: state.overflow_dropped_features,
+        last_overflow_at: state.last_overflow_at,
+        updated_at: state.updated_at,
+    };
+}
+
+function scanFeatureSchemaPayload(): Record<string, Record<string, unknown>> {
+    const keys = Array.from(new Set([
+        ...STRATEGY_IDS,
+        ...Object.keys(scanFeatureSchemaByStrategy),
+    ])).sort();
+    return Object.fromEntries(
+        keys.map((strategyId) => [strategyId, scanFeatureSchemaEntryPayload(strategyId)]),
+    );
 }
 
 function ensureStrategyCostDiagnosticsEntry(strategyId: string): StrategyCostDiagnostics {
@@ -3210,6 +3549,114 @@ function recordScanSchemaDrift(strategy: string, marketKey: string, reason: stri
     return alert;
 }
 
+function updateScanFeatureSchemaGovernance(
+    scan: StrategyScanState,
+    extraction: ScanMetaFeatureExtraction,
+): void {
+    const strategy = scan.strategy.trim().toUpperCase() || 'UNKNOWN';
+    const state = ensureScanFeatureSchemaEntry(strategy);
+    const now = Date.now();
+    state.scans += 1;
+    state.updated_at = now;
+
+    if (extraction.dropped_count > 0) {
+        state.overflow_events += 1;
+        state.overflow_dropped_features += extraction.dropped_count;
+        state.last_overflow_at = now;
+    }
+
+    const featureKeys = Object.keys(buildScanFeatureMap(scan))
+        .filter((key) => key.trim().length > 0)
+        .sort();
+    if (state.expected_keys.length === 0) {
+        state.expected_keys = featureKeys.slice(0, SCAN_FEATURE_SCHEMA_MAX_TRACKED_KEYS);
+        if (extraction.dropped_count > 0) {
+            io.emit('scan_feature_schema_update', scanFeatureSchemaEntryPayload(strategy));
+        }
+        return;
+    }
+
+    const expectedSet = new Set(state.expected_keys);
+    const currentSet = new Set(featureKeys);
+    const newKeys = featureKeys.filter((key) => !expectedSet.has(key));
+    const missingKeys = state.expected_keys.filter((key) => !currentSet.has(key));
+
+    if (newKeys.length > 0 && state.expected_keys.length < SCAN_FEATURE_SCHEMA_MAX_TRACKED_KEYS) {
+        for (const key of newKeys) {
+            if (state.expected_keys.includes(key)) {
+                continue;
+            }
+            state.expected_keys.push(key);
+            if (state.expected_keys.length >= SCAN_FEATURE_SCHEMA_MAX_TRACKED_KEYS) {
+                break;
+            }
+        }
+    }
+
+    state.last_new_keys = newKeys.slice(0, 12);
+    state.last_missing_keys = missingKeys.slice(0, 12);
+    if (newKeys.length > 0) {
+        state.missing_streak = 0;
+    } else if (missingKeys.length > 0) {
+        state.missing_streak += 1;
+    } else {
+        state.missing_streak = 0;
+    }
+
+    const expectedKeyCount = Math.max(1, state.expected_keys.length);
+    const missingRatio = missingKeys.length / expectedKeyCount;
+    const warmedUp = state.scans >= SCAN_FEATURE_SCHEMA_WARMUP_SCANS;
+    const cooldownReady = (now - state.last_alert_at) >= SCAN_FEATURE_SCHEMA_ALERT_COOLDOWN_MS;
+    let severity: 'WARN' | 'CRITICAL' | null = null;
+    let reason = '';
+
+    if (cooldownReady) {
+        if (extraction.dropped_count > 0) {
+            severity = 'WARN';
+            reason = `meta feature overflow dropped ${extraction.dropped_count} column(s) (limit=${SCAN_META_FEATURE_LIMIT})`;
+        } else if (warmedUp && newKeys.length > 0) {
+            severity = 'WARN';
+            reason = `feature schema expanded by ${newKeys.length} key(s)`;
+        } else if (
+            warmedUp
+            && missingKeys.length > 0
+            && missingRatio >= SCAN_FEATURE_SCHEMA_MISSING_RATIO_ALERT
+            && state.missing_streak >= SCAN_FEATURE_SCHEMA_MISSING_STREAK_ALERT
+        ) {
+            severity = 'CRITICAL';
+            reason = `feature schema missing ${missingKeys.length}/${expectedKeyCount} expected key(s) for ${state.missing_streak} scan(s)`;
+        }
+    }
+
+    if (severity) {
+        state.last_alert_at = now;
+        const alertPayload = {
+            severity,
+            strategy,
+            market_key: scan.market_key,
+            reason,
+            dropped_meta_features: extraction.dropped_count,
+            dropped_meta_keys: extraction.dropped_keys.slice(0, SCAN_META_FEATURE_DROPPED_KEY_PREVIEW),
+            new_keys: newKeys.slice(0, 12),
+            missing_keys: missingKeys.slice(0, 12),
+            missing_ratio: missingRatio,
+            expected_key_count: expectedKeyCount,
+            timestamp: now,
+        };
+        io.emit('scan_ingest_alert', alertPayload);
+        io.emit('scan_feature_schema_alert', alertPayload);
+        touchRuntimeModule(
+            'SCAN_INGEST',
+            severity === 'CRITICAL' ? 'DEGRADED' : 'ONLINE',
+            `${strategy} feature schema ${severity.toLowerCase()}: ${reason}`,
+        );
+    }
+
+    if (extraction.dropped_count > 0 || newKeys.length > 0 || missingKeys.length > 0) {
+        io.emit('scan_feature_schema_update', scanFeatureSchemaEntryPayload(strategy));
+    }
+}
+
 function updateStrategyQuality(scan: StrategyScanState): void {
     const state = ensureStrategyQualityEntry(scan.strategy);
     state.total_scans += 1;
@@ -3248,8 +3695,19 @@ function parseTradeSample(payload: unknown): StrategyTradeSample | null {
         || asString(record.executionId)
         || asString(details?.execution_id)
         || asString(details?.executionId);
+    const historyContext = executionId
+        ? resolveExecutionHistoryContext(executionId, strategy)
+        : null;
+    const executionTrace = executionId ? executionTraces.get(executionId) || null : null;
     const marketKey = extractExecutionMarketKey(record)
-        || (executionId ? executionTraces.get(executionId)?.market_key || null : null);
+        || executionTrace?.market_key
+        || historyContext?.market_key
+        || null;
+    const recordFeatureRowId = asString(record.feature_row_id)
+        || asString(record.featureRowId)
+        || asString(details?.feature_row_id)
+        || asString(details?.featureRowId)
+        || null;
     const rawNotional = asNumber(record.notional)
         ?? asNumber(details?.notional)
         ?? Math.abs(pnl);
@@ -3266,8 +3724,8 @@ function parseTradeSample(payload: unknown): StrategyTradeSample | null {
         costDrag = roundTripCostRate;
     }
 
-    const reason = asString(record.reason) || asString(details?.reason) || '';
-    const labelEligible = isLabelEligibleReason(reason);
+    const reason = inferTradeClosureReason(asString(record.reason), details) || '';
+    const labelEligible = classifyClosureReason(reason).label_eligible;
 
     return {
         strategy,
@@ -3281,16 +3739,11 @@ function parseTradeSample(payload: unknown): StrategyTradeSample | null {
         label_eligible: labelEligible,
         execution_id: executionId || undefined,
         market_key: marketKey,
+        feature_row_id: recordFeatureRowId
+            || executionTrace?.feature_row_id
+            || historyContext?.feature_row_id
+            || undefined,
     };
-}
-
-function isLabelEligibleReason(reason: string): boolean {
-    if (!reason) return false;
-    const upper = reason.trim().toUpperCase();
-    // Signal-driven and time-based exits are usable for ML labelling
-    const eligible = ['TP', 'SL', 'TAKE_PROFIT', 'STOP_LOSS', 'SIGNAL_TP', 'SIGNAL_SL',
-        'EDGE_DECAY', 'EXPIRY', 'EXPIRY_EXIT', 'TIMEOUT', 'TIME_EXPIRY', 'TIME_EXIT', 'MAX_HOLD'];
-    return eligible.includes(upper);
 }
 
 function updateStrategyCostDiagnostics(sample: StrategyTradeSample): StrategyCostDiagnostics {
@@ -3433,6 +3886,19 @@ function recordRejectedSignal(record: RejectedSignalRecord): void {
     if (rejectedSignalHistory.length > REJECTED_SIGNAL_RETENTION) {
         rejectedSignalHistory.splice(0, rejectedSignalHistory.length - REJECTED_SIGNAL_RETENTION);
     }
+    const existing = rejectedSignalsByExecutionId.get(record.execution_id);
+    if (!existing || record.timestamp >= existing.timestamp) {
+        rejectedSignalsByExecutionId.set(record.execution_id, record);
+    }
+    if (rejectedSignalsByExecutionId.size > (REJECTED_SIGNAL_RETENTION * 2)) {
+        rejectedSignalsByExecutionId.clear();
+        for (const entry of rejectedSignalHistory) {
+            const current = rejectedSignalsByExecutionId.get(entry.execution_id);
+            if (!current || entry.timestamp >= current.timestamp) {
+                rejectedSignalsByExecutionId.set(entry.execution_id, entry);
+            }
+        }
+    }
     if (
         record.stage === 'INTELLIGENCE_GATE'
         && typeof record.reason === 'string'
@@ -3463,9 +3929,177 @@ async function bootstrapRejectedSignalHistory(): Promise<void> {
     try {
         const persisted = await rejectedSignalRecorder.readRecent(REJECTED_SIGNAL_RETENTION);
         rejectedSignalHistory.splice(0, rejectedSignalHistory.length, ...persisted);
+        rejectedSignalsByExecutionId.clear();
+        for (const record of rejectedSignalHistory) {
+            const existing = rejectedSignalsByExecutionId.get(record.execution_id);
+            if (!existing || record.timestamp >= existing.timestamp) {
+                rejectedSignalsByExecutionId.set(record.execution_id, record);
+            }
+        }
     } catch (error) {
         recordSilentCatch('RejectedSignal.Bootstrap', error, { path: rejectedSignalRecorder.getPath() });
     }
+}
+
+function unquoteCsvCell(value: string): string {
+    const trimmed = value.trim();
+    if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+        return trimmed.slice(1, -1).replace(/""/g, '"');
+    }
+    return trimmed;
+}
+
+function parseCsvLineLoose(line: string): string[] {
+    const out: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i += 1) {
+        const ch = line[i] as string;
+        if (ch === '"') {
+            const next = line[i + 1];
+            if (inQuotes && next === '"') {
+                current += '"';
+                i += 1;
+                continue;
+            }
+            inQuotes = !inQuotes;
+            continue;
+        }
+        if (ch === ',' && !inQuotes) {
+            out.push(current);
+            current = '';
+            continue;
+        }
+        current += ch;
+    }
+    out.push(current);
+    return out;
+}
+
+async function backfillFeatureLabelsFromTradeRecorder(
+    maxRows = 3000,
+    emitSummary = true,
+): Promise<{ processed: number; labeled: number; skipped: number; rows_scanned: number }> {
+    const safeRows = Math.max(200, Math.min(20_000, Math.floor(maxRows)));
+    const filePath = strategyTradeRecorder.getPath();
+    const content = await fs.readFile(filePath, 'utf8').catch((error) => {
+        const code = (error as NodeJS.ErrnoException)?.code || '';
+        if (code !== 'ENOENT') {
+            recordSilentCatch('FeatureRegistry.LabelBackfillRead', error, { path: filePath });
+        }
+        return '';
+    });
+    const lines = content.split('\n').map((line) => line.trim()).filter((line) => line.length > 0);
+    if (lines.length <= 1) {
+        return {
+            processed: 0,
+            labeled: 0,
+            skipped: 0,
+            rows_scanned: 0,
+        };
+    }
+
+    const header = parseCsvLineLoose(lines[0]).map((cell) => unquoteCsvCell(cell).toLowerCase());
+    const idx = (name: string): number => header.indexOf(name.toLowerCase());
+
+    const timestampIdx = idx('timestamp');
+    const strategyIdx = idx('strategy');
+    const pnlIdx = idx('pnl');
+    const notionalIdx = idx('notional');
+    const modeIdx = idx('mode');
+    const reasonIdx = idx('reason');
+    const executionIdIdx = idx('execution_id');
+    const marketKeyIdx = idx('market_key');
+    const featureRowIdIdx = idx('feature_row_id');
+    const netReturnIdx = idx('net_return');
+    const grossReturnIdx = idx('gross_return');
+    const roundTripCostRateIdx = idx('round_trip_cost_rate');
+    const costDragReturnIdx = idx('cost_drag_return');
+
+    const start = Math.max(1, lines.length - safeRows);
+    let processed = 0;
+    let labeled = 0;
+    let skipped = 0;
+
+    for (let i = start; i < lines.length; i += 1) {
+        const cells = parseCsvLineLoose(lines[i]);
+        const mode = modeIdx >= 0 ? unquoteCsvCell(cells[modeIdx] || '') : '';
+        if (mode && mode.toUpperCase() !== 'PAPER') {
+            continue;
+        }
+
+        const strategy = strategyIdx >= 0 ? unquoteCsvCell(cells[strategyIdx] || '') : '';
+        if (!strategy) {
+            skipped += 1;
+            continue;
+        }
+
+        const toNumberCell = (index: number): number | null => {
+            if (index < 0) {
+                return null;
+            }
+            const parsed = Number(unquoteCsvCell(cells[index] || ''));
+            return Number.isFinite(parsed) ? parsed : null;
+        };
+        const details: Record<string, unknown> = {};
+        const netReturn = toNumberCell(netReturnIdx);
+        const grossReturn = toNumberCell(grossReturnIdx);
+        const roundTripCostRate = toNumberCell(roundTripCostRateIdx);
+        const costDragReturn = toNumberCell(costDragReturnIdx);
+        if (netReturn !== null) details.net_return = netReturn;
+        if (grossReturn !== null) details.gross_return = grossReturn;
+        if (roundTripCostRate !== null) details.round_trip_cost_rate = roundTripCostRate;
+        if (costDragReturn !== null) details.cost_drag_return = costDragReturn;
+
+        const payload: Record<string, unknown> = {
+            timestamp: toNumberCell(timestampIdx) ?? Date.now(),
+            strategy,
+            pnl: toNumberCell(pnlIdx),
+            notional: toNumberCell(notionalIdx),
+            mode: mode || 'PAPER',
+            reason: reasonIdx >= 0 ? unquoteCsvCell(cells[reasonIdx] || '') : '',
+            execution_id: executionIdIdx >= 0 ? (unquoteCsvCell(cells[executionIdIdx] || '') || undefined) : undefined,
+            details,
+        };
+        if (marketKeyIdx >= 0) {
+            const marketKey = unquoteCsvCell(cells[marketKeyIdx] || '');
+            if (marketKey) {
+                payload.market_key = marketKey;
+            }
+        }
+        if (featureRowIdIdx >= 0) {
+            const featureRowId = unquoteCsvCell(cells[featureRowIdIdx] || '');
+            if (featureRowId) {
+                payload.feature_row_id = featureRowId;
+            }
+        }
+
+        const sample = parseTradeSample(payload);
+        if (!sample || sample.label_eligible === false) {
+            skipped += 1;
+            continue;
+        }
+        processed += 1;
+        if (attachLabelToFeature(sample)) {
+            labeled += 1;
+        }
+    }
+
+    if (labeled > 0) {
+        io.emit('feature_registry_update', featureRegistrySummary());
+    }
+    const rowsScanned = Math.max(0, lines.length - start);
+    if (emitSummary || labeled > 0) {
+        logger.info(
+            `[FeatureRegistryLabelBackfill] processed=${processed} labeled=${labeled} skipped=${skipped} source=${filePath} rows_scanned=${rowsScanned}`,
+        );
+    }
+    return {
+        processed,
+        labeled,
+        skipped,
+        rows_scanned: rowsScanned,
+    };
 }
 
 function sampleMean(values: number[]): number {
@@ -3882,7 +4516,27 @@ function trimFeatureRegistryRowsIfNeeded(): void {
     }
 
     const removeCount = Math.max(1, featureRegistryRows.length - FEATURE_REGISTRY_TRIM_TARGET_ROWS);
-    const removed = featureRegistryRows.splice(0, removeCount);
+    const removed: FeatureSnapshot[] = [];
+    const kept: FeatureSnapshot[] = [];
+    let remainingToRemove = removeCount;
+
+    // Preserve labeled rows as long as possible and trim oldest unlabeled rows first.
+    for (const row of featureRegistryRows) {
+        const labeled = row.label_net_return !== null || row.label_pnl !== null;
+        if (remainingToRemove > 0 && !labeled) {
+            removed.push(row);
+            remainingToRemove -= 1;
+            continue;
+        }
+        kept.push(row);
+    }
+
+    if (remainingToRemove > 0) {
+        removed.push(...kept.splice(0, remainingToRemove));
+    }
+
+    featureRegistryRows.length = 0;
+    featureRegistryRows.push(...kept);
     for (const row of removed) {
         featureRegistryIndexById.delete(row.id);
         modelPredictionByRowId.delete(row.id);
@@ -3942,6 +4596,304 @@ function clearModelInferenceState(): void {
         latest: {},
         updated_at: Date.now(),
     };
+}
+
+type FeatureRegistryReplayEvent =
+    | {
+        event_type: 'SCAN';
+        event_ts: number;
+        row_id: string;
+        strategy: string;
+        market_key: string;
+        scan_ts: number;
+        signal_type: string;
+        metric_family: MetricFamily;
+        features: Record<string, number>;
+    }
+    | {
+        event_type: 'LABEL';
+        event_ts: number;
+        row_id: string;
+        strategy: string;
+        label_ts: number;
+        label_net_return: number | null;
+        label_pnl: number | null;
+        label_source: string | null;
+    }
+    | {
+        event_type: 'RESET';
+        event_ts: number;
+    };
+
+function sanitizeReplayFeatureMap(input: unknown): Record<string, number> {
+    const row = asRecord(input);
+    if (!row) {
+        return {};
+    }
+    const features: Record<string, number> = {};
+    for (const [key, value] of Object.entries(row)) {
+        if (!/^[a-zA-Z0-9_]+$/.test(key)) {
+            continue;
+        }
+        const parsed = asNumber(value);
+        if (parsed === null) {
+            continue;
+        }
+        features[key] = parsed;
+    }
+    return features;
+}
+
+function parseReplayMetricFamily(input: unknown): MetricFamily {
+    const raw = asString(input)?.toUpperCase() || '';
+    switch (raw) {
+    case 'ARBITRAGE_EDGE':
+    case 'MOMENTUM':
+    case 'FAIR_VALUE':
+    case 'MARKET_MAKING':
+    case 'ORDER_FLOW':
+    case 'FLOW_PRESSURE':
+    case 'UNKNOWN':
+        return raw;
+    default:
+        return 'UNKNOWN';
+    }
+}
+
+function parseFeatureRegistryReplayEvent(line: string): FeatureRegistryReplayEvent | null {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(line);
+    } catch {
+        return null;
+    }
+
+    const row = asRecord(parsed);
+    if (!row) {
+        return null;
+    }
+
+    const eventType = asString(row.event_type)?.toUpperCase() || '';
+    const eventTs = asNumber(row.event_ts) ?? Date.now();
+    if (eventType === 'SCAN') {
+        const rowId = asString(row.row_id);
+        const strategy = asString(row.strategy);
+        const marketKey = asString(row.market_key);
+        const scanTs = asNumber(row.scan_ts) ?? eventTs;
+        if (!rowId || !strategy || !marketKey) {
+            return null;
+        }
+        return {
+            event_type: 'SCAN',
+            event_ts: eventTs,
+            row_id: rowId,
+            strategy,
+            market_key: marketKey,
+            scan_ts: scanTs,
+            signal_type: asString(row.signal_type) || 'UNKNOWN',
+            metric_family: parseReplayMetricFamily(row.metric_family),
+            features: sanitizeReplayFeatureMap(row.features),
+        };
+    }
+
+    if (eventType === 'LABEL') {
+        const rowId = asString(row.row_id);
+        const strategy = asString(row.strategy);
+        if (!rowId || !strategy) {
+            return null;
+        }
+        return {
+            event_type: 'LABEL',
+            event_ts: eventTs,
+            row_id: rowId,
+            strategy,
+            label_ts: asNumber(row.label_ts) ?? eventTs,
+            label_net_return: row.label_net_return === null ? null : asNumber(row.label_net_return),
+            label_pnl: row.label_pnl === null ? null : asNumber(row.label_pnl),
+            label_source: asString(row.label_source),
+        };
+    }
+
+    if (eventType === 'RESET') {
+        return {
+            event_type: 'RESET',
+            event_ts: eventTs,
+        };
+    }
+
+    return null;
+}
+
+function applyFeatureRegistryReplayEvent(event: FeatureRegistryReplayEvent): void {
+    if (event.event_type === 'RESET') {
+        clearFeatureRegistry();
+        clearModelInferenceState();
+        featureRegistryUpdatedAt = Math.max(featureRegistryUpdatedAt, event.event_ts);
+        return;
+    }
+
+    if (event.event_type === 'SCAN') {
+        const existingIndex = featureRegistryIndexById.get(event.row_id);
+        const snapshot: FeatureSnapshot = {
+            id: event.row_id,
+            strategy: event.strategy,
+            market_key: event.market_key,
+            timestamp: event.scan_ts,
+            signal_type: event.signal_type,
+            metric_family: event.metric_family,
+            features: event.features,
+            label_net_return: null,
+            label_pnl: null,
+            label_timestamp: null,
+            label_source: null,
+        };
+        if (
+            existingIndex !== undefined
+            && existingIndex >= 0
+            && existingIndex < featureRegistryRows.length
+        ) {
+            const existing = featureRegistryRows[existingIndex];
+            featureRegistryRows[existingIndex] = {
+                ...snapshot,
+                label_net_return: existing.label_net_return,
+                label_pnl: existing.label_pnl,
+                label_timestamp: existing.label_timestamp,
+                label_source: existing.label_source,
+            };
+            featureRegistryIndexById.set(event.row_id, existingIndex);
+        } else {
+            if (existingIndex !== undefined) {
+                featureRegistryIndexById.delete(event.row_id);
+            }
+            featureRegistryRows.push(snapshot);
+            featureRegistryIndexById.set(event.row_id, featureRegistryRows.length - 1);
+            addFeatureRegistryRowStats(snapshot);
+        }
+        featureRegistryUpdatedAt = Math.max(featureRegistryUpdatedAt, event.event_ts, event.scan_ts);
+        return;
+    }
+
+    const index = featureRegistryIndexById.get(event.row_id);
+    if (index === undefined || index < 0 || index >= featureRegistryRows.length) {
+        return;
+    }
+    const row = featureRegistryRows[index];
+    if (row.strategy !== event.strategy) {
+        return;
+    }
+    if (row.label_net_return !== null || row.label_pnl !== null) {
+        return;
+    }
+    if (event.label_ts < row.timestamp) {
+        featureRegistryLeakageViolations += 1;
+        return;
+    }
+
+    row.label_net_return = event.label_net_return;
+    row.label_pnl = event.label_pnl;
+    row.label_timestamp = event.label_ts;
+    row.label_source = event.label_source;
+    markFeatureRegistryRowLabeled(row);
+    featureRegistryUpdatedAt = Math.max(featureRegistryUpdatedAt, event.event_ts, event.label_ts);
+}
+
+async function replayFeatureRegistryEventLog(filePath: string): Promise<{
+    parsed: number;
+    scans: number;
+    labels: number;
+    resets: number;
+    errors: number;
+}> {
+    const summary = {
+        parsed: 0,
+        scans: 0,
+        labels: 0,
+        resets: 0,
+        errors: 0,
+    };
+
+    const stream = createReadStream(filePath, { encoding: 'utf8' });
+    const lineReader = readline.createInterface({
+        input: stream,
+        crlfDelay: Infinity,
+    });
+
+    for await (const rawLine of lineReader) {
+        const line = rawLine.trim();
+        if (line.length === 0) {
+            continue;
+        }
+        const event = parseFeatureRegistryReplayEvent(line);
+        if (!event) {
+            summary.errors += 1;
+            continue;
+        }
+        summary.parsed += 1;
+        applyFeatureRegistryReplayEvent(event);
+        if (event.event_type === 'SCAN') {
+            summary.scans += 1;
+            if (summary.scans % 256 === 0 && featureRegistryRows.length > FEATURE_REGISTRY_TRIM_TRIGGER_ROWS) {
+                trimFeatureRegistryRowsIfNeeded();
+            }
+        } else if (event.event_type === 'LABEL') {
+            summary.labels += 1;
+        } else {
+            summary.resets += 1;
+        }
+    }
+
+    return summary;
+}
+
+async function bootstrapFeatureRegistryFromEventLogs(): Promise<void> {
+    clearFeatureRegistry();
+    clearModelInferenceState();
+
+    const basePath = featureRegistryRecorder.getPath();
+    const replayPaths = [`${basePath}.old`, basePath];
+    const totals = {
+        files: 0,
+        parsed: 0,
+        scans: 0,
+        labels: 0,
+        resets: 0,
+        errors: 0,
+    };
+
+    for (const replayPath of replayPaths) {
+        const stat = await fs.stat(replayPath).catch((error) => {
+            const code = (error as NodeJS.ErrnoException)?.code || '';
+            if (code !== 'ENOENT') {
+                recordSilentCatch('FeatureRegistry.ReplayStat', error, { path: replayPath });
+            }
+            return null;
+        });
+        if (!stat || !stat.isFile() || stat.size <= 0) {
+            continue;
+        }
+        const summary = await replayFeatureRegistryEventLog(replayPath).catch((error) => {
+            recordSilentCatch('FeatureRegistry.ReplayRead', error, { path: replayPath });
+            return null;
+        });
+        if (!summary) {
+            continue;
+        }
+        totals.files += 1;
+        totals.parsed += summary.parsed;
+        totals.scans += summary.scans;
+        totals.labels += summary.labels;
+        totals.resets += summary.resets;
+        totals.errors += summary.errors;
+    }
+
+    trimFeatureRegistryRowsIfNeeded();
+    modelTrainerLastLabeledRows = featureRegistryRows.filter((row) => row.label_net_return !== null).length;
+
+    if (totals.files > 0) {
+        logger.info(
+            `[FeatureRegistryBootstrap] replayed files=${totals.files} events=${totals.parsed} scans=${totals.scans} labels=${totals.labels} resets=${totals.resets} errors=${totals.errors} rows=${featureRegistryRows.length} labeled_rows=${featureRegistryLabeledRows}`,
+        );
+    }
 }
 
 function allowedFamiliesForRegime(regime: RegimeLabel): string[] {
@@ -4610,8 +5562,10 @@ function buildPurgedEmbargoFolds(
     splits: number,
     purgeRows: number,
     embargoRows: number,
+    minTrainRows: number,
+    minTestRows: number,
 ): Array<{ trainIdx: number[]; testIdx: number[] }> {
-    if (rows < Math.max(20, splits * 2)) {
+    if (rows < Math.max(minTrainRows + minTestRows, splits * 2)) {
         return [];
     }
     const baseSize = Math.floor(rows / splits);
@@ -4631,7 +5585,7 @@ function buildPurgedEmbargoFolds(
     const folds: Array<{ trainIdx: number[]; testIdx: number[] }> = [];
     for (const range of ranges) {
         const testIdx = Array.from({ length: range.end - range.start }, (_v, idx) => range.start + idx);
-        if (testIdx.length < 4) {
+        if (testIdx.length < minTestRows) {
             continue;
         }
         const leftEnd = Math.max(0, range.start - purgeRows);
@@ -4640,7 +5594,7 @@ function buildPurgedEmbargoFolds(
             ...Array.from({ length: leftEnd }, (_v, idx) => idx),
             ...Array.from({ length: rows - rightStart }, (_v, idx) => rightStart + idx),
         ];
-        if (trainIdx.length < 20) {
+        if (trainIdx.length < minTrainRows) {
             continue;
         }
         folds.push({ trainIdx, testIdx });
@@ -4673,20 +5627,24 @@ function buildScanFeatureMap(scan: StrategyScanState): Record<string, number> {
     };
 }
 
-function modelInferencePayload(): ModelInferenceState {
+function modelInferencePayload(limitRows = MODEL_INFERENCE_PAYLOAD_MAX_ROWS): ModelInferenceState {
+    const safeLimit = Number.isFinite(limitRows)
+        ? Math.max(1, Math.min(MODEL_INFERENCE_MAX_TRACKED_ROWS, Math.floor(limitRows)))
+        : MODEL_INFERENCE_PAYLOAD_MAX_ROWS;
+    const selected = Object.entries(modelInferenceState.latest)
+        .sort((a, b) => b[1].timestamp - a[1].timestamp)
+        .slice(0, safeLimit);
     return {
         ...modelInferenceState,
-        latest: Object.fromEntries(
-            Object.entries(modelInferenceState.latest).map(([key, value]) => [
-                key,
-                {
-                    ...value,
-                    probability_positive: value.probability_positive === null
-                        ? null
-                        : Math.round(value.probability_positive * 1000) / 1000,
-                },
-            ]),
-        ),
+        latest: Object.fromEntries(selected.map(([key, value]) => [
+            key,
+            {
+                ...value,
+                probability_positive: value.probability_positive === null
+                    ? null
+                    : Math.round(value.probability_positive * 1000) / 1000,
+            },
+        ])),
     };
 }
 
@@ -4814,7 +5772,7 @@ function modelGateProbabilityFromTrace(executionId: string): number | null {
         }
         const probability = asNumber(asRecord(event.payload)?.probability);
         if (probability !== null && Number.isFinite(probability)) {
-            return clampProbabilityGate(probability);
+            return clampUnitProbability(probability);
         }
     }
     return null;
@@ -4830,7 +5788,7 @@ function collectModelGateCalibrationSamples(now = Date.now()): ModelGateCalibrat
         featureRegistryRows,
         rejectedSignalHistory,
         probabilityForExecutionId: modelGateProbabilityFromTrace,
-        clampProbability: clampProbabilityGate,
+        normalizeProbability: clampUnitProbability,
         fallbackNotionalUsd: 100,
     });
 }
@@ -5294,6 +6252,26 @@ function updateModelInferenceFromScan(scan: StrategyScanState, rowId: string | n
     return latest;
 }
 
+function isPaperModelBootstrapBypassActive(): boolean {
+    if (!MODEL_PROBABILITY_GATE_REQUIRE_MODEL) {
+        return false;
+    }
+    if (mlPipelineStatus.model_eligible) {
+        return false;
+    }
+    if (signalModelArtifact && modelInferenceState.model_loaded) {
+        return false;
+    }
+    return true;
+}
+
+function paperModelBootstrapBypassReason(): string {
+    const labeledRows = Math.max(0, Math.floor(mlPipelineStatus.dataset_labeled_rows || 0));
+    const minRows = MODEL_TRAINER_MIN_LABELED_ROWS;
+    const modelReason = mlPipelineStatus.model_reason || 'model not eligible';
+    return `paper bootstrap bypass: ${modelReason} (${labeledRows}/${minRows} labeled rows)`;
+}
+
 function updateModelDriftFromFeatureLabel(feature: FeatureSnapshot): void {
     const prediction = modelPredictionByRowId.get(feature.id);
     if (!prediction || prediction.probability_positive === null) {
@@ -5373,7 +6351,8 @@ function updateModelDriftFromFeatureLabel(feature: FeatureSnapshot): void {
     const gateDisabled = now < gateDisabledUntil;
     const gateEnforcing = MODEL_PROBABILITY_GATE_ENABLED
         && MODEL_PROBABILITY_GATE_ENFORCE_PAPER
-        && !gateDisabled;
+        && !gateDisabled
+        && !isPaperModelBootstrapBypassActive();
 
     modelDriftState = {
         ...modelDriftState,
@@ -5404,7 +6383,9 @@ function clearModelDriftState(): void {
         calibration_error_ema: 0,
         accuracy_pct: 0,
         gate_enabled: MODEL_PROBABILITY_GATE_ENABLED,
-        gate_enforcing: MODEL_PROBABILITY_GATE_ENABLED && MODEL_PROBABILITY_GATE_ENFORCE_PAPER,
+        gate_enforcing: MODEL_PROBABILITY_GATE_ENABLED
+            && MODEL_PROBABILITY_GATE_ENFORCE_PAPER
+            && !isPaperModelBootstrapBypassActive(),
         gate_disabled_until: 0,
         issues: [],
         by_strategy: {},
@@ -5414,9 +6395,11 @@ function clearModelDriftState(): void {
 
 function refreshModelDriftRuntime(now = Date.now()): void {
     const gateDisabled = now < modelDriftState.gate_disabled_until;
+    const bootstrapBypass = isPaperModelBootstrapBypassActive();
     const nextGateEnforcing = MODEL_PROBABILITY_GATE_ENABLED
         && MODEL_PROBABILITY_GATE_ENFORCE_PAPER
-        && !gateDisabled;
+        && !gateDisabled
+        && !bootstrapBypass;
     const changed = modelDriftState.gate_enabled !== MODEL_PROBABILITY_GATE_ENABLED
         || modelDriftState.gate_enforcing !== nextGateEnforcing;
     if (!changed) {
@@ -5431,12 +6414,14 @@ function refreshModelDriftRuntime(now = Date.now()): void {
     io.emit('model_drift_update', modelDriftPayload());
     touchRuntimeModule(
         'UNCERTAINTY_GATE',
-        nextGateEnforcing ? 'ONLINE' : 'DEGRADED',
+        nextGateEnforcing ? 'ONLINE' : bootstrapBypass ? 'STANDBY' : 'DEGRADED',
         nextGateEnforcing
             ? 'probability gate enforcing in PAPER'
             : gateDisabled
                 ? `probability gate paused until ${modelDriftState.gate_disabled_until}`
-                : 'probability gate not enforcing',
+                : bootstrapBypass
+                    ? paperModelBootstrapBypassReason()
+                    : 'probability gate not enforcing',
     );
 }
 
@@ -5452,6 +6437,9 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
 } {
     const strategy = extractExecutionStrategy(payload);
     const marketKey = extractExecutionMarketKey(payload);
+    const bootstrapBypass = tradingMode === 'PAPER' && isPaperModelBootstrapBypassActive();
+    const requireModel = tradingMode === 'LIVE'
+        || (MODEL_PROBABILITY_GATE_REQUIRE_MODEL && !bootstrapBypass);
     const probabilityGate = activeModelProbabilityGate(strategy, marketKey);
     const enforceMode = (tradingMode === 'PAPER' && MODEL_PROBABILITY_GATE_ENFORCE_PAPER)
         || (tradingMode === 'LIVE' && MODEL_PROBABILITY_GATE_ENFORCE_LIVE);
@@ -5460,6 +6448,18 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
             ok: true,
             blocked: false,
             reason: 'model probability gate not enforcing in this mode',
+            strategy,
+            market_key: marketKey,
+            probability: null,
+            gate: probabilityGate,
+            model_loaded: Boolean(signalModelArtifact),
+        };
+    }
+    if (bootstrapBypass) {
+        return {
+            ok: true,
+            blocked: false,
+            reason: paperModelBootstrapBypassReason(),
             strategy,
             market_key: marketKey,
             probability: null,
@@ -5481,8 +6481,8 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
     }
     if (!strategy) {
         return {
-            ok: !MODEL_PROBABILITY_GATE_REQUIRE_MODEL,
-            blocked: MODEL_PROBABILITY_GATE_REQUIRE_MODEL,
+            ok: !requireModel,
+            blocked: requireModel,
             reason: 'execution payload missing strategy identity for model gate',
             strategy,
             market_key: marketKey,
@@ -5497,11 +6497,13 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
     const strategyRows = Object.values(modelInferenceState.latest)
         .filter((entry) => entry.strategy === strategy)
         .sort((a, b) => b.timestamp - a.timestamp);
-    const fallback = exact || strategyRows[0] || null;
+    const fallback = marketKey
+        ? (exact || null)
+        : (strategyRows[0] || null);
     if (!fallback) {
         return {
-            ok: !MODEL_PROBABILITY_GATE_REQUIRE_MODEL,
-            blocked: MODEL_PROBABILITY_GATE_REQUIRE_MODEL,
+            ok: !requireModel,
+            blocked: requireModel,
             reason: marketKey
                 ? `no model inference row for ${strategy} on ${marketKey}`
                 : `no model inference row for ${strategy}`,
@@ -5515,8 +6517,8 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
     const ageMs = Date.now() - fallback.timestamp;
     if (ageMs > MODEL_PROBABILITY_GATE_MAX_STALENESS_MS) {
         return {
-            ok: !MODEL_PROBABILITY_GATE_REQUIRE_MODEL,
-            blocked: MODEL_PROBABILITY_GATE_REQUIRE_MODEL,
+            ok: !requireModel,
+            blocked: requireModel,
             reason: `model inference stale ${ageMs}ms > ${MODEL_PROBABILITY_GATE_MAX_STALENESS_MS}ms`,
             strategy,
             market_key: fallback.market_key,
@@ -5527,8 +6529,8 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
     }
     if (fallback.probability_positive === null) {
         return {
-            ok: !MODEL_PROBABILITY_GATE_REQUIRE_MODEL,
-            blocked: MODEL_PROBABILITY_GATE_REQUIRE_MODEL,
+            ok: !requireModel,
+            blocked: requireModel,
             reason: 'model probability unavailable',
             strategy,
             market_key: fallback.market_key,
@@ -5619,14 +6621,50 @@ function trainSignalModelInProcess(): {
 
     const x = labeled.map((row) => featureColumns.map((key) => asNumber(row.features[key]) ?? 0));
     const y = labeled.map((row) => ((row.label_net_return ?? 0) > 0 ? 1 : 0));
-    const folds = buildPurgedEmbargoFolds(
+    const configuredFoldSpec = {
+        splits: MODEL_TRAINER_SPLITS,
+        purgeRows: MODEL_TRAINER_PURGE_ROWS,
+        embargoRows: MODEL_TRAINER_EMBARGO_ROWS,
+        minTrainRows: MODEL_TRAINER_MIN_TRAIN_ROWS_PER_FOLD,
+        minTestRows: MODEL_TRAINER_MIN_TEST_ROWS_PER_FOLD,
+    };
+    const bootstrapFoldSpec = {
+        splits: 2,
+        purgeRows: 0,
+        embargoRows: 0,
+        minTrainRows: 2,
+        minTestRows: 1,
+    };
+    let effectiveFoldSpec = configuredFoldSpec;
+    let foldMode: 'configured' | 'bootstrap_low_sample' = 'configured';
+    let folds = buildPurgedEmbargoFolds(
         trainingRows,
-        MODEL_TRAINER_SPLITS,
-        MODEL_TRAINER_PURGE_ROWS,
-        MODEL_TRAINER_EMBARGO_ROWS,
+        configuredFoldSpec.splits,
+        configuredFoldSpec.purgeRows,
+        configuredFoldSpec.embargoRows,
+        configuredFoldSpec.minTrainRows,
+        configuredFoldSpec.minTestRows,
     );
+    if (folds.length < 2 && trainingRows >= (bootstrapFoldSpec.splits * 2)) {
+        const bootstrapFolds = buildPurgedEmbargoFolds(
+            trainingRows,
+            bootstrapFoldSpec.splits,
+            bootstrapFoldSpec.purgeRows,
+            bootstrapFoldSpec.embargoRows,
+            bootstrapFoldSpec.minTrainRows,
+            bootstrapFoldSpec.minTestRows,
+        );
+        if (bootstrapFolds.length >= 2) {
+            folds = bootstrapFolds;
+            effectiveFoldSpec = bootstrapFoldSpec;
+            foldMode = 'bootstrap_low_sample';
+        }
+    }
     if (folds.length < 2) {
-        return ineligible('insufficient folds after purge/embargo', folds.length);
+        return ineligible(
+            `insufficient folds after purge/embargo (configured: splits=${configuredFoldSpec.splits}, purge=${configuredFoldSpec.purgeRows}, embargo=${configuredFoldSpec.embargoRows}, min_train=${configuredFoldSpec.minTrainRows}, min_test=${configuredFoldSpec.minTestRows}; fallback: splits=${bootstrapFoldSpec.splits}, purge=${bootstrapFoldSpec.purgeRows}, embargo=${bootstrapFoldSpec.embargoRows}, min_train=${bootstrapFoldSpec.minTrainRows}, min_test=${bootstrapFoldSpec.minTestRows})`,
+            folds.length,
+        );
     }
 
     const grid = [
@@ -5722,6 +6760,7 @@ function trainSignalModelInProcess(): {
         },
         train_rows: trainingRows,
         total_labeled_rows: totalLabeledRows,
+        fold_mode: foldMode,
     };
     const report: Record<string, unknown> = {
         generated_at: generatedAt,
@@ -5730,8 +6769,12 @@ function trainSignalModelInProcess(): {
         total_labeled_rows: totalLabeledRows,
         feature_count: featureCount,
         cv_folds: folds.length,
-        purge_rows: MODEL_TRAINER_PURGE_ROWS,
-        embargo_rows: MODEL_TRAINER_EMBARGO_ROWS,
+        fold_mode: foldMode,
+        splits: effectiveFoldSpec.splits,
+        purge_rows: effectiveFoldSpec.purgeRows,
+        embargo_rows: effectiveFoldSpec.embargoRows,
+        min_train_rows_per_fold: effectiveFoldSpec.minTrainRows,
+        min_test_rows_per_fold: effectiveFoldSpec.minTestRows,
         best_hyperparameters: artifact.best_hyperparameters,
         cv_results: cvResults.sort((a, b) => (asNumber(a.objective) ?? 0) - (asNumber(b.objective) ?? 0)),
         in_sample: {
@@ -5793,8 +6836,10 @@ async function refreshMlPipelineStatus(): Promise<void> {
     const modelReport = await readJsonFileSafe(SIGNAL_MODEL_REPORT_PATH);
     const registrySummary = featureRegistrySummary();
 
-    const datasetRows = asNumber(datasetManifest?.rows) ?? registrySummary.rows;
-    const datasetLabeledRows = asNumber(datasetManifest?.labeled_rows) ?? registrySummary.labeled_rows;
+    const manifestRows = asNumber(datasetManifest?.rows);
+    const manifestLabeledRows = asNumber(datasetManifest?.labeled_rows);
+    const datasetRows = Math.max(registrySummary.rows, manifestRows ?? 0);
+    const datasetLabeledRows = Math.max(registrySummary.labeled_rows, manifestLabeledRows ?? 0);
     const datasetFeatureCount = asNumber(datasetManifest?.feature_count) ?? (featureRegistryRows[0]
         ? Object.keys(featureRegistryRows[0].features).length
         : 0);
@@ -5914,12 +6959,67 @@ function upsertFeatureSnapshot(scan: StrategyScanState): void {
     featureRegistryUpdatedAt = Date.now();
 }
 
+function applyFeatureLabelToRow(
+    row: FeatureSnapshot,
+    sample: StrategyTradeSample,
+    labelSource: string,
+): boolean {
+    if (row.label_net_return !== null || row.label_pnl !== null) {
+        return false;
+    }
+    if (sample.timestamp < row.timestamp) {
+        featureRegistryLeakageViolations += 1;
+        return false;
+    }
+    row.label_net_return = sample.net_return;
+    row.label_pnl = sample.pnl;
+    row.label_timestamp = sample.timestamp;
+    row.label_source = labelSource;
+    markFeatureRegistryRowLabeled(row);
+    updateModelDriftFromFeatureLabel(row);
+    featureRegistryRecorder.record({
+        event_type: 'LABEL',
+        event_ts: Date.now(),
+        row_id: row.id,
+        strategy: row.strategy,
+        label_ts: sample.timestamp,
+        label_net_return: sample.net_return,
+        label_pnl: sample.pnl,
+        label_source: labelSource,
+    });
+    featureRegistryUpdatedAt = Date.now();
+    fireAndForget('MLTrainer.InProcess', runInProcessModelTraining(false), {
+        source: 'feature_label_attach',
+        strategy: row.strategy,
+    });
+    return true;
+}
+
 function attachLabelToFeature(sample: StrategyTradeSample): boolean {
     // Skip ML label assignment for non-eligible closures (stale, manual, reset)
     if (sample.label_eligible === false) {
         return false;
     }
+
     const sampleMarketKey = sample.market_key || null;
+
+    // Primary path: execution-linked labeling to avoid feature/label drift.
+    if (sample.feature_row_id) {
+        const executionLinkedIndex = featureRegistryIndexById.get(sample.feature_row_id);
+        if (
+            executionLinkedIndex !== undefined
+            && executionLinkedIndex >= 0
+            && executionLinkedIndex < featureRegistryRows.length
+        ) {
+            const row = featureRegistryRows[executionLinkedIndex];
+            if (row.strategy === sample.strategy && (!sampleMarketKey || row.market_key === sampleMarketKey)) {
+                return applyFeatureLabelToRow(row, sample, 'strategy:pnl:execution_linked');
+            }
+        }
+        // Continue to fallback matching when the execution-linked row is unavailable.
+    }
+
+    // Legacy fallback for historical rows that predate execution-linked traces.
     for (let index = featureRegistryRows.length - 1; index >= 0; index -= 1) {
         const row = featureRegistryRows[index];
         if (row.strategy !== sample.strategy) {
@@ -5938,28 +7038,11 @@ function attachLabelToFeature(sample: StrategyTradeSample): boolean {
         if ((sample.timestamp - row.timestamp) > FEATURE_REGISTRY_LABEL_LOOKBACK_MS) {
             break;
         }
-        row.label_net_return = sample.net_return;
-        row.label_pnl = sample.pnl;
-        row.label_timestamp = sample.timestamp;
-        row.label_source = 'strategy:pnl';
-        markFeatureRegistryRowLabeled(row);
-        updateModelDriftFromFeatureLabel(row);
-        featureRegistryRecorder.record({
-            event_type: 'LABEL',
-            event_ts: Date.now(),
-            row_id: row.id,
-            strategy: row.strategy,
-            label_ts: sample.timestamp,
-            label_net_return: sample.net_return,
-            label_pnl: sample.pnl,
-            label_source: 'strategy:pnl',
-        });
-        featureRegistryUpdatedAt = Date.now();
-        fireAndForget('MLTrainer.InProcess', runInProcessModelTraining(false), {
-            source: 'feature_label_attach',
-            strategy: row.strategy,
-        });
-        return true;
+        return applyFeatureLabelToRow(
+            row,
+            sample,
+            sample.feature_row_id ? 'strategy:pnl:fallback_after_execution_link_miss' : 'strategy:pnl:fallback',
+        );
     }
     return false;
 }
@@ -6286,7 +7369,6 @@ async function bootstrapStrategyMultipliers(resetToNeutral = false): Promise<voi
         } else {
             await redisClient.setNX(key, baseline.toFixed(6));
         }
-        await redisClient.expire(key, 86400); // 24 hours
         const raw = asNumber(await redisClient.get(key));
         const multiplier = Number.isFinite(raw) && raw !== null
             ? (raw <= 0 ? 0 : Math.min(STRATEGY_WEIGHT_CAP, Math.max(STRATEGY_WEIGHT_FLOOR, raw)))
@@ -6365,6 +7447,7 @@ async function resetSimulationState(
     clearFeatureRegistry();
     clearModelInferenceState();
     clearModelDriftState();
+    clearScanFeatureSchemaState();
     executionNettingByMarket.clear();
     await resetRiskGuardStates();
     // Preserve any operator-enabled/disabled strategy toggles by default.
@@ -6376,6 +7459,7 @@ async function resetSimulationState(
     io.emit('data_integrity_snapshot', dataIntegrityPayload());
     io.emit('strategy_governance_snapshot', governancePayload());
     io.emit('feature_registry_snapshot', featureRegistrySummary());
+    io.emit('scan_feature_schema_snapshot', scanFeatureSchemaPayload());
     io.emit('model_inference_snapshot', modelInferencePayload());
     io.emit('model_drift_update', modelDriftPayload());
     io.emit('entry_freshness_slo_update', entryFreshnessSloPayload());
@@ -6457,6 +7541,20 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
         }
 
         if (parsedRecord) {
+            const scanSnapshot = snapshotScanForExecution(parsedStrategy, parsedMarketKey);
+            const inferredFeatureRowId = featureRowIdForScan(scanSnapshot);
+            if (!asString(parsedRecord.execution_id) && !asString(parsedRecord.executionId)) {
+                parsedRecord.execution_id = executionId;
+            }
+            if (!asString(parsedRecord.strategy) && parsedStrategy) {
+                parsedRecord.strategy = parsedStrategy;
+            }
+            if (!asString(parsedRecord.market_key) && parsedMarketKey) {
+                parsedRecord.market_key = parsedMarketKey;
+            }
+            if (!asString(parsedRecord.feature_row_id) && inferredFeatureRowId) {
+                parsedRecord.feature_row_id = inferredFeatureRowId;
+            }
             parsedRecord.execution_ingress_signed = ingress.signed;
         }
         if (parsedStrategy && parsedRecord) {
@@ -6638,7 +7736,7 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                         preflightFromExecution: polymarketPreflight.preflightFromExecution.bind(polymarketPreflight),
                         executeFromExecution: async (payload, tradingMode) => {
                             const live = await polymarketPreflight.executeFromExecution(payload, tradingMode);
-                            if (live && live.ok && tradingMode === 'LIVE') {
+                            if (live && live.ok && tradingMode === 'LIVE' && !live.dryRun) {
                                 upsertExecutionNettingStateFromAcceptedPayload(
                                     payload,
                                     dispatchStrategy || extractExecutionStrategy(payload),
@@ -6688,26 +7786,52 @@ redisSubscriber.subscribe('strategy:pnl', (message) => {
         const pnlMarketKey = extractExecutionMarketKey(parsed);
         pushExecutionTraceEvent(executionId, 'PNL', parsed, { strategy: pnlStrategy, market_key: pnlMarketKey });
         io.emit('strategy_pnl', parsed);
+        const mode = normalizeTradingMode(parsed?.mode) || 'PAPER';
+        const sample = mode === 'PAPER' ? parseTradeSample(parsed) : null;
+        const rejection = sample?.execution_id ? rejectedSignalsByExecutionId.get(sample.execution_id) || null : null;
+        if (mode === 'PAPER' && rejection) {
+            const ignoredPayload = {
+                execution_id: sample?.execution_id || executionId,
+                timestamp: Date.now(),
+                strategy: sample?.strategy || pnlStrategy || 'UNKNOWN',
+                market_key: sample?.market_key || pnlMarketKey,
+                reason: 'paper pnl ignored: execution rejected upstream',
+                rejected_stage: rejection.stage,
+                rejected_reason: rejection.reason,
+                rejected_timestamp: rejection.timestamp,
+                mode,
+            };
+            io.emit('strategy_pnl_ignored', ignoredPayload);
+            io.emit('execution_log', {
+                execution_id: ignoredPayload.execution_id,
+                timestamp: ignoredPayload.timestamp,
+                side: 'PNL_IGNORED',
+                market: asString(asRecord(parsed)?.market) || 'Polymarket',
+                price: ignoredPayload.reason,
+                size: ignoredPayload.strategy,
+                mode,
+                details: ignoredPayload,
+            });
+            touchRuntimeModule('PNL_LEDGER', 'ONLINE', `${ignoredPayload.strategy} pnl ignored (${rejection.stage})`);
+            return;
+        }
+
         strategyTradeRecorder.record(parsed);
         touchRuntimeModule('PNL_LEDGER', 'ONLINE', `${pnlStrategy || 'UNKNOWN'} pnl event recorded`);
 
-        const mode = normalizeTradingMode(parsed?.mode) || 'PAPER';
-        if (mode === 'PAPER') {
-            const sample = parseTradeSample(parsed);
-            if (sample) {
-                pushTradeSample(sample);
-                const diagnostics = updateStrategyCostDiagnostics(sample);
-                const labeled = attachLabelToFeature(sample);
-                io.emit('strategy_cost_diagnostics_update', {
-                    strategy: sample.strategy,
-                    ...diagnostics,
-                    avg_cost_drag_bps: Math.round(diagnostics.avg_cost_drag_bps * 10) / 10,
-                    avg_net_return_bps: Math.round(diagnostics.avg_net_return_bps * 10) / 10,
-                    avg_gross_return_bps: Math.round(diagnostics.avg_gross_return_bps * 10) / 10,
-                });
-                if (labeled) {
-                    io.emit('feature_registry_update', featureRegistrySummary());
-                }
+        if (mode === 'PAPER' && sample) {
+            pushTradeSample(sample);
+            const diagnostics = updateStrategyCostDiagnostics(sample);
+            const labeled = attachLabelToFeature(sample);
+            io.emit('strategy_cost_diagnostics_update', {
+                strategy: sample.strategy,
+                ...diagnostics,
+                avg_cost_drag_bps: Math.round(diagnostics.avg_cost_drag_bps * 10) / 10,
+                avg_net_return_bps: Math.round(diagnostics.avg_net_return_bps * 10) / 10,
+                avg_gross_return_bps: Math.round(diagnostics.avg_gross_return_bps * 10) / 10,
+            });
+            if (labeled) {
+                io.emit('feature_registry_update', featureRegistrySummary());
             }
         }
 
@@ -6809,7 +7933,8 @@ redisSubscriber.subscribe('arbitrage:scan', (message) => {
             || strategy.toLowerCase();
         const rawSignalType = normalizedScan.signal_type || asString(parsedRecord.signal_type);
         const rawUnit = normalizedScan.unit || asString(parsedRecord.unit);
-        const metaFeatures = extractScanMetaFeatures(normalizedScan.meta ?? parsedRecord.meta);
+        const metaExtraction = extractScanMetaFeatures(normalizedScan.meta ?? parsedRecord.meta);
+        const metaFeatures = metaExtraction.features;
         const inferred = inferScanDescriptor(strategy, rawSignalType, rawUnit);
         const metricFamily = parseMetricFamily(normalizedScan.metric_family ?? parsedRecord.metric_family) || inferred.metric_family;
         const directionality = parseMetricDirection(normalizedScan.directionality ?? parsedRecord.directionality) || inferred.directionality;
@@ -6836,6 +7961,7 @@ redisSubscriber.subscribe('arbitrage:scan', (message) => {
         upsertFeatureSnapshot(scanState);
         touchRuntimeModule('FEATURE_REGISTRY', 'ONLINE', `feature row ${scanState.strategy} ${scanState.market_key}`);
         updateStrategyQuality(scanState);
+        updateScanFeatureSchemaGovernance(scanState, metaExtraction);
         const dataIntegrityAlert = updateDataIntegrityFromScan(scanState);
         const quality = ensureStrategyQualityEntry(strategy);
         const integrity = ensureStrategyDataIntegrityEntry(strategy);
@@ -6861,7 +7987,10 @@ redisSubscriber.subscribe('arbitrage:scan', (message) => {
         io.emit('feature_registry_update', featureRegistrySummary());
         requestMetaControllerRefresh();
         requestCrossHorizonRefresh();
-        touchRuntimeModule('SCAN_INGEST', 'ONLINE', `${strategy} ${scanState.passes_threshold ? 'PASS' : 'HOLD'} ${scanState.symbol}`);
+        const droppedMetaHint = metaExtraction.dropped_count > 0
+            ? ` dropped_meta=${metaExtraction.dropped_count}`
+            : '';
+        touchRuntimeModule('SCAN_INGEST', 'ONLINE', `${strategy} ${scanState.passes_threshold ? 'PASS' : 'HOLD'} ${scanState.symbol}${droppedMetaHint}`);
         io.emit('intelligence_update', scanState);
         io.emit('scanner_update', parsed);
     } catch (error) {
@@ -7017,6 +8146,7 @@ redisSubscriber.subscribe('system:simulation_reset', (msg) => {
         clearFeatureRegistry();
         clearModelInferenceState();
         clearModelDriftState();
+        clearScanFeatureSchemaState();
         executionNettingByMarket.clear();
         fireAndForget('RiskGuard.ResetState', resetRiskGuardStates(), {
             source: 'system:simulation_reset',
@@ -7029,6 +8159,7 @@ redisSubscriber.subscribe('system:simulation_reset', (msg) => {
         io.emit('data_integrity_snapshot', dataIntegrityPayload());
         io.emit('strategy_governance_snapshot', governancePayload());
         io.emit('feature_registry_snapshot', featureRegistrySummary());
+        io.emit('scan_feature_schema_snapshot', scanFeatureSchemaPayload());
         io.emit('model_inference_snapshot', modelInferencePayload());
         io.emit('model_drift_update', modelDriftPayload());
         io.emit('entry_freshness_slo_update', entryFreshnessSloPayload());
@@ -7080,6 +8211,7 @@ io.on('connection', async (socket) => {
     socket.emit('data_integrity_snapshot', dataIntegrityPayload());
     socket.emit('strategy_governance_snapshot', governancePayload());
     socket.emit('feature_registry_snapshot', featureRegistrySummary());
+    socket.emit('scan_feature_schema_snapshot', scanFeatureSchemaPayload());
     socket.emit('risk_config_update', await getRiskConfig());
     socket.emit('trading_mode_update', {
         mode: await getTradingMode(),
@@ -7462,6 +8594,7 @@ app.get('/api/arb/stats', async (_req, res) => {
         entry_freshness_slo: entryFreshnessSloPayload(),
         strategy_governance: governancePayload(),
         feature_registry: featureRegistrySummary(),
+        scan_feature_schema: scanFeatureSchemaPayload(),
     });
 });
 
@@ -7572,6 +8705,7 @@ app.get('/api/arb/intelligence', (_req, res) => {
             mean_normalized_margin: Math.round(group.mean_normalized_margin * 1000) / 1000,
         })),
         cross_horizon_router: crossHorizonRouterState,
+        scan_feature_schema: scanFeatureSchemaPayload(),
     });
 });
 
@@ -7581,6 +8715,10 @@ app.get('/api/arb/cross-horizon-router', (_req, res) => {
 
 app.get('/api/arb/data-integrity', (_req, res) => {
     res.json(dataIntegrityPayload());
+});
+
+app.get('/api/arb/scan-feature-schema', (_req, res) => {
+    res.json(scanFeatureSchemaPayload());
 });
 
 app.get('/api/arb/governance', (_req, res) => {
@@ -7611,8 +8749,12 @@ app.get('/api/ml/pipeline-status', (_req, res) => {
     res.json(mlPipelineStatus);
 });
 
-app.get('/api/ml/model-inference', (_req, res) => {
-    res.json(modelInferencePayload());
+app.get('/api/ml/model-inference', (req, res) => {
+    const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : NaN;
+    const limit = Number.isFinite(rawLimit)
+        ? Math.max(1, Math.min(MODEL_INFERENCE_MAX_TRACKED_ROWS, Math.floor(rawLimit)))
+        : MODEL_INFERENCE_PAYLOAD_MAX_ROWS;
+    res.json(modelInferencePayload(limit));
 });
 
 app.get('/api/ml/model-drift', (_req, res) => {
@@ -7925,6 +9067,7 @@ app.get('/api/arb/rejected-signals/log', async (_req, res) => {
 app.post('/api/arb/rejected-signals/reset', requireControlPlaneAuth, async (_req, res) => {
     await rejectedSignalRecorder.reset();
     rejectedSignalHistory.splice(0, rejectedSignalHistory.length);
+    rejectedSignalsByExecutionId.clear();
     io.emit('rejected_signal_snapshot', rejectedSignalSnapshot());
     res.json({
         ok: true,
@@ -8228,6 +9371,14 @@ registerScheduledTask('MLTrainer', MODEL_TRAINER_INTERVAL_MS, async () => {
     }
 });
 
+registerScheduledTask('FeatureLabelBackfill', FEATURE_LABEL_BACKFILL_INTERVAL_MS, async () => {
+    try {
+        await backfillFeatureLabelsFromTradeRecorder(5000, false);
+    } catch (error) {
+        recordSilentCatch('FeatureRegistry.LabelBackfillCycle', error);
+    }
+});
+
 registerScheduledTask('ModelGateCalibration', MODEL_PROBABILITY_GATE_TUNER_INTERVAL_MS, async () => {
     try {
         await runModelProbabilityGateCalibration();
@@ -8242,6 +9393,7 @@ async function bootstrap() {
     await connectRedis();
     await strategyTradeRecorder.init();
     await featureRegistryRecorder.init();
+    await bootstrapFeatureRegistryFromEventLogs();
     await settlementService.init();
     await marketDataService.start();
 
@@ -8280,6 +9432,7 @@ async function bootstrap() {
     await applyDefaultStrategyStates(false);
     await bootstrapStrategyMultipliers();
     await loadRiskGuardStates();
+    await backfillFeatureLabelsFromTradeRecorder();
     await bootstrapRejectedSignalHistory();
     await runStrategyGovernanceCycle();
     await refreshLedgerHealth();

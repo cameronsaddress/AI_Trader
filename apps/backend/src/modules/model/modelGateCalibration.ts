@@ -37,7 +37,7 @@ export type BuildModelGateCalibrationSamplesInput = {
     featureRegistryRows: FeatureSnapshot[];
     rejectedSignalHistory: RejectedSignalRecord[];
     probabilityForExecutionId: (executionId: string) => number | null;
-    clampProbability: (value: number) => number;
+    normalizeProbability: (value: number) => number;
     fallbackNotionalUsd?: number;
 };
 
@@ -156,7 +156,7 @@ export function buildModelGateCalibrationSamples(
         const directOutcome = outcomesByExecutionId.get(rejected.execution_id);
         if (directOutcome) {
             samples.push({
-                probability: input.clampProbability(probability),
+                probability: input.normalizeProbability(probability),
                 pnl: directOutcome.pnl,
                 accepted: false,
                 execution_id: rejected.execution_id,
@@ -199,7 +199,7 @@ export function buildModelGateCalibrationSamples(
         const assumedNotional = avgNotionalByStrategy.get(bestCandidate.strategy) ?? fallbackNotionalUsd;
         const estimatedPnl = bestCandidate.net_return * assumedNotional;
         samples.push({
-            probability: input.clampProbability(probability),
+            probability: input.normalizeProbability(probability),
             pnl: estimatedPnl,
             accepted: false,
             execution_id: rejected.execution_id,

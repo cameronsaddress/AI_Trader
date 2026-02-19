@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -14,9 +15,11 @@ use uuid::Uuid;
 use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
     build_scan_payload,
+    clear_strategy_open_positions,
     compute_strategy_bet_size,
     entered_live_mode,
     is_strategy_enabled,
+    persist_strategy_open_positions,
     publish_heartbeat,
     publish_event,
     publish_execution_event,
@@ -29,6 +32,7 @@ use crate::strategies::control::{
     release_sim_notional_for_strategy,
     settle_sim_position_for_strategy,
     read_trading_mode,
+    restore_strategy_open_positions,
     TradingMode,
 };
 use crate::strategies::market_data::{update_book_from_market_ws, BinaryBook};
@@ -53,6 +57,7 @@ const COINBASE_PRODUCT_ID: &str = "BTC-USD";
 const ENTRY_EXPIRY_CUTOFF_MS: i64 = 30_000;
 const MAX_ENTRY_SPREAD: f64 = 0.08;
 const LIVE_PREVIEW_COOLDOWN_MS: i64 = 2_000;
+const CEX_SNIPER_STRATEGY_ID: &str = "CEX_SNIPER";
 
 fn coinbase_ws_url() -> String {
     std::env::var("COINBASE_WS_URL").unwrap_or_else(|_| COINBASE_ADVANCED_WS_URL.to_string())
@@ -165,13 +170,13 @@ fn rolling_std(values: &VecDeque<f64>) -> f64 {
     var.max(0.0).sqrt()
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum Side {
     Yes,
     No,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Position {
     id: String,
     side: Side,
@@ -193,6 +198,18 @@ impl CexArbStrategy {
             open_positions: Arc::new(RwLock::new(Vec::new())),
         }
     }
+
+    fn valid_persisted_position(position: &Position) -> bool {
+        !position.id.trim().is_empty()
+            && position.entry_poly.is_finite()
+            && position.entry_poly > 0.0
+            && position.entry_poly < 1.0
+            && position.entry_cb.is_finite()
+            && position.entry_cb > 0.0
+            && position.size.is_finite()
+            && position.size > 0.0
+            && position.timestamp_ms > 0
+    }
 }
 
 #[async_trait]
@@ -210,6 +227,30 @@ impl Strategy for CexArbStrategy {
         let cost_model = SimCostModel::from_env();
         let variant = strategy_variant();
         let mut last_seen_reset_ts = 0_i64;
+
+        if let Some(restored) = restore_strategy_open_positions::<Vec<Position>>(&mut conn, CEX_SNIPER_STRATEGY_ID).await {
+            let mut sanitized: Vec<Position> = restored
+                .into_iter()
+                .filter(Self::valid_persisted_position)
+                .collect();
+            if sanitized.len() > MAX_CONCURRENT_POSITIONS {
+                sanitized.truncate(MAX_CONCURRENT_POSITIONS);
+            }
+            if sanitized.is_empty() {
+                clear_strategy_open_positions(&mut conn, CEX_SNIPER_STRATEGY_ID).await;
+            } else {
+                let restored_count = sanitized.len();
+                {
+                    let mut positions = self.open_positions.write().await;
+                    *positions = sanitized.clone();
+                }
+                persist_strategy_open_positions(&mut conn, CEX_SNIPER_STRATEGY_ID, &sanitized).await;
+                info!(
+                    "CEX Sniper restored {} persisted open position(s)",
+                    restored_count
+                );
+            }
+        }
 
         let latest_cb_price = Arc::new(RwLock::new((0.0, 0_i64)));
         let cb_writer = latest_cb_price.clone();
@@ -363,7 +404,7 @@ impl Strategy for CexArbStrategy {
                     }
                     _ = interval.tick() => {
                         let now_ms = Utc::now().timestamp_millis();
-                        let enabled = is_strategy_enabled(&mut conn, "CEX_SNIPER").await;
+                        let enabled = is_strategy_enabled(&mut conn, CEX_SNIPER_STRATEGY_ID).await;
 
                         if !enabled {
                             let released_notional = {
@@ -375,14 +416,15 @@ impl Strategy for CexArbStrategy {
                                 release
                             };
                             if released_notional > 0.0 {
-                                let _ = release_sim_notional_for_strategy(&mut conn, "CEX_SNIPER", released_notional).await;
+                                let _ = release_sim_notional_for_strategy(&mut conn, CEX_SNIPER_STRATEGY_ID, released_notional).await;
                             }
+                            clear_strategy_open_positions(&mut conn, CEX_SNIPER_STRATEGY_ID).await;
                             publish_heartbeat(&mut conn, "cex_arb").await;
                             continue;
                         }
 
                         // Risk guard cooldown — skip entry if backend set a post-loss cooldown.
-                        let cooldown_until = read_risk_guard_cooldown(&mut conn, "CEX_SNIPER").await;
+                        let cooldown_until = read_risk_guard_cooldown(&mut conn, CEX_SNIPER_STRATEGY_ID).await;
                         if cooldown_until > 0 && now_ms < cooldown_until {
                             publish_heartbeat(&mut conn, "cex_arb").await;
                             continue;
@@ -530,7 +572,7 @@ impl Strategy for CexArbStrategy {
                         publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
 
                         let trading_mode = read_trading_mode(&mut conn).await;
-                        let just_entered_live = entered_live_mode(&mut conn, "CEX_SNIPER", trading_mode).await;
+                        let just_entered_live = entered_live_mode(&mut conn, CEX_SNIPER_STRATEGY_ID, trading_mode).await;
                         if trading_mode == TradingMode::Live {
                             let time_to_expiry_ms = market_expiry.saturating_mul(1000) - now_ms;
                             let yes_spread = (book.yes.best_ask - book.yes.best_bid).max(0.0);
@@ -552,7 +594,7 @@ impl Strategy for CexArbStrategy {
                                 let available_cash = read_sim_available_cash(&mut conn).await;
                                 let raw_preview_size = compute_strategy_bet_size(
                                     &mut conn,
-                                    "CEX_SNIPER",
+                                    CEX_SNIPER_STRATEGY_ID,
                                     available_cash,
                                     &risk_cfg,
                                     10.0,
@@ -621,8 +663,9 @@ impl Strategy for CexArbStrategy {
                                     (count, release)
                                 };
                                 if released_notional > 0.0 {
-                                    let _ = release_sim_notional_for_strategy(&mut conn, "CEX_SNIPER", released_notional).await;
+                                    let _ = release_sim_notional_for_strategy(&mut conn, CEX_SNIPER_STRATEGY_ID, released_notional).await;
                                 }
+                                clear_strategy_open_positions(&mut conn, CEX_SNIPER_STRATEGY_ID).await;
                                 if cleared > 0 {
                                     info!("CEX Sniper: cleared {} paper position(s) on LIVE transition", cleared);
                                 }
@@ -636,14 +679,18 @@ impl Strategy for CexArbStrategy {
                             last_seen_reset_ts = reset_ts;
                             cb_history.clear();
                             momentum_history.clear();
-                            let mut positions = positions_link.write().await;
-                            positions.clear();
+                            {
+                                let mut positions = positions_link.write().await;
+                                positions.clear();
+                            }
+                            clear_strategy_open_positions(&mut conn, CEX_SNIPER_STRATEGY_ID).await;
                             publish_heartbeat(&mut conn, "cex_arb").await;
                             continue;
                         }
 
                         let mut closed: Vec<(Position, f64, f64, i64, &'static str)> = Vec::new();
                         let mut new_entry: Option<Position> = None;
+                        let mut positions_pruned_snapshot: Option<Vec<Position>> = None;
 
                         {
                             let mut positions = positions_link.write().await;
@@ -681,6 +728,9 @@ impl Strategy for CexArbStrategy {
 
                             for idx in done.iter().rev() {
                                 positions.remove(*idx);
+                            }
+                            if !done.is_empty() {
+                                positions_pruned_snapshot = Some(positions.clone());
                             }
 
                             if positions.len() < MAX_CONCURRENT_POSITIONS {
@@ -726,14 +776,22 @@ impl Strategy for CexArbStrategy {
                             }
                         }
 
+                        if let Some(snapshot) = positions_pruned_snapshot.as_ref() {
+                            if snapshot.is_empty() {
+                                clear_strategy_open_positions(&mut conn, CEX_SNIPER_STRATEGY_ID).await;
+                            } else {
+                                persist_strategy_open_positions(&mut conn, CEX_SNIPER_STRATEGY_ID, snapshot).await;
+                            }
+                        }
+
                         for (pos, exit_price, gross_return, hold_ms, reason) in closed {
                             let pnl = realized_pnl(pos.size, gross_return, cost_model);
-                            let new_bankroll = settle_sim_position_for_strategy(&mut conn, "CEX_SNIPER", pos.size, pnl).await;
+                            let new_bankroll = settle_sim_position_for_strategy(&mut conn, CEX_SNIPER_STRATEGY_ID, pos.size, pnl).await;
                             let execution_id = pos.id.clone();
 
                             let pnl_msg = serde_json::json!({
                                 "execution_id": execution_id.clone(),
-                                "strategy": "CEX_SNIPER",
+                                "strategy": CEX_SNIPER_STRATEGY_ID,
                                 "variant": variant.as_str(),
                                 "pnl": pnl,
                                 "notional": pos.size,
@@ -781,7 +839,7 @@ impl Strategy for CexArbStrategy {
                             let available_cash = read_sim_available_cash(&mut conn).await;
                             let base_size = compute_strategy_bet_size(
                                 &mut conn,
-                                "CEX_SNIPER",
+                                CEX_SNIPER_STRATEGY_ID,
                                 available_cash,
                                 &risk_cfg,
                                 10.0,
@@ -795,20 +853,29 @@ impl Strategy for CexArbStrategy {
                                 continue;
                             }
 
-                            if !reserve_sim_notional_for_strategy(&mut conn, "CEX_SNIPER", pos.size).await {
+                            if !reserve_sim_notional_for_strategy(&mut conn, CEX_SNIPER_STRATEGY_ID, pos.size).await {
                                 publish_heartbeat(&mut conn, "cex_arb").await;
                                 continue;
                             }
 
-                            {
+                            let mut persisted_snapshot: Option<Vec<Position>> = None;
+                            let accepted = {
                                 let mut positions = positions_link.write().await;
                                 if positions.len() < MAX_CONCURRENT_POSITIONS {
                                     positions.push(pos.clone());
+                                    persisted_snapshot = Some(positions.clone());
+                                    true
                                 } else {
-                                    let _ = release_sim_notional_for_strategy(&mut conn, "CEX_SNIPER", pos.size).await;
-                                    publish_heartbeat(&mut conn, "cex_arb").await;
-                                    continue;
+                                    false
                                 }
+                            };
+                            if !accepted {
+                                let _ = release_sim_notional_for_strategy(&mut conn, CEX_SNIPER_STRATEGY_ID, pos.size).await;
+                                publish_heartbeat(&mut conn, "cex_arb").await;
+                                continue;
+                            }
+                            if let Some(snapshot) = persisted_snapshot.as_ref() {
+                                persist_strategy_open_positions(&mut conn, CEX_SNIPER_STRATEGY_ID, snapshot).await;
                             }
 
                             let direction = match pos.side { Side::Yes => "YES", Side::No => "NO" };

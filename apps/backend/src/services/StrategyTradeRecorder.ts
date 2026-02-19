@@ -32,6 +32,48 @@ export function classifyClosureReason(reason: string | undefined): { closure_cla
     return { closure_class: 'UNKNOWN', label_eligible: false };
 }
 
+export function inferTradeClosureReason(
+    reason: string | null | undefined,
+    details: Record<string, unknown> | null = null,
+): string | undefined {
+    const direct = parseString(reason);
+    if (direct) {
+        return direct.trim().toUpperCase();
+    }
+
+    const detailReason = parseString(details?.reason);
+    if (detailReason) {
+        return detailReason.trim().toUpperCase();
+    }
+
+    const action = parseString(details?.action);
+    if (!action) {
+        return undefined;
+    }
+
+    const upperAction = action.trim().toUpperCase();
+    if (upperAction === 'RESOLVE_WINDOW' || upperAction === 'WINDOW_RESOLVE') {
+        return 'EXPIRY';
+    }
+    if (upperAction === 'SETTLEMENT_TIMEOUT') {
+        return 'TIMEOUT';
+    }
+    if (upperAction === 'EARLY_EXIT') {
+        return 'SIGNAL_SL';
+    }
+    if (upperAction.includes('EXPIRY')) {
+        return 'EXPIRY';
+    }
+    if (upperAction.includes('TIMEOUT')) {
+        return 'TIMEOUT';
+    }
+    if (upperAction.includes('MAX_HOLD')) {
+        return 'MAX_HOLD';
+    }
+
+    return upperAction;
+}
+
 type StrategyTradeRecord = {
     timestamp: number;
     strategy: string;
@@ -173,7 +215,7 @@ function toRecord(payload: unknown): StrategyTradeRecord | null {
         ?? parseNumber(details?.size)
         ?? undefined;
     const mode = parseString(row.mode) || undefined;
-    const reason = parseString(row.reason) || parseString(details?.reason) || undefined;
+    const reason = inferTradeClosureReason(parseString(row.reason), details);
     const grossReturn = parseNumber(details?.gross_return) ?? undefined;
     const netReturn = parseNumber(details?.net_return) ?? (
         notional && notional > 0 ? pnl / notional : undefined

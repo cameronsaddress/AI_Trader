@@ -2,7 +2,7 @@ use chrono::Utc;
 use hmac::{Hmac, Mac};
 use log::warn;
 use redis::AsyncCommands;
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::Sha256;
 
 pub const DEFAULT_SIM_BANKROLL: f64 = 1000.0;
@@ -15,6 +15,8 @@ const SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX: &str = "sim_ledger:reserved:family:"
 const STRATEGY_RISK_MULTIPLIER_PREFIX: &str = "strategy:risk_multiplier:";
 const STRATEGY_RISK_OVERLAY_PREFIX: &str = "strategy:risk_overlay:cross_horizon:";
 const STRATEGY_LAST_MODE_PREFIX: &str = "strategy:last_mode:";
+const STRATEGY_OPEN_POSITIONS_PREFIX: &str = "strategy:open_positions:";
+const STRATEGY_OPEN_POSITIONS_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 const DEFAULT_STRATEGY_CONCENTRATION_CAP_PCT: f64 = 0.35;
 const DEFAULT_FAMILY_CONCENTRATION_CAP_PCT: f64 = 0.60;
 const DEFAULT_UNDERLYING_CONCENTRATION_CAP_PCT: f64 = 0.70;
@@ -177,8 +179,16 @@ async fn read_f64_or(
     key: &str,
     fallback: f64,
 ) -> f64 {
-    match conn.get::<_, f64>(key).await {
-        Ok(value) => value,
+    match conn.get::<_, Option<f64>>(key).await {
+        Ok(Some(value)) if value.is_finite() => value,
+        Ok(Some(_)) => {
+            warn!(
+                "read non-finite {} from redis; using fallback {}",
+                key, fallback
+            );
+            fallback
+        }
+        Ok(None) => fallback,
         Err(error) => {
             warn!("failed to read {} from redis; using fallback {}: {}", key, fallback, error);
             fallback
@@ -736,6 +746,95 @@ pub async fn entered_live_mode(
     just_entered_live
 }
 
+fn strategy_open_positions_key(strategy_id: &str) -> Option<String> {
+    let key = strategy_id.trim().to_uppercase();
+    if key.is_empty() {
+        return None;
+    }
+    Some(format!("{}{}", STRATEGY_OPEN_POSITIONS_PREFIX, key))
+}
+
+pub async fn restore_strategy_open_positions<T>(
+    conn: &mut redis::aio::MultiplexedConnection,
+    strategy_id: &str,
+) -> Option<T>
+where
+    T: DeserializeOwned,
+{
+    let key = strategy_open_positions_key(strategy_id)?;
+    let raw = match conn.get::<_, Option<String>>(&key).await {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                "[{}] failed to read persisted open positions {}: {}",
+                strategy_id, key, error
+            );
+            None
+        }
+    }?;
+
+    match serde_json::from_str::<T>(&raw) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            warn!(
+                "[{}] failed to decode persisted open positions {}: {}",
+                strategy_id, key, error
+            );
+            None
+        }
+    }
+}
+
+pub async fn persist_strategy_open_positions<T>(
+    conn: &mut redis::aio::MultiplexedConnection,
+    strategy_id: &str,
+    payload: &T,
+) where
+    T: Serialize,
+{
+    let Some(key) = strategy_open_positions_key(strategy_id) else {
+        return;
+    };
+    let encoded = match serde_json::to_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                "[{}] failed to encode persisted open positions {}: {}",
+                strategy_id, key, error
+            );
+            return;
+        }
+    };
+    if let Err(error) = conn.set::<_, _, ()>(&key, encoded).await {
+        warn!(
+            "[{}] failed to persist open positions {}: {}",
+            strategy_id, key, error
+        );
+        return;
+    }
+    if let Err(error) = conn.expire::<_, ()>(&key, STRATEGY_OPEN_POSITIONS_TTL_SECS).await {
+        warn!(
+            "[{}] failed to set open-position TTL for {}: {}",
+            strategy_id, key, error
+        );
+    }
+}
+
+pub async fn clear_strategy_open_positions(
+    conn: &mut redis::aio::MultiplexedConnection,
+    strategy_id: &str,
+) {
+    let Some(key) = strategy_open_positions_key(strategy_id) else {
+        return;
+    };
+    if let Err(error) = conn.del::<_, ()>(&key).await {
+        warn!(
+            "[{}] failed to clear persisted open positions {}: {}",
+            strategy_id, key, error
+        );
+    }
+}
+
 pub fn strategy_variant() -> String {
     let raw = std::env::var("STRATEGY_VARIANT").unwrap_or_else(|_| "baseline".to_string());
     let trimmed = raw.trim();
@@ -779,7 +878,7 @@ pub fn compute_bet_size(bankroll: f64, cfg: &RiskConfig, min_size: f64, max_frac
 
 pub async fn read_strategy_risk_multiplier(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> f64 {
     if strategy_id.trim().is_empty() {
-        return 0.25;
+        return 1.0;
     }
 
     let key = format!("{}{}", STRATEGY_RISK_MULTIPLIER_PREFIX, strategy_id.trim());
@@ -789,10 +888,10 @@ pub async fn read_strategy_risk_multiplier(conn: &mut redis::aio::MultiplexedCon
         Err(error) => warn!("failed to read strategy risk multiplier {}: {}", key, error),
     }
 
-    if let Err(error) = conn.set_nx::<_, _, bool>(&key, 0.25_f64).await {
+    if let Err(error) = conn.set_nx::<_, _, bool>(&key, 1.0_f64).await {
         warn!("failed to initialize strategy risk multiplier {}: {}", key, error);
     }
-    0.25
+    1.0
 }
 
 pub async fn read_strategy_risk_overlay(conn: &mut redis::aio::MultiplexedConnection, strategy_id: &str) -> f64 {

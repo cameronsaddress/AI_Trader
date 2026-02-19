@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ethers::prelude::*;
 use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -11,9 +12,11 @@ use uuid::Uuid;
 use crate::engine::PolymarketClient;
 use crate::strategies::control::{
     build_scan_payload,
+    clear_strategy_open_positions,
     compute_strategy_bet_size,
     entered_live_mode,
     is_strategy_enabled,
+    persist_strategy_open_positions,
     publish_heartbeat,
     publish_event,
     publish_execution_event,
@@ -24,6 +27,7 @@ use crate::strategies::control::{
     reserve_sim_notional_for_strategy,
     read_risk_guard_cooldown,
     release_sim_notional_for_strategy,
+    restore_strategy_open_positions,
     settle_sim_position_for_strategy,
     read_trading_mode,
     TradingMode,
@@ -49,6 +53,7 @@ const TAKE_PROFIT_PCT: f64 = 0.12;
 const STOP_LOSS_PCT: f64 = -0.08;
 const MAX_HOLD_SECS: i64 = 120;
 const LIVE_PREVIEW_COOLDOWN_SECS: i64 = 20;
+const SYNDICATE_STRATEGY_ID: &str = "SYNDICATE";
 
 #[derive(Debug, Clone)]
 struct TrackedTrade {
@@ -62,6 +67,15 @@ struct TrackedTrade {
 
 #[derive(Debug, Clone)]
 struct Position {
+    execution_id: String,
+    entry_price: f64,
+    size: f64,
+    timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedOpenPosition {
+    token_id: String,
     execution_id: String,
     entry_price: f64,
     size: f64,
@@ -84,6 +98,63 @@ impl SyndicateStrategy {
             last_entry_ts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+
+    fn valid_position(position: &Position) -> bool {
+        !position.execution_id.trim().is_empty()
+            && position.entry_price.is_finite()
+            && position.entry_price > 0.0
+            && position.entry_price < 1.0
+            && position.size.is_finite()
+            && position.size > 0.0
+            && position.timestamp > 0
+    }
+
+    fn snapshot_open_positions(positions: &HashMap<U256, Position>) -> Vec<PersistedOpenPosition> {
+        let mut out: Vec<PersistedOpenPosition> = positions
+            .iter()
+            .filter_map(|(token_id, position)| {
+                if token_id.is_zero() || !Self::valid_position(position) {
+                    return None;
+                }
+                Some(PersistedOpenPosition {
+                    token_id: token_id.to_string(),
+                    execution_id: position.execution_id.clone(),
+                    entry_price: position.entry_price,
+                    size: position.size,
+                    timestamp: position.timestamp,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.token_id.cmp(&b.token_id));
+        out
+    }
+
+    fn restore_open_positions(
+        rows: Vec<PersistedOpenPosition>,
+    ) -> HashMap<U256, Position> {
+        let mut out = HashMap::new();
+        for row in rows {
+            let token_raw = row.token_id.trim();
+            if token_raw.is_empty() {
+                continue;
+            }
+            let token_id = match U256::from_dec_str(token_raw) {
+                Ok(value) if !value.is_zero() => value,
+                _ => continue,
+            };
+            let position = Position {
+                execution_id: row.execution_id,
+                entry_price: row.entry_price,
+                size: row.size,
+                timestamp: row.timestamp,
+            };
+            if !Self::valid_position(&position) {
+                continue;
+            }
+            out.insert(token_id, position);
+        }
+        out
+    }
 }
 
 #[async_trait]
@@ -101,6 +172,29 @@ impl Strategy for SyndicateStrategy {
         let cost_model = SimCostModel::from_env();
         let variant = strategy_variant();
         let event_variant = variant.clone();
+
+        if let Some(restored) = restore_strategy_open_positions::<Vec<PersistedOpenPosition>>(&mut conn, SYNDICATE_STRATEGY_ID).await {
+            let restored_positions = Self::restore_open_positions(restored);
+            if restored_positions.is_empty() {
+                clear_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID).await;
+            } else {
+                let restored_count = restored_positions.len();
+                let sanitized_snapshot = Self::snapshot_open_positions(&restored_positions);
+                {
+                    let mut positions = self.open_positions.write().await;
+                    *positions = restored_positions;
+                }
+                if sanitized_snapshot.is_empty() {
+                    clear_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID).await;
+                } else {
+                    persist_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID, &sanitized_snapshot).await;
+                }
+                info!(
+                    "Syndicate restored {} persisted open position(s)",
+                    restored_count
+                );
+            }
+        }
 
         let trade_window_writer = self.trade_window.clone();
         let positions_writer = self.open_positions.clone();
@@ -162,9 +256,14 @@ impl Strategy for SyndicateStrategy {
                     let reset_ts = read_simulation_reset_ts(&mut event_conn).await;
                     if reset_ts > event_last_reset_ts {
                         event_last_reset_ts = reset_ts;
-                        {
+                        let had_positions = {
                             let mut positions = positions_writer.write().await;
+                            let had = !positions.is_empty();
                             positions.clear();
+                            had
+                        };
+                        if had_positions {
+                            clear_strategy_open_positions(&mut event_conn, SYNDICATE_STRATEGY_ID).await;
                         }
                         {
                             let mut window = trade_window_writer.write().await;
@@ -227,10 +326,12 @@ impl Strategy for SyndicateStrategy {
 
                             // Exit logic on incoming trade updates.
                             let trading_mode = read_trading_mode(&mut event_conn).await;
-                            let just_entered_live = entered_live_mode(&mut event_conn, "SYNDICATE", trading_mode).await;
+                            let just_entered_live = entered_live_mode(&mut event_conn, SYNDICATE_STRATEGY_ID, trading_mode).await;
                             let mut cleared_live_count = 0usize;
                             let mut cleared_live_notional = 0.0_f64;
                             let mut close_candidate: Option<(Position, f64, &'static str)> = None;
+                            let mut cleared_persisted_positions = false;
+                            let mut persisted_snapshot: Option<Vec<PersistedOpenPosition>> = None;
 
                             {
                                 let mut positions = positions_writer.write().await;
@@ -239,6 +340,7 @@ impl Strategy for SyndicateStrategy {
                                         cleared_live_count = positions.len();
                                         cleared_live_notional = positions.values().map(|pos| pos.size).sum::<f64>();
                                         positions.clear();
+                                        cleared_persisted_positions = true;
                                     }
                                 } else if let Some(pos) = positions.get(&token_id).cloned() {
                                     if Utc::now().timestamp() - pos.timestamp >= MIN_HOLD_SECS {
@@ -247,14 +349,24 @@ impl Strategy for SyndicateStrategy {
                                             let reason = if pnl_pct >= TAKE_PROFIT_PCT { "TAKE_PROFIT" } else { "STOP_LOSS" };
                                             close_candidate = Some((pos, pnl_pct, reason));
                                             positions.remove(&token_id);
+                                            persisted_snapshot = Some(SyndicateStrategy::snapshot_open_positions(&positions));
                                         }
                                     }
+                                }
+                            }
+                            if cleared_persisted_positions {
+                                clear_strategy_open_positions(&mut event_conn, SYNDICATE_STRATEGY_ID).await;
+                            } else if let Some(snapshot) = persisted_snapshot.as_ref() {
+                                if snapshot.is_empty() {
+                                    clear_strategy_open_positions(&mut event_conn, SYNDICATE_STRATEGY_ID).await;
+                                } else {
+                                    persist_strategy_open_positions(&mut event_conn, SYNDICATE_STRATEGY_ID, snapshot).await;
                                 }
                             }
 
                             if trading_mode == TradingMode::Live {
                                 if cleared_live_notional > 0.0 {
-                                    let _ = release_sim_notional_for_strategy(&mut event_conn, "SYNDICATE", cleared_live_notional).await;
+                                    let _ = release_sim_notional_for_strategy(&mut event_conn, SYNDICATE_STRATEGY_ID, cleared_live_notional).await;
                                 }
                                 if cleared_live_count > 0 {
                                     info!(
@@ -267,7 +379,7 @@ impl Strategy for SyndicateStrategy {
 
                             if let Some((pos, pnl_pct, reason)) = close_candidate {
                                 let realized = realized_pnl(pos.size, pnl_pct, event_cost_model);
-                                let new_bankroll = settle_sim_position_for_strategy(&mut event_conn, "SYNDICATE", pos.size, realized).await;
+                                let new_bankroll = settle_sim_position_for_strategy(&mut event_conn, SYNDICATE_STRATEGY_ID, pos.size, realized).await;
                                 let execution_id = pos.execution_id.clone();
 
                                 let pnl_msg = serde_json::json!({
@@ -306,7 +418,7 @@ impl Strategy for SyndicateStrategy {
         loop {
             sleep(Duration::from_secs(5)).await;
 
-            if !is_strategy_enabled(&mut conn, "SYNDICATE").await {
+            if !is_strategy_enabled(&mut conn, SYNDICATE_STRATEGY_ID).await {
                 let released_notional = {
                     let mut positions = self.open_positions.write().await;
                     if positions.is_empty() {
@@ -317,15 +429,16 @@ impl Strategy for SyndicateStrategy {
                         release
                     }
                 };
+                clear_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID).await;
                 if released_notional > 0.0 {
-                    let _ = release_sim_notional_for_strategy(&mut conn, "SYNDICATE", released_notional).await;
+                    let _ = release_sim_notional_for_strategy(&mut conn, SYNDICATE_STRATEGY_ID, released_notional).await;
                 }
-                publish_heartbeat(&mut conn, "SYNDICATE").await;
+                publish_heartbeat(&mut conn, SYNDICATE_STRATEGY_ID).await;
                 continue;
             }
 
             let trading_mode = read_trading_mode(&mut conn).await;
-            let just_entered_live = entered_live_mode(&mut conn, "SYNDICATE", trading_mode).await;
+            let just_entered_live = entered_live_mode(&mut conn, SYNDICATE_STRATEGY_ID, trading_mode).await;
             if trading_mode == TradingMode::Live && just_entered_live {
                 let released_notional = {
                     let mut positions = self.open_positions.write().await;
@@ -338,8 +451,9 @@ impl Strategy for SyndicateStrategy {
                         release
                     }
                 };
+                clear_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID).await;
                 if released_notional > 0.0 {
-                    let _ = release_sim_notional_for_strategy(&mut conn, "SYNDICATE", released_notional).await;
+                    let _ = release_sim_notional_for_strategy(&mut conn, SYNDICATE_STRATEGY_ID, released_notional).await;
                 }
             }
 
@@ -350,6 +464,7 @@ impl Strategy for SyndicateStrategy {
                     let mut positions = self.open_positions.write().await;
                     positions.clear();
                 }
+                clear_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID).await;
                 {
                     let mut window = self.trade_window.write().await;
                     window.clear();
@@ -358,7 +473,7 @@ impl Strategy for SyndicateStrategy {
                     let mut last_entry = self.last_entry_ts.write().await;
                     last_entry.clear();
                 }
-                publish_heartbeat(&mut conn, "SYNDICATE").await;
+                publish_heartbeat(&mut conn, SYNDICATE_STRATEGY_ID).await;
                 continue;
             }
 
@@ -393,6 +508,7 @@ impl Strategy for SyndicateStrategy {
 
             if trading_mode == TradingMode::Paper {
                 let mut time_exits: Vec<(U256, Position, f64)> = Vec::new();
+                let mut positions_after_time_exits: Option<Vec<PersistedOpenPosition>> = None;
                 {
                     let mut positions = self.open_positions.write().await;
                     let tokens: Vec<U256> = positions.keys().copied().collect();
@@ -410,6 +526,16 @@ impl Strategy for SyndicateStrategy {
                         positions.remove(&token_id);
                         time_exits.push((token_id, pos, exit_price));
                     }
+                    if !time_exits.is_empty() {
+                        positions_after_time_exits = Some(Self::snapshot_open_positions(&positions));
+                    }
+                }
+                if let Some(snapshot) = positions_after_time_exits.as_ref() {
+                    if snapshot.is_empty() {
+                        clear_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID).await;
+                    } else {
+                        persist_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID, snapshot).await;
+                    }
                 }
 
                 for (token_id, pos, exit_price) in time_exits {
@@ -419,7 +545,7 @@ impl Strategy for SyndicateStrategy {
                         0.0
                     };
                     let realized = realized_pnl(pos.size, pnl_pct, cost_model);
-                    let new_bankroll = settle_sim_position_for_strategy(&mut conn, "SYNDICATE", pos.size, realized).await;
+                    let new_bankroll = settle_sim_position_for_strategy(&mut conn, SYNDICATE_STRATEGY_ID, pos.size, realized).await;
                     let ts_ms = Utc::now().timestamp_millis();
                     let hold_secs = now.saturating_sub(pos.timestamp);
                     let net_return = if pos.size > 0.0 { realized / pos.size } else { 0.0 };
@@ -470,9 +596,9 @@ impl Strategy for SyndicateStrategy {
             }
 
             let now_ms = Utc::now().timestamp_millis();
-            let cooldown_until = read_risk_guard_cooldown(&mut conn, "SYNDICATE").await;
+            let cooldown_until = read_risk_guard_cooldown(&mut conn, SYNDICATE_STRATEGY_ID).await;
             if cooldown_until > 0 && now_ms < cooldown_until {
-                publish_heartbeat(&mut conn, "SYNDICATE").await;
+                publish_heartbeat(&mut conn, SYNDICATE_STRATEGY_ID).await;
                 continue;
             }
 
@@ -647,7 +773,7 @@ impl Strategy for SyndicateStrategy {
                 let risk_cfg = read_risk_config(&mut conn).await;
                 let base_bet_size = compute_strategy_bet_size(
                     &mut conn,
-                    "SYNDICATE",
+                    SYNDICATE_STRATEGY_ID,
                     available_cash,
                     &risk_cfg,
                     10.0,
@@ -759,11 +885,12 @@ impl Strategy for SyndicateStrategy {
                     continue;
                 }
 
-                if !reserve_sim_notional_for_strategy(&mut conn, "SYNDICATE", bet_size).await {
+                if !reserve_sim_notional_for_strategy(&mut conn, SYNDICATE_STRATEGY_ID, bet_size).await {
                     continue;
                 }
 
                 let execution_id = Uuid::new_v4().to_string();
+                let mut persisted_snapshot: Option<Vec<PersistedOpenPosition>> = None;
                 let inserted = {
                     let mut positions = self.open_positions.write().await;
                     if positions.contains_key(token_id) {
@@ -775,13 +902,21 @@ impl Strategy for SyndicateStrategy {
                             size: bet_size,
                             timestamp: now,
                         });
+                        persisted_snapshot = Some(Self::snapshot_open_positions(&positions));
                         true
                     }
                 };
 
                 if !inserted {
-                    let _ = release_sim_notional_for_strategy(&mut conn, "SYNDICATE", bet_size).await;
+                    let _ = release_sim_notional_for_strategy(&mut conn, SYNDICATE_STRATEGY_ID, bet_size).await;
                     continue;
+                }
+                if let Some(snapshot) = persisted_snapshot.as_ref() {
+                    if snapshot.is_empty() {
+                        clear_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID).await;
+                    } else {
+                        persist_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID, snapshot).await;
+                    }
                 }
 
                 {
@@ -823,7 +958,7 @@ impl Strategy for SyndicateStrategy {
                 );
             }
 
-            publish_heartbeat(&mut conn, "SYNDICATE").await;
+            publish_heartbeat(&mut conn, SYNDICATE_STRATEGY_ID).await;
         }
     }
 }

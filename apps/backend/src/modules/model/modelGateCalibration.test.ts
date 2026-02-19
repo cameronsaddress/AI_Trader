@@ -91,7 +91,7 @@ describe('buildModelGateCalibrationSamples', () => {
                 if (executionId === 'exec-b') return 0.57;
                 return null;
             },
-            clampProbability: (value) => Math.max(0.5, Math.min(0.95, value)),
+            normalizeProbability: (value) => Math.min(1, Math.max(0, value)),
         });
 
         const accepted = samples.filter((sample) => sample.accepted);
@@ -99,7 +99,7 @@ describe('buildModelGateCalibrationSamples', () => {
         const rejectedDirect = samples.find((sample) => !sample.accepted && sample.execution_id === 'exec-a');
         expect(rejectedDirect).toBeDefined();
         expect(rejectedDirect?.pnl).toBe(25);
-        expect(rejectedDirect?.probability).toBe(0.5);
+        expect(rejectedDirect?.probability).toBe(0.48);
     });
 
     it('matches nearest eligible counterfactual rows and does not reuse the same label row twice', () => {
@@ -151,7 +151,7 @@ describe('buildModelGateCalibrationSamples', () => {
                 }),
             ],
             probabilityForExecutionId: () => null,
-            clampProbability: (value) => Math.max(0.5, Math.min(0.95, value)),
+            normalizeProbability: (value) => Math.min(1, Math.max(0, value)),
         });
 
         const rejA = samples.find((sample) => !sample.accepted && sample.execution_id === 'rej-a');
@@ -206,7 +206,7 @@ describe('buildModelGateCalibrationSamples', () => {
                 }),
             ],
             probabilityForExecutionId: () => null,
-            clampProbability: (value) => Math.max(0.5, Math.min(0.95, value)),
+            normalizeProbability: (value) => Math.min(1, Math.max(0, value)),
             fallbackNotionalUsd: 100,
         });
 

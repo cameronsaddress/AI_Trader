@@ -28,8 +28,11 @@ services:
       - INTELLIGENCE_GATE_ENABLED=${INTELLIGENCE_GATE_ENABLED:-true}
       - INTELLIGENCE_GATE_MAX_STALENESS_MS=${INTELLIGENCE_GATE_MAX_STALENESS_MS:-3000}
       - INTELLIGENCE_GATE_MIN_MARGIN=${INTELLIGENCE_GATE_MIN_MARGIN:-0}
+      - FEATURE_DATASET_MANIFEST_PATH=/app/reports/feature_dataset_manifest.json
+      - SIGNAL_MODEL_REPORT_PATH=/app/reports/models/signal_model_report.json
+      - SIGNAL_MODEL_ARTIFACT_PATH=/app/reports/models/signal_model_latest.json
       - DEFAULT_DISABLED_STRATEGIES=
-      - STRATEGY_WEIGHT_CAP=2.0
+      - STRATEGY_WEIGHT_CAP=${STRATEGY_WEIGHT_CAP:-2.0}
       - STRATEGY_ALLOCATOR_EMA_ALPHA=0.05
       - RISK_GUARD_STRATEGIES=BTC_5M,BTC_15M,ETH_15M,SOL_15M,CEX_SNIPER,OBI_SCALPER,SYNDICATE,ATOMIC_ARB,GRAPH_ARB,CONVERGENCE_CARRY,MAKER_MM,AS_MARKET_MAKER,LONGSHOT_BIAS
       - VAULT_ENABLED=true
@@ -53,6 +56,7 @@ services:
     volumes:
       - ../apps/backend:/app/apps/backend
       - ../packages:/app/packages
+      - ../reports:/app/reports
     command: npm run dev --workspace=@ai-trader/backend
     init: true
     restart: unless-stopped
@@ -60,11 +64,12 @@ services:
       test:
         [
           "CMD-SHELL",
-          "wget -q -T 4 -t 1 -O- http://localhost:5114/health >/dev/null && touch /tmp/backend_healthy_once && rm -f /tmp/backend_hc_failures && exit 0; if [ -f /tmp/backend_healthy_once ]; then n=$$(cat /tmp/backend_hc_failures 2>/dev/null || echo 0); n=$$((n+1)); echo \"$$n\" >/tmp/backend_hc_failures; [ \"$$n\" -ge 3 ] && kill -s TERM 1; fi; exit 1",
+          "wget -q -T 6 -t 1 -O- http://localhost:5114/health >/dev/null && touch /tmp/backend_healthy_once && rm -f /tmp/backend_hc_failures && exit 0; if [ -f /tmp/backend_healthy_once ]; then n=$$(cat /tmp/backend_hc_failures 2>/dev/null || echo 0); n=$$((n+1)); echo \"$$n\" >/tmp/backend_hc_failures; [ \"$$n\" -ge 8 ] && kill -s TERM 1; fi; exit 1",
         ]
-      interval: 15s
-      timeout: 5s
-      retries: 3
+      interval: 20s
+      timeout: 8s
+      retries: 5
+      start_period: 45s
     mem_limit: 1g
 
   frontend:
@@ -201,7 +206,9 @@ services:
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
-      - BTC_5M_MIN_EXPECTED_NET_RETURN=0.003
+      - BTC_5M_MIN_EXPECTED_NET_RETURN=0.008
+      - BTC_5M_MAX_POSITION_FRACTION=0.10
+      - BTC_5M_MAX_ENTRY_SPREAD=0.05
       - BTC_5M_NOTIONAL_CAP=35
       - BTC_5M_FAIR_PRICE_EXTRA_BPS=100
       - BTC_5M_FAIR_PRICE_BAND=0.03

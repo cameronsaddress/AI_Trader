@@ -103,10 +103,13 @@ describe('PolymarketPreflightService redis dedupe', () => {
         const first = new PolymarketPreflightService(dedupe);
         const firstResult = await first.preflightFromExecution(payload);
         expect(firstResult).not.toBeNull();
+        expect(firstResult?.throttled).toBeUndefined();
 
         const restarted = new PolymarketPreflightService(dedupe);
         const secondResult = await restarted.preflightFromExecution(payload);
-        expect(secondResult).toBeNull();
+        expect(secondResult).not.toBeNull();
+        expect(secondResult?.throttled).toBe(true);
+        expect(secondResult?.ok).toBe(false);
     });
 
     it('suppresses duplicate live-execution posting attempt after restart via redis dedupe key', async () => {
@@ -116,10 +119,13 @@ describe('PolymarketPreflightService redis dedupe', () => {
         const first = new PolymarketPreflightService(dedupe);
         const firstResult = await first.executeFromExecution(payload, 'LIVE');
         expect(firstResult).not.toBeNull();
+        expect(firstResult?.throttled).toBeUndefined();
 
         const restarted = new PolymarketPreflightService(dedupe);
         const secondResult = await restarted.executeFromExecution(payload, 'LIVE');
-        expect(secondResult).toBeNull();
+        expect(secondResult).not.toBeNull();
+        expect(secondResult?.throttled).toBe(true);
+        expect(secondResult?.ok).toBe(false);
     });
 
     it('continues when redis dedupe store throws (degrades open)', async () => {
@@ -129,5 +135,17 @@ describe('PolymarketPreflightService redis dedupe', () => {
 
         await expect(service.preflightFromExecution(payload)).resolves.not.toBeNull();
         await expect(service.executeFromExecution(payload, 'LIVE')).resolves.not.toBeNull();
+    });
+
+    it('returns explicit bypass outcome when trading mode is PAPER', async () => {
+        const dedupe = new MockDedupeStore();
+        const payload = buildExecutionPayload('ATOMIC_ARB');
+        const service = new PolymarketPreflightService(dedupe);
+
+        const result = await service.executeFromExecution(payload, 'PAPER');
+        expect(result).not.toBeNull();
+        expect(result?.bypassed).toBe(true);
+        expect(result?.dryRun).toBe(true);
+        expect(result?.ok).toBe(true);
     });
 });

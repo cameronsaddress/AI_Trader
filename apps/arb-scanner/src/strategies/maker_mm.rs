@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use chrono::{Timelike, Utc};
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -11,9 +12,11 @@ use uuid::Uuid;
 use crate::engine::{MarketTarget, PolymarketClient, WS_URL};
 use crate::strategies::control::{
     build_scan_payload,
+    clear_strategy_open_positions,
     compute_strategy_bet_size,
     entered_live_mode,
     is_strategy_enabled,
+    persist_strategy_open_positions,
     publish_heartbeat,
     publish_event,
     publish_execution_event,
@@ -24,6 +27,7 @@ use crate::strategies::control::{
     read_trading_mode,
     release_sim_notional_for_strategy,
     reserve_sim_notional_for_strategy,
+    restore_strategy_open_positions,
     settle_sim_position_for_strategy,
     strategy_variant,
     TradingMode,
@@ -62,14 +66,15 @@ fn fee_curve_rate() -> f64 {
 const TAKE_PROFIT_PCT: f64 = 0.018;
 const STOP_LOSS_PCT: f64 = -0.015;
 const MAX_HOLD_MS: i64 = 90_000;
+const MAKER_MM_STRATEGY_ID: &str = "MAKER_MM";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum Side {
     Yes,
     No,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Position {
     execution_id: String,
     market_id: String,
@@ -89,6 +94,17 @@ impl MakerMmStrategy {
         Self {
             client: PolymarketClient::new(),
         }
+    }
+
+    fn valid_persisted_position(position: &Position) -> bool {
+        !position.execution_id.trim().is_empty()
+            && !position.market_id.trim().is_empty()
+            && position.entry_price.is_finite()
+            && position.entry_price > 0.0
+            && position.entry_price < 1.0
+            && position.size.is_finite()
+            && position.size > 0.0
+            && position.timestamp_ms > 0
     }
 
     fn build_universe(markets: Vec<MarketTarget>) -> (HashMap<String, MarketTarget>, HashMap<String, TokenBinding>, Vec<String>) {
@@ -164,6 +180,24 @@ impl Strategy for MakerMmStrategy {
         let mut last_seen_reset_ts = 0_i64;
         let mut last_entry_ms = 0_i64;
         let mut last_live_preview_ms = 0_i64;
+
+        if let Some(restored) = restore_strategy_open_positions::<Vec<Position>>(&mut conn, MAKER_MM_STRATEGY_ID).await {
+            let mut sanitized: Vec<Position> = restored
+                .into_iter()
+                .filter(Self::valid_persisted_position)
+                .collect();
+            if sanitized.len() > MAX_OPEN_POSITIONS {
+                sanitized.truncate(MAX_OPEN_POSITIONS);
+            }
+            if sanitized.is_empty() {
+                clear_strategy_open_positions(&mut conn, MAKER_MM_STRATEGY_ID).await;
+            } else {
+                let restored_count = sanitized.len();
+                open_positions = sanitized.clone();
+                persist_strategy_open_positions(&mut conn, MAKER_MM_STRATEGY_ID, &sanitized).await;
+                info!("Maker MM restored {} persisted open position(s)", restored_count);
+            }
+        }
 
         loop {
             let now_secs = Utc::now().timestamp();
@@ -272,21 +306,23 @@ impl Strategy for MakerMmStrategy {
                             last_seen_reset_ts = reset_ts;
                             let release_notional = open_positions.iter().map(|pos| pos.size).sum::<f64>();
                             open_positions.clear();
+                            clear_strategy_open_positions(&mut conn, MAKER_MM_STRATEGY_ID).await;
                             books.clear();
                             last_entry_ms = 0;
                             if release_notional > 0.0 {
-                                let _ = release_sim_notional_for_strategy(&mut conn, "MAKER_MM", release_notional).await;
+                                let _ = release_sim_notional_for_strategy(&mut conn, MAKER_MM_STRATEGY_ID, release_notional).await;
                             }
                             publish_heartbeat(&mut conn, "maker_mm").await;
                             continue;
                         }
 
-                        if !is_strategy_enabled(&mut conn, "MAKER_MM").await {
+                        if !is_strategy_enabled(&mut conn, MAKER_MM_STRATEGY_ID).await {
                             if !open_positions.is_empty() {
                                 let release_notional = open_positions.iter().map(|pos| pos.size).sum::<f64>();
                                 open_positions.clear();
+                                clear_strategy_open_positions(&mut conn, MAKER_MM_STRATEGY_ID).await;
                                 if release_notional > 0.0 {
-                                    let _ = release_sim_notional_for_strategy(&mut conn, "MAKER_MM", release_notional).await;
+                                    let _ = release_sim_notional_for_strategy(&mut conn, MAKER_MM_STRATEGY_ID, release_notional).await;
                                 }
                             }
                             publish_heartbeat(&mut conn, "maker_mm").await;
@@ -294,27 +330,30 @@ impl Strategy for MakerMmStrategy {
                         }
 
                         // Risk guard cooldown — skip entry if backend set a post-loss cooldown.
-                        let cooldown_until = read_risk_guard_cooldown(&mut conn, "MAKER_MM").await;
+                        let cooldown_until = read_risk_guard_cooldown(&mut conn, MAKER_MM_STRATEGY_ID).await;
                         if cooldown_until > 0 && now_ms < cooldown_until {
                             publish_heartbeat(&mut conn, "maker_mm").await;
                             continue;
                         }
 
                         let trading_mode = read_trading_mode(&mut conn).await;
-                        let just_entered_live = entered_live_mode(&mut conn, "MAKER_MM", trading_mode).await;
+                        let just_entered_live = entered_live_mode(&mut conn, MAKER_MM_STRATEGY_ID, trading_mode).await;
                         if trading_mode == TradingMode::Live && just_entered_live && !open_positions.is_empty() {
                             let release_notional = open_positions.iter().map(|pos| pos.size).sum::<f64>();
                             let cleared = open_positions.len();
                             open_positions.clear();
+                            clear_strategy_open_positions(&mut conn, MAKER_MM_STRATEGY_ID).await;
                             if release_notional > 0.0 {
-                                let _ = release_sim_notional_for_strategy(&mut conn, "MAKER_MM", release_notional).await;
+                                let _ = release_sim_notional_for_strategy(&mut conn, MAKER_MM_STRATEGY_ID, release_notional).await;
                             }
                             info!("Maker MM: cleared {} paper position(s) on LIVE transition", cleared);
                         }
 
                         // Exit management.
                         if trading_mode != TradingMode::Live {
+                            let prior_len = open_positions.len();
                             let mut keep_positions: Vec<Position> = Vec::new();
+                            let mut closed_positions: Vec<(Position, f64, f64, i64, &'static str)> = Vec::new();
                             for pos in open_positions.drain(..) {
                                 let Some(book) = books.get(&pos.market_id) else {
                                     keep_positions.push(pos);
@@ -358,43 +397,53 @@ impl Strategy for MakerMmStrategy {
                                 };
 
                                 if let Some(reason) = close_reason {
-                                    let pnl = realized_pnl_with_fill(
-                                        pos.size,
-                                        gross_return,
-                                        cost_model,
-                                        FillStyle::Maker,
-                                        FillStyle::Taker,
-                                    );
-                                    let bankroll = settle_sim_position_for_strategy(&mut conn, "MAKER_MM", pos.size, pnl).await;
-                                    let execution_id = pos.execution_id.clone();
-                                    let pnl_msg = serde_json::json!({
-                                        "execution_id": execution_id,
-                                        "strategy": "MAKER_MM",
-                                        "variant": variant.as_str(),
-                                        "pnl": pnl,
-                                        "notional": pos.size,
-                                        "timestamp": now_ms,
-                                        "bankroll": bankroll,
-                                        "mode": "PAPER",
-                                        "details": {
-                                            "action": "CLOSE_POSITION",
-                                            "reason": reason,
-                                            "market_id": pos.market_id,
-                                            "question": pos.question,
-                                            "side": Self::side_label(pos.side),
-                                            "entry": pos.entry_price,
-                                            "exit": bid,
-                                            "gross_return": gross_return,
-                                            "hold_ms": hold_ms,
-                                            "fill_model": "MAKER_TAKER",
-                                        }
-                                    });
-                                    publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
+                                    closed_positions.push((pos, bid, gross_return, hold_ms, reason));
                                 } else {
                                     keep_positions.push(pos);
                                 }
                             }
                             open_positions = keep_positions;
+                            if open_positions.len() != prior_len {
+                                if open_positions.is_empty() {
+                                    clear_strategy_open_positions(&mut conn, MAKER_MM_STRATEGY_ID).await;
+                                } else {
+                                    persist_strategy_open_positions(&mut conn, MAKER_MM_STRATEGY_ID, &open_positions).await;
+                                }
+                            }
+                            for (pos, bid, gross_return, hold_ms, reason) in closed_positions {
+                                let pnl = realized_pnl_with_fill(
+                                    pos.size,
+                                    gross_return,
+                                    cost_model,
+                                    FillStyle::Maker,
+                                    FillStyle::Taker,
+                                );
+                                let bankroll = settle_sim_position_for_strategy(&mut conn, MAKER_MM_STRATEGY_ID, pos.size, pnl).await;
+                                let execution_id = pos.execution_id.clone();
+                                let pnl_msg = serde_json::json!({
+                                    "execution_id": execution_id,
+                                    "strategy": "MAKER_MM",
+                                    "variant": variant.as_str(),
+                                    "pnl": pnl,
+                                    "notional": pos.size,
+                                    "timestamp": now_ms,
+                                    "bankroll": bankroll,
+                                    "mode": "PAPER",
+                                    "details": {
+                                        "action": "CLOSE_POSITION",
+                                        "reason": reason,
+                                        "market_id": pos.market_id,
+                                        "question": pos.question,
+                                        "side": Self::side_label(pos.side),
+                                        "entry": pos.entry_price,
+                                        "exit": bid,
+                                        "gross_return": gross_return,
+                                        "hold_ms": hold_ms,
+                                        "fill_model": "MAKER_TAKER",
+                                    }
+                                });
+                                publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
+                            }
                         }
 
                         let mut best_candidate: Option<(&MarketTarget, Side, f64, f64, f64, f64, i64, i64)> = None;
@@ -531,7 +580,7 @@ impl Strategy for MakerMmStrategy {
                                 let risk_cfg = read_risk_config(&mut conn).await;
                                 let size = compute_strategy_bet_size(
                                     &mut conn,
-                                    "MAKER_MM",
+                                    MAKER_MM_STRATEGY_ID,
                                     available_cash,
                                     &risk_cfg,
                                     10.0,
@@ -604,7 +653,7 @@ impl Strategy for MakerMmStrategy {
                             0.10,
                         ).await;
 
-                        if size > 0.0 && reserve_sim_notional_for_strategy(&mut conn, "MAKER_MM", size).await {
+                        if size > 0.0 && reserve_sim_notional_for_strategy(&mut conn, MAKER_MM_STRATEGY_ID, size).await {
                             let execution_id = Uuid::new_v4().to_string();
                             open_positions.push(Position {
                                 execution_id: execution_id.clone(),
@@ -615,6 +664,7 @@ impl Strategy for MakerMmStrategy {
                                 size,
                                 timestamp_ms: now_ms,
                             });
+                            persist_strategy_open_positions(&mut conn, MAKER_MM_STRATEGY_ID, &open_positions).await;
                             last_entry_ms = now_ms;
                             let exec_msg = serde_json::json!({
                                 "execution_id": execution_id,

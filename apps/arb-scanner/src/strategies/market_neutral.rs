@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use statrs::distribution::{ContinuousCDF, Normal};
 use std::collections::VecDeque;
@@ -15,9 +16,11 @@ use uuid::Uuid;
 use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
     build_scan_payload,
+    clear_strategy_open_positions,
     compute_strategy_bet_size,
     entered_live_mode,
     is_strategy_enabled,
+    persist_strategy_open_positions,
     publish_heartbeat,
     publish_event,
     publish_execution_event,
@@ -31,6 +34,7 @@ use crate::strategies::control::{
     settle_sim_position_for_strategy,
     read_trading_mode,
     TradingMode,
+    restore_strategy_open_positions,
 };
 use crate::strategies::market_data::{update_book_from_market_ws, BinaryBook};
 use crate::strategies::simulation::{realized_pnl, SimCostModel};
@@ -220,7 +224,28 @@ fn parse_coinbase_message_sequence(payload: &str) -> Option<u64> {
     parse_sequence(parsed.get("sequence_num")).or_else(|| parse_sequence(parsed.get("sequence")))
 }
 
-#[derive(Debug, Clone)]
+fn is_transient_ws_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("connection reset")
+        || lower.contains("without closing handshake")
+        || lower.contains("broken pipe")
+        || lower.contains("connection closed")
+        || lower.contains("io error")
+        || lower.contains("timed out")
+}
+
+fn is_transient_ws_error(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    if matches!(
+        error,
+        tokio_tungstenite::tungstenite::Error::ConnectionClosed
+            | tokio_tungstenite::tungstenite::Error::AlreadyClosed
+    ) {
+        return true;
+    }
+    is_transient_ws_error_message(&error.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Position {
     execution_id: String,
     market_id: String,
@@ -378,6 +403,18 @@ impl MarketNeutralStrategy {
         let steps_per_year = 31_536_000_000.0 / avg_dt_ms;
         Some((std_step * steps_per_year.sqrt()).clamp(0.10, 2.00))
     }
+
+    fn valid_persisted_position(position: &Position) -> bool {
+        !position.execution_id.trim().is_empty()
+            && !position.market_id.trim().is_empty()
+            && !position.yes_token.trim().is_empty()
+            && position.entry_price.is_finite()
+            && position.entry_price > 0.0
+            && position.entry_price < 1.0
+            && position.size.is_finite()
+            && position.size > 0.0
+            && position.timestamp_ms > 0
+    }
 }
 
 #[async_trait]
@@ -393,9 +430,33 @@ impl Strategy for MarketNeutralStrategy {
             }
         };
         let cost_model = SimCostModel::from_env();
+        let strategy_id = self.strategy_id();
+        let heartbeat_id = self.heartbeat_id();
         let variant = strategy_variant();
         let params = StrategyParams::for_asset(&self.asset);
         let mut last_seen_reset_ts = 0_i64;
+
+        if let Some(restored) = restore_strategy_open_positions::<Position>(&mut conn, &strategy_id).await {
+            if Self::valid_persisted_position(&restored) {
+                {
+                    let mut pos_lock = self.open_position.write().await;
+                    *pos_lock = Some(restored.clone());
+                }
+                info!(
+                    "{} restored persisted position {} (entry {:.4}, notional {:.2})",
+                    strategy_id,
+                    restored.execution_id,
+                    restored.entry_price,
+                    restored.size
+                );
+            } else {
+                clear_strategy_open_positions(&mut conn, &strategy_id).await;
+                warn!(
+                    "{} dropped invalid persisted open position snapshot",
+                    strategy_id
+                );
+            }
+        }
 
         let spot_writer = self.latest_spot_price.clone();
         let spot_history_writer = self.spot_history.clone();
@@ -509,7 +570,11 @@ impl Strategy for MarketNeutralStrategy {
             let mut poly_ws = match connect_async(request).await {
                 Ok((ws, _)) => ws,
                 Err(e) => {
-                    error!("Polymarket WS connect failed: {}", e);
+                    if is_transient_ws_error(&e) {
+                        warn!("{} fair-value Polymarket WS connect transient failure: {}", self.asset, e);
+                    } else {
+                        error!("Polymarket WS connect failed: {}", e);
+                    }
                     sleep(Duration::from_secs(3)).await;
                     continue;
                 }
@@ -534,12 +599,15 @@ impl Strategy for MarketNeutralStrategy {
             let mut last_resolution_lookup_ms = 0_i64;
             let mut trades_this_window = 0_usize;
             let mut consecutive_losses = 0_u32;
+            let mut ws_disconnected = false;
+            let reconnect_backoff_secs = 1_u64;
+            let mut disconnect_reason = String::new();
 
             loop {
                 tokio::select! {
-                    Some(msg) = poly_ws.next() => {
+                    msg = poly_ws.next() => {
                         match msg {
-                            Ok(Message::Text(text)) => {
+                            Some(Ok(Message::Text(text))) => {
                                 update_book_from_market_ws(
                                     &text,
                                     &target_market.yes_token,
@@ -547,21 +615,55 @@ impl Strategy for MarketNeutralStrategy {
                                     &mut book,
                                 );
                             }
-                            Ok(Message::Ping(payload)) => {
+                            Some(Ok(Message::Ping(payload))) => {
                                 let _ = poly_ws.send(Message::Pong(payload)).await;
                             }
-                            Ok(Message::Close(_)) => break,
-                            Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => {}
-                            Ok(_) => {}
-                            Err(e) => {
-                                error!("{} fair-value Polymarket WS error: {}", self.asset, e);
+                            Some(Ok(Message::Close(frame))) => {
+                                ws_disconnected = true;
+                                disconnect_reason = frame
+                                    .as_ref()
+                                    .map(|close| {
+                                        let reason = close.reason.trim();
+                                        if reason.is_empty() {
+                                            format!("code={:?}", close.code)
+                                        } else {
+                                            format!("code={:?}, reason={}", close.code, reason)
+                                        }
+                                    })
+                                    .unwrap_or_else(|| "no close frame".to_string());
+                                warn!(
+                                    "{} fair-value Polymarket WS closed; reconnecting ({})",
+                                    self.asset, disconnect_reason
+                                );
+                                break;
+                            }
+                            Some(Ok(Message::Binary(_))) | Some(Ok(Message::Pong(_))) => {}
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => {
+                                ws_disconnected = true;
+                                disconnect_reason = e.to_string();
+                                if is_transient_ws_error(&e) {
+                                    warn!(
+                                        "{} fair-value Polymarket WS transient error; reconnecting ({})",
+                                        self.asset, disconnect_reason
+                                    );
+                                } else {
+                                    error!("{} fair-value Polymarket WS error: {}", self.asset, e);
+                                }
+                                break;
+                            }
+                            None => {
+                                ws_disconnected = true;
+                                disconnect_reason = "stream ended".to_string();
+                                warn!(
+                                    "{} fair-value Polymarket WS stream ended; reconnecting",
+                                    self.asset
+                                );
                                 break;
                             }
                         }
                     }
                     _ = interval.tick() => {
-                        let strategy_id = self.strategy_id();
-                        let heartbeat_id = self.heartbeat_id();
                         let entry_expiry_cutoff_secs = self.entry_expiry_cutoff_secs();
 
                         if !is_strategy_enabled(&mut conn, &strategy_id).await {
@@ -569,6 +671,7 @@ impl Strategy for MarketNeutralStrategy {
                                 let mut pos_lock = self.open_position.write().await;
                                 pos_lock.take().map(|pos| pos.size).unwrap_or(0.0)
                             };
+                            clear_strategy_open_positions(&mut conn, &strategy_id).await;
                             if released_notional > 0.0 {
                                 let _ = release_sim_notional_for_strategy(&mut conn, &strategy_id, released_notional).await;
                             }
@@ -592,6 +695,7 @@ impl Strategy for MarketNeutralStrategy {
                                     let pos_owned = pos.clone();
                                     *pos_lock = None;
                                     drop(pos_lock);
+                                    clear_strategy_open_positions(&mut conn, &strategy_id).await;
                                     let _ = settle_sim_position_for_strategy(&mut conn, &strategy_id, pos_owned.size, 0.0).await;
                                     let stale_msg = serde_json::json!({
                                         "execution_id": pos_owned.execution_id,
@@ -646,6 +750,7 @@ impl Strategy for MarketNeutralStrategy {
                             }
                         };
                         if let Some(pos) = rollover_position {
+                            clear_strategy_open_positions(&mut conn, &strategy_id).await;
                             let new_bankroll = settle_sim_position_for_strategy(&mut conn, &strategy_id, pos.size, 0.0).await;
                             let pnl_msg = serde_json::json!({
                                 "execution_id": pos.execution_id,
@@ -687,8 +792,11 @@ impl Strategy for MarketNeutralStrategy {
                                 let (exit_price, exit_source) = if let Some(price) = resolved_price {
                                     (price.clamp(0.0, 1.0), "RESOLVED_OUTCOME")
                                 } else if now_ts <= expiry_ts + RESOLUTION_GRACE_SECS {
-                                    let mut pos_lock = self.open_position.write().await;
-                                    *pos_lock = Some(pos);
+                                    {
+                                        let mut pos_lock = self.open_position.write().await;
+                                        *pos_lock = Some(pos.clone());
+                                    }
+                                    persist_strategy_open_positions(&mut conn, &strategy_id, &pos).await;
                                     publish_heartbeat(&mut conn, &heartbeat_id).await;
                                     continue;
                                 } else {
@@ -703,6 +811,7 @@ impl Strategy for MarketNeutralStrategy {
                                     }
                                 };
 
+                                clear_strategy_open_positions(&mut conn, &strategy_id).await;
                                 let gross_return = ((exit_price - pos.entry_price) / pos.entry_price).max(-0.999);
                                 let pnl = realized_pnl(pos.size, gross_return, cost_model);
                                 let new_bankroll = settle_sim_position_for_strategy(&mut conn, &strategy_id, pos.size, pnl).await;
@@ -904,6 +1013,7 @@ impl Strategy for MarketNeutralStrategy {
                                     let execution_id = Uuid::new_v4().to_string();
                                     let preview_msg = serde_json::json!({
                                         "execution_id": execution_id,
+                                        "strategy": strategy_id,
                                         "market": format!("Long {}", self.asset),
                                         "side": "LIVE_DRY_RUN",
                                         "price": book.yes.best_ask,
@@ -949,6 +1059,7 @@ impl Strategy for MarketNeutralStrategy {
                                     let mut pos_lock = self.open_position.write().await;
                                     pos_lock.take().map(|pos| pos.size).unwrap_or(0.0)
                                 };
+                                clear_strategy_open_positions(&mut conn, &strategy_id).await;
                                 if released_notional > 0.0 {
                                     let _ = release_sim_notional_for_strategy(&mut conn, &strategy_id, released_notional).await;
                                     info!("{} strategy: cleared paper position on LIVE transition", strategy_id);
@@ -961,8 +1072,11 @@ impl Strategy for MarketNeutralStrategy {
                         let reset_ts = read_simulation_reset_ts(&mut conn).await;
                         if reset_ts > last_seen_reset_ts {
                             last_seen_reset_ts = reset_ts;
-                            let mut pos_lock = self.open_position.write().await;
-                            *pos_lock = None;
+                            {
+                                let mut pos_lock = self.open_position.write().await;
+                                *pos_lock = None;
+                            }
+                            clear_strategy_open_positions(&mut conn, &strategy_id).await;
                             last_entry_ms = 0;
                             trades_this_window = 0;
                             consecutive_losses = 0;
@@ -1026,6 +1140,7 @@ impl Strategy for MarketNeutralStrategy {
                         }
 
                         if let Some((pos, exit_price, mark_return, executable_return, hold_ms, reason)) = close_event {
+                            clear_strategy_open_positions(&mut conn, &strategy_id).await;
                             let pnl = realized_pnl(pos.size, executable_return, cost_model);
                             let new_bankroll = settle_sim_position_for_strategy(&mut conn, &strategy_id, pos.size, pnl).await;
                             if pnl < 0.0 {
@@ -1085,21 +1200,27 @@ impl Strategy for MarketNeutralStrategy {
                             }
                             let mut accepted = false;
                             let mut execution_id: Option<String> = None;
+                            let mut persisted_position: Option<Position> = None;
                             {
                                 let mut pos_lock = self.open_position.write().await;
                                 if pos_lock.is_none() {
                                     let id = Uuid::new_v4().to_string();
-                                    *pos_lock = Some(Position {
+                                    let position = Position {
                                         execution_id: id.clone(),
                                         market_id: target_market.market_id.clone(),
                                         yes_token: target_market.yes_token.clone(),
                                         entry_price,
                                         size,
                                         timestamp_ms: now_ms,
-                                    });
+                                    };
+                                    *pos_lock = Some(position.clone());
                                     accepted = true;
                                     execution_id = Some(id);
+                                    persisted_position = Some(position);
                                 }
+                            }
+                            if let Some(position) = persisted_position.as_ref() {
+                                persist_strategy_open_positions(&mut conn, &strategy_id, position).await;
                             }
 
                             if accepted {
@@ -1108,6 +1229,7 @@ impl Strategy for MarketNeutralStrategy {
                                 let exec_id = execution_id.unwrap_or_else(|| Uuid::new_v4().to_string());
                                 let exec_msg = serde_json::json!({
                                     "execution_id": exec_id,
+                                    "strategy": strategy_id.clone(),
                                     "market": format!("Long {}", self.asset),
                                     "side": "ENTRY",
                                     "price": entry_price,
@@ -1115,6 +1237,8 @@ impl Strategy for MarketNeutralStrategy {
                                     "timestamp": now_ms,
                                     "mode": "PAPER",
                                     "details": {
+                                        "strategy": strategy_id.clone(),
+                                        "condition_id": target_market.market_id.clone(),
                                         "fair_value": fair_yes,
                                         "edge": edge,
                                         "adaptive_entry_edge": adaptive_entry_edge,
@@ -1137,6 +1261,14 @@ impl Strategy for MarketNeutralStrategy {
                         publish_heartbeat(&mut conn, &heartbeat_id).await;
                     }
                 }
+            }
+
+            if ws_disconnected {
+                sleep(Duration::from_secs(reconnect_backoff_secs)).await;
+                info!(
+                    "{} fair-value Polymarket WS reconnect cycle complete (last disconnect: {})",
+                    self.asset, disconnect_reason
+                );
             }
         }
     }
