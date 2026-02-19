@@ -32,7 +32,10 @@ Core flow:
 
 ## 3. Services and Containers
 
-`infrastructure/docker-compose.yml` currently defines 21 services:
+`infrastructure/docker-compose.yml` currently defines:
+
+- 21 default services in the base profile.
+- 6 additional scanners in the `experimental` profile (27 total when enabled).
 
 | Service | Role |
 |---|---|
@@ -58,9 +61,30 @@ Core flow:
 | `arb-scanner-as-mm` | `AS_MARKET_MAKER` |
 | `arb-scanner-longshot` | `LONGSHOT_BIAS` |
 
+Optional `experimental` profile scanners:
+
+| Service | Role |
+|---|---|
+| `arb-scanner-xrp` | `XRP_15M` |
+| `arb-scanner-xrp-5m` | `XRP_5M` |
+| `arb-scanner-btc-1m` | `BTC_1M` |
+| `arb-scanner-eth-1m` | `ETH_1M` |
+| `arb-scanner-sol-1m` | `SOL_1M` |
+| `arb-scanner-xrp-1m` | `XRP_1M` |
+
+Use `--profile experimental` to start these scanners, and set matching feature flags so backend strategy catalogs/heartbeat expectations stay coherent:
+
+- `ENABLE_XRP_STRATEGIES=true`
+- `ENABLE_ONE_MINUTE_STRATEGIES=true` (required for all `*_1M` strategies, including `XRP_1M`)
+
 ## 4. Strategy Catalog
 
-Canonical strategy IDs (`STRATEGY_IDS` in `apps/backend/src/config/constants.ts`):
+Canonical strategy IDs (`STRATEGY_IDS` in `apps/backend/src/config/constants.ts`) are dynamic:
+
+- Core IDs are always present.
+- Feature IDs are included only when `ENABLE_XRP_STRATEGIES` and/or `ENABLE_ONE_MINUTE_STRATEGIES` are enabled.
+
+Core strategy IDs:
 
 | Strategy | Family | Primary edge |
 |---|---|---|
@@ -80,6 +104,17 @@ Canonical strategy IDs (`STRATEGY_IDS` in `apps/backend/src/config/constants.ts`
 | `AS_MARKET_MAKER` | `MARKET_MAKING` | Avellaneda-Stoikov reservation/half-spread logic |
 | `LONGSHOT_BIAS` | `BIAS_EXPLOITATION` | Longshot mispricing fade |
 
+Feature-flagged strategy IDs:
+
+| Strategy | Gate | Family | Primary edge |
+|---|---|---|---|
+| `XRP_5M` | `ENABLE_XRP_STRATEGIES=true` | `FAIR_VALUE` | 5m fair-value edge on XRP |
+| `XRP_15M` | `ENABLE_XRP_STRATEGIES=true` | `FAIR_VALUE` | 15m fair-value edge on XRP |
+| `BTC_1M` | `ENABLE_ONE_MINUTE_STRATEGIES=true` | `FAIR_VALUE` | 1m latency-sensitive fair-value dislocation on BTC |
+| `ETH_1M` | `ENABLE_ONE_MINUTE_STRATEGIES=true` | `FAIR_VALUE` | 1m latency-sensitive fair-value dislocation on ETH |
+| `SOL_1M` | `ENABLE_ONE_MINUTE_STRATEGIES=true` | `FAIR_VALUE` | 1m latency-sensitive fair-value dislocation on SOL |
+| `XRP_1M` | `ENABLE_XRP_STRATEGIES=true` and `ENABLE_ONE_MINUTE_STRATEGIES=true` | `FAIR_VALUE` | 1m latency-sensitive fair-value dislocation on XRP |
+
 ## 5. Baseline Strategy Tuning (Current Build)
 
 Baseline values come from scanner code defaults plus `infrastructure/docker-compose.yml` overrides.
@@ -88,7 +123,10 @@ Key runtime overrides currently set in compose:
 
 | Strategy | Key overrides |
 |---|---|
-| `BTC_5M` | `BTC_5M_MIN_EXPECTED_NET_RETURN=0.008`, `BTC_5M_MAX_POSITION_FRACTION=0.10`, `BTC_5M_MAX_ENTRY_SPREAD=0.05`, plus momentum/regime/model filter penalties and Kelly/edge scaling |
+| `BTC_5M` | Core entry/position controls plus freshness + divergence + IV blend: `BTC_5M_MAX_SPOT_AGE_MS`, `BTC_5M_MAX_BOOK_AGE_MS`, `BTC_5M_LIVE_PREVIEW_COOLDOWN_MS`, `BTC_5M_DIVERGENCE_*`, `BTC_5M_IV_BLEND_WEIGHT`, `BTC_5M_IV_MAX_STALE_MS` |
+| `ETH_5M` / `ETH_15M` | Window-specific latency + divergence controls: `ETH_<WINDOW>_MAX_SPOT_AGE_MS`, `ETH_<WINDOW>_MAX_BOOK_AGE_MS`, `ETH_<WINDOW>_LIVE_PREVIEW_COOLDOWN_MS`, `ETH_<WINDOW>_DECISION_INTERVAL_MS`, `ETH_<WINDOW>_DIVERGENCE_*`, `ETH_<WINDOW>_IV_BLEND_WEIGHT` |
+| `SOL_5M` / `SOL_15M` | Window-specific latency + divergence controls: `SOL_<WINDOW>_MAX_SPOT_AGE_MS`, `SOL_<WINDOW>_MAX_BOOK_AGE_MS`, `SOL_<WINDOW>_LIVE_PREVIEW_COOLDOWN_MS`, `SOL_<WINDOW>_DECISION_INTERVAL_MS`, `SOL_<WINDOW>_DIVERGENCE_*` |
+| `XRP_5M` / `XRP_15M` / `*_1M` (experimental) | Same market-neutral tuning family: `<ASSET>_<WINDOW>_MAX_SPOT_AGE_MS`, `<ASSET>_<WINDOW>_MAX_BOOK_AGE_MS`, `<ASSET>_<WINDOW>_LIVE_PREVIEW_COOLDOWN_MS`, `<ASSET>_<WINDOW>_DECISION_INTERVAL_MS`, `<ASSET>_<WINDOW>_DIVERGENCE_*`, optional `<ASSET>_<WINDOW>_IV_BLEND_WEIGHT` |
 | `ATOMIC_ARB` | `ATOMIC_ARB_MIN_NET_EDGE=0.0010`, `ATOMIC_ARB_MIN_BUFFER_FLOOR=0.0020` |
 | `GRAPH_ARB` | `GRAPH_ARB_MIN_NET_EDGE=0.0015`, `GRAPH_ARB_MIN_BUFFER_FLOOR=0.0010`, `GRAPH_ARB_HORIZON_PENALTY_COEFF=0.0005` |
 | `CONVERGENCE_CARRY` | `CONVERGENCE_CARRY_MIN_PARITY_EDGE=0.008`, `CONVERGENCE_CARRY_EXIT_PARITY_EDGE=0.002` |
@@ -100,6 +138,13 @@ Shared simulation knobs applied across most scanners:
 
 - `SIM_FEE_BPS_PER_SIDE=0`
 - `SIM_SLIPPAGE_BPS_PER_SIDE=2`
+
+Shared implied-vol feed controls:
+
+- `DERIBIT_IV_REFRESH_MS`
+- `DERIBIT_IV_HTTP_TIMEOUT_MS`
+- `DERIBIT_IV_MAX_SPOT_AGE_MS`
+- `DERIBIT_IV_MIN_SAMPLES`
 
 ## 6. Auto-Tuning and Control Loops
 
@@ -163,11 +208,14 @@ Critical env groups:
 
 - Safety: `LIVE_ORDER_POSTING_ENABLED`, `CONTROL_PLANE_TOKEN`, `EXECUTION_HALT_*`.
 - Heartbeat and runtime health: `SCANNER_HEARTBEAT_MAX_AGE_MS`, `SCANNER_OPTIONAL_HEARTBEAT_IDS`.
+- Strategy coverage flags: `ENABLE_XRP_STRATEGIES`, `ENABLE_ONE_MINUTE_STRATEGIES`.
 - Ledger caps: `SIM_STRATEGY_CONCENTRATION_CAP_PCT`, `SIM_FAMILY_CONCENTRATION_CAP_PCT`, `SIM_UNDERLYING_CONCENTRATION_CAP_PCT`, `SIM_GLOBAL_UTILIZATION_CAP_PCT`.
 - PnL parity watchdog: `LEDGER_PNL_PARITY_*`.
 - ML and model gate: `MODEL_TRAINER_*`, `MODEL_PROBABILITY_GATE_*`.
 - Execution controls: `EXECUTION_SHORTFALL_*`, `EXECUTION_NETTING_*`.
 - Polymarket preflight/live limits: `POLY_*` and `POLY_LIVE_STRATEGY_ALLOWLIST`.
+- Fair-value latency/divergence/IV controls: `<ASSET>_<WINDOW>_MAX_SPOT_AGE_MS`, `<ASSET>_<WINDOW>_MAX_BOOK_AGE_MS`, `<ASSET>_<WINDOW>_LIVE_PREVIEW_COOLDOWN_MS`, `<ASSET>_<WINDOW>_DECISION_INTERVAL_MS`, `<ASSET>_<WINDOW>_DIVERGENCE_*`, `<ASSET>_<WINDOW>_IV_BLEND_WEIGHT`, `<ASSET>_<WINDOW>_IV_MAX_STALE_MS`, `DERIBIT_IV_*`.
+- Soak/report KPIs: `SOAK_MIN_PREFLIGHT_PASS_RATE_PCT`, `SOAK_MAX_SHORTFALL_BLOCK_RATE_PCT`, `SOAK_MAX_NETTING_BLOCK_RATE_PCT`, `SOAK_MIN_EDGE_CAPTURE_RATIO`, `SOAK_MIN_NET_PNL_USD`, `SOAK_MAX_REJECT_RATE_PCT`, `SOAK_MAX_STALE_FORCED_CLOSES`.
 
 ## 9. Start, Stop, Rebuild
 
@@ -196,6 +244,14 @@ docker compose -f infrastructure/docker-compose.yml up -d --no-deps --force-recr
   arb-scanner-sol arb-scanner-sol-5m arb-scanner-cex arb-scanner-copy \
   arb-scanner-atomic arb-scanner-obi arb-scanner-graph arb-scanner-convergence \
   arb-scanner-maker arb-scanner-as-mm arb-scanner-longshot
+```
+
+Rebuild + restart with experimental fair-value scanners:
+
+```bash
+docker compose -f infrastructure/docker-compose.yml --profile experimental run --rm arb-builder cargo build
+docker compose -f infrastructure/docker-compose.yml --profile experimental up -d --no-deps --force-recreate \
+  arb-scanner-xrp arb-scanner-xrp-5m arb-scanner-btc-1m arb-scanner-eth-1m arb-scanner-sol-1m arb-scanner-xrp-1m
 ```
 
 ## 10. Operator UI and Pages
@@ -291,12 +347,20 @@ Optional staged live-fire drill:
 scripts/run_live_fire_drill.sh
 ```
 
+Live-fire drill fail behavior:
+
+- `DRILL_AUTO_HALT_ON_FAIL=true` (default) will call `/api/system/execution-halt` automatically when any drill stage fails.
+- Keep this enabled for canary and initial live.
+
 Default soak acceptance thresholds:
 
 - `SOAK_MIN_PREFLIGHT_PASS_RATE_PCT=96`
 - `SOAK_MAX_SHORTFALL_BLOCK_RATE_PCT=18`
 - `SOAK_MAX_NETTING_BLOCK_RATE_PCT=12`
 - `SOAK_MIN_EDGE_CAPTURE_RATIO=0.55`
+- `SOAK_MIN_NET_PNL_USD=0`
+- `SOAK_MAX_REJECT_RATE_PCT=20`
+- `SOAK_MAX_STALE_FORCED_CLOSES=0`
 
 Recommended go-live minimums:
 
@@ -315,15 +379,15 @@ Recommended go-live minimums:
 1. Keep `LIVE_ORDER_POSTING_ENABLED=false`.
 2. Run long paper soak and checklist scripts.
 3. Fix all critical or recurring WARN classes.
-4. Verify strategy coverage and no orphaned disabled strategy.
+4. Verify strategy coverage flags and scanner profile alignment: no 1m/XRP scanner should run unless matching `ENABLE_*` flags are enabled, and no enabled feature strategy should exist without a live scanner heartbeat.
+5. Verify no orphaned disabled strategy in `DEFAULT_DISABLED_STRATEGIES`.
 
 ### Phase B: Live-Readiness Config
 
 1. Apply `config/live_canary_baseline.env` values to runtime env.
 2. Keep allowlist constrained (`POLY_LIVE_STRATEGY_ALLOWLIST`).
-3. Ensure model gate enforcement for live is enabled:
-`MODEL_PROBABILITY_GATE_ENFORCE_LIVE=true`
-`MODEL_PROBABILITY_GATE_REQUIRE_MODEL=true`
+3. Ensure model gate enforcement for live is enabled (`MODEL_PROBABILITY_GATE_ENFORCE_LIVE=true`, `MODEL_PROBABILITY_GATE_REQUIRE_MODEL=true`).
+4. Keep `ENABLE_XRP_STRATEGIES=false` and `ENABLE_ONE_MINUTE_STRATEGIES=false` unless you are intentionally running the experimental scanner profile and have passed separate soak gates for those strategies.
 
 ### Phase C: Controlled Activation
 
@@ -336,7 +400,8 @@ Recommended go-live minimums:
 
 1. Increase allowlist breadth slowly.
 2. Scale notional caps only after stable checkpoint windows.
-3. Re-run soak/checklist after each material config change.
+3. Enable feature strategies in order only after each prior stage is stable: first `ENABLE_XRP_STRATEGIES=true` with 5m/15m scanners, then `ENABLE_ONE_MINUTE_STRATEGIES=true` only after 1m latency/reject-rate soak passes.
+4. Re-run soak/checklist after each material config change.
 
 ## 14. Incident Response and Rollback
 

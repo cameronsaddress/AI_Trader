@@ -30,6 +30,9 @@ const MIN_PREFLIGHT_PASS_RATE_PCT = Number(process.env.SOAK_MIN_PREFLIGHT_PASS_R
 const MAX_SHORTFALL_BLOCK_RATE_PCT = Number(process.env.SOAK_MAX_SHORTFALL_BLOCK_RATE_PCT || '18');
 const MAX_NETTING_BLOCK_RATE_PCT = Number(process.env.SOAK_MAX_NETTING_BLOCK_RATE_PCT || '12');
 const MIN_EDGE_CAPTURE_RATIO = Number(process.env.SOAK_MIN_EDGE_CAPTURE_RATIO || '0.55');
+const MIN_NET_PNL_USD = Number(process.env.SOAK_MIN_NET_PNL_USD || '0');
+const MAX_REJECT_RATE_PCT = Number(process.env.SOAK_MAX_REJECT_RATE_PCT || '20');
+const MAX_STALE_FORCED_CLOSES = Math.max(0, Number(process.env.SOAK_MAX_STALE_FORCED_CLOSES || '0'));
 
 if (!CONTROL_PLANE_TOKEN) {
     console.error('CONTROL_PLANE_TOKEN is required');
@@ -138,6 +141,8 @@ function parseTradeRows(tradeLogPath, startMs) {
         const pnl = asNumber(cols[indexByName.pnl], 0);
         const notionalRaw = Math.abs(asNumber(cols[indexByName.notional], 0));
         const notional = notionalRaw > 0 ? notionalRaw : Math.max(1, Math.abs(pnl));
+        const reason = String(cols[indexByName.reason] || '').trim().toUpperCase();
+        const closureClass = String(cols[indexByName.closure_class] || '').trim().toUpperCase();
         const grossReturn = indexByName.gross_return !== undefined
             ? asNumber(cols[indexByName.gross_return], NaN)
             : NaN;
@@ -153,6 +158,8 @@ function parseTradeRows(tradeLogPath, startMs) {
             strategy,
             pnl,
             notional,
+            reason,
+            closure_class: closureClass,
             net_return: netReturn,
             gross_return: Number.isFinite(grossReturn) ? grossReturn : null,
             cost_drag_return: Number.isFinite(costDrag) ? costDrag : null,
@@ -170,6 +177,7 @@ function summarizeTrades(rows) {
     let grossSamples = 0;
     let costDragSum = 0;
     let costDragSamples = 0;
+    let staleForcedCloses = 0;
 
     for (const row of rows) {
         tradeCount += 1;
@@ -186,6 +194,12 @@ function summarizeTrades(rows) {
         bucket.trades += 1;
         bucket.net_pnl += row.pnl;
         bucket.avg_net_return_bps += row.net_return * 10_000;
+        if (
+            row.reason.includes('STALE')
+            || row.closure_class === 'FORCED'
+        ) {
+            staleForcedCloses += 1;
+        }
 
         if (row.gross_return !== null) {
             grossSamples += 1;
@@ -223,6 +237,7 @@ function summarizeTrades(rows) {
         gross_samples: grossSamples,
         edge_capture_ratio: edgeCaptureRatio,
         avg_cost_drag_bps: avgCostDragBps,
+        stale_forced_closes: staleForcedCloses,
         by_strategy: byStrategy,
     };
 }
@@ -295,6 +310,35 @@ function buildChecks(metrics) {
             threshold: MIN_EDGE_CAPTURE_RATIO,
         };
 
+    checks.net_pnl_positive = {
+        ok: (metrics.trades.net_pnl || 0) >= MIN_NET_PNL_USD,
+        skipped: false,
+        actual: metrics.trades.net_pnl,
+        threshold: MIN_NET_PNL_USD,
+    };
+
+    checks.stale_forced_closes = {
+        ok: (metrics.trades.stale_forced_closes || 0) <= MAX_STALE_FORCED_CLOSES,
+        skipped: false,
+        actual: metrics.trades.stale_forced_closes || 0,
+        threshold: MAX_STALE_FORCED_CLOSES,
+    };
+
+    checks.reject_rate = metrics.rejected_signals.preflight_reject_rate_pct === null
+        ? {
+            ok: true,
+            skipped: true,
+            actual: null,
+            threshold: MAX_REJECT_RATE_PCT,
+            note: 'no preflight samples available',
+        }
+        : {
+            ok: metrics.rejected_signals.preflight_reject_rate_pct <= MAX_REJECT_RATE_PCT,
+            skipped: false,
+            actual: metrics.rejected_signals.preflight_reject_rate_pct,
+            threshold: MAX_REJECT_RATE_PCT,
+        };
+
     checks.paper_mode_enforced = {
         ok: metrics.activity.paper_mode_ratio_pct >= 99.9,
         skipped: false,
@@ -328,6 +372,9 @@ function toMarkdown(report) {
     lines.push(`- Shortfall Block Rate: ${report.metrics.blocks.shortfall_block_rate_pct === null ? 'n/a' : report.metrics.blocks.shortfall_block_rate_pct.toFixed(2) + '%'}`);
     lines.push(`- Netting Block Rate: ${report.metrics.blocks.netting_block_rate_pct === null ? 'n/a' : report.metrics.blocks.netting_block_rate_pct.toFixed(2) + '%'}`);
     lines.push(`- Edge Capture Ratio: ${report.metrics.trades.edge_capture_ratio === null ? 'n/a' : report.metrics.trades.edge_capture_ratio.toFixed(3)}`);
+    lines.push(`- Net PnL: $${Number(report.metrics.trades.net_pnl || 0).toFixed(2)}`);
+    lines.push(`- Stale Forced Closes: ${report.metrics.trades.stale_forced_closes || 0}`);
+    lines.push(`- Reject Rate: ${report.metrics.rejected_signals.preflight_reject_rate_pct === null ? 'n/a' : report.metrics.rejected_signals.preflight_reject_rate_pct.toFixed(2) + '%'}`);
     lines.push(`- Live Execution Events While In PAPER: ${report.metrics.activity.live_execution_events}`);
     lines.push('');
     lines.push('## Checks');
@@ -529,6 +576,9 @@ async function main() {
     const nettingBlockRate = preflightTotal > 0
         ? (observedNetting / preflightTotal) * 100
         : null;
+    const preflightRejectRate = preflightTotal > 0
+        ? (rejectedEntries.length / preflightTotal) * 100
+        : null;
 
     const finalAllocator = (lastStats && typeof lastStats.strategy_allocator === 'object')
         ? lastStats.strategy_allocator
@@ -583,6 +633,7 @@ async function main() {
             by_stage: rejectedByStage,
             shortfall_tagged: rejectedShortfall,
             netting_tagged: rejectedNetting,
+            preflight_reject_rate_pct: preflightRejectRate,
         },
         strategy_allocator: allocatorDelta,
         execution_netting: lastStats?.execution_netting || null,
@@ -602,6 +653,9 @@ async function main() {
             max_shortfall_block_rate_pct: MAX_SHORTFALL_BLOCK_RATE_PCT,
             max_netting_block_rate_pct: MAX_NETTING_BLOCK_RATE_PCT,
             min_edge_capture_ratio: MIN_EDGE_CAPTURE_RATIO,
+            min_net_pnl_usd: MIN_NET_PNL_USD,
+            max_reject_rate_pct: MAX_REJECT_RATE_PCT,
+            max_stale_forced_closes: MAX_STALE_FORCED_CLOSES,
         },
         metrics,
         checks: checkResults.checks,

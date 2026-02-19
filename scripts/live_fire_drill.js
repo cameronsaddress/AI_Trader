@@ -25,6 +25,7 @@ Environment:
 - DRILL_MIN_LIVE_FILL_RATE (default: 0.75)
 - DRILL_MIN_SETTLEMENT_COMPLETION_RATE (default: 0.95)
 - DRILL_EVENT_TIMEOUT_MS (default: 10000)
+- DRILL_AUTO_HALT_ON_FAIL (default: true)
 */
 
 const { io } = require('socket.io-client');
@@ -49,6 +50,7 @@ const DRILL_MIN_SETTLEMENT_COMPLETION_RATE = Math.max(
     Math.min(1, Number(process.env.DRILL_MIN_SETTLEMENT_COMPLETION_RATE || '0.95')),
 );
 const DRILL_EVENT_TIMEOUT_MS = Math.max(2000, Number(process.env.DRILL_EVENT_TIMEOUT_MS || '10000'));
+const DRILL_AUTO_HALT_ON_FAIL = process.env.DRILL_AUTO_HALT_ON_FAIL !== 'false';
 
 if (!CONTROL_PLANE_TOKEN) {
     console.error('CONTROL_PLANE_TOKEN is required');
@@ -428,6 +430,30 @@ async function main() {
     report.passCount = report.stages.filter((stage) => stage.passed).length;
     report.failCount = report.stages.filter((stage) => !stage.passed).length;
     report.passed = report.failCount === 0;
+    report.auto_halt = {
+        enabled: DRILL_AUTO_HALT_ON_FAIL,
+        triggered: false,
+        status: null,
+    };
+
+    if (!report.passed && DRILL_AUTO_HALT_ON_FAIL) {
+        const haltReason = `live_fire_drill failed at ${new Date().toISOString()} (failCount=${report.failCount})`;
+        const haltResponse = await api('/api/system/execution-halt', {
+            method: 'POST',
+            body: {
+                halted: true,
+                reason: haltReason,
+            },
+        });
+        report.auto_halt = {
+            enabled: DRILL_AUTO_HALT_ON_FAIL,
+            triggered: true,
+            status: haltResponse.status,
+            ok: haltResponse.ok,
+            reason: haltReason,
+            error: haltResponse.json?.error || null,
+        };
+    }
 
     console.log(JSON.stringify(report, null, 2));
     process.exit(report.passed ? 0 : 1);

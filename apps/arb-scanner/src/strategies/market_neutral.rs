@@ -36,6 +36,7 @@ use crate::strategies::control::{
     TradingMode,
     restore_strategy_open_positions,
 };
+use crate::strategies::implied_vol::{blend_sigma, spawn_deribit_iv_feed, ImpliedVolSnapshot};
 use crate::strategies::market_data::{update_book_from_market_ws, BinaryBook};
 use crate::strategies::simulation::{realized_pnl, SimCostModel};
 use crate::strategies::vol_regime::{detect_regime, regime_exit_multipliers};
@@ -69,6 +70,22 @@ const DEFAULT_MAX_CONSECUTIVE_LOSSES: u32 = 3;
 const DEFAULT_MAX_POSITION_FRACTION: f64 = 0.20;
 const RESOLUTION_GRACE_SECS: i64 = 180;
 const RESOLUTION_CHECK_COOLDOWN_MS: i64 = 2_000;
+
+fn env_i64(name: &str, fallback: i64, min: i64, max: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(fallback)
+        .clamp(min, max)
+}
+
+fn env_f64(name: &str, fallback: f64, min: f64, max: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(fallback)
+        .clamp(min, max)
+}
 
 #[derive(Debug, Clone, Copy)]
 struct StrategyParams {
@@ -261,6 +278,7 @@ pub struct MarketNeutralStrategy {
     horizon_seconds: i64,
     latest_spot_price: Arc<RwLock<(f64, i64)>>,
     spot_history: Arc<RwLock<VecDeque<(i64, f64)>>>,
+    implied_vol: Arc<RwLock<Option<ImpliedVolSnapshot>>>,
     open_position: Arc<RwLock<Option<Position>>>,
 }
 
@@ -277,6 +295,7 @@ impl MarketNeutralStrategy {
             horizon_seconds: window,
             latest_spot_price: Arc::new(RwLock::new((0.0, 0))),
             spot_history: Arc::new(RwLock::new(VecDeque::new())),
+            implied_vol: Arc::new(RwLock::new(None)),
             open_position: Arc::new(RwLock::new(None)),
         }
     }
@@ -305,6 +324,43 @@ impl MarketNeutralStrategy {
             .and_then(|raw| raw.trim().parse::<i64>().ok())
             .unwrap_or(default_cutoff)
             .clamp(5, self.window_seconds().saturating_sub(5))
+    }
+
+    fn env_prefix(&self) -> String {
+        format!("{}_{}M", self.asset.to_uppercase(), self.window_minutes())
+    }
+
+    fn live_preview_cooldown_ms(&self) -> i64 {
+        let key = format!("{}_LIVE_PREVIEW_COOLDOWN_MS", self.env_prefix());
+        env_i64(&key, LIVE_PREVIEW_COOLDOWN_MS, 200, 30_000)
+    }
+
+    fn max_spot_age_ms(&self) -> i64 {
+        let key = format!("{}_MAX_SPOT_AGE_MS", self.env_prefix());
+        let fallback = if self.window_seconds() <= 300 { 1_500 } else { SPOT_STALE_MS };
+        env_i64(&key, fallback, 300, 30_000)
+    }
+
+    fn max_book_age_ms(&self) -> i64 {
+        let key = format!("{}_MAX_BOOK_AGE_MS", self.env_prefix());
+        let fallback = if self.window_seconds() <= 300 { 1_000 } else { BOOK_STALE_MS };
+        env_i64(&key, fallback, 300, 30_000)
+    }
+
+    fn iv_blend_weight(&self) -> f64 {
+        let key = format!("{}_IV_BLEND_WEIGHT", self.env_prefix());
+        env_f64(&key, 0.60, 0.0, 1.0)
+    }
+
+    fn iv_max_stale_ms(&self) -> i64 {
+        let key = format!("{}_IV_MAX_STALE_MS", self.env_prefix());
+        env_i64(&key, 120_000, 1_000, 10 * 60_000)
+    }
+
+    fn decision_interval_ms(&self) -> u64 {
+        let key = format!("{}_DECISION_INTERVAL_MS", self.env_prefix());
+        let fallback = if self.window_seconds() <= 300 { 150 } else { 250 };
+        env_i64(&key, fallback, 50, 2_000) as u64
     }
 
     fn calculate_fair_value(&self, spot: f64, strike: f64, time_to_expiry_years: f64, sigma: f64) -> f64 {
@@ -435,6 +491,12 @@ impl Strategy for MarketNeutralStrategy {
         let variant = strategy_variant();
         let params = StrategyParams::for_asset(&self.asset);
         let mut last_seen_reset_ts = 0_i64;
+        let spot_max_age_ms = self.max_spot_age_ms();
+        let book_max_age_ms = self.max_book_age_ms();
+        let live_preview_cooldown_ms = self.live_preview_cooldown_ms();
+        let sigma_iv_weight = self.iv_blend_weight();
+        let sigma_iv_max_stale_ms = self.iv_max_stale_ms();
+        let decision_interval_ms = self.decision_interval_ms();
 
         if let Some(restored) = restore_strategy_open_positions::<Position>(&mut conn, &strategy_id).await {
             if Self::valid_persisted_position(&restored) {
@@ -538,6 +600,16 @@ impl Strategy for MarketNeutralStrategy {
             }
         });
 
+        match self.asset.to_uppercase().as_str() {
+            "BTC" => {
+                spawn_deribit_iv_feed("BTC", self.latest_spot_price.clone(), self.implied_vol.clone());
+            }
+            "ETH" => {
+                spawn_deribit_iv_feed("ETH", self.latest_spot_price.clone(), self.implied_vol.clone());
+            }
+            _ => {}
+        }
+
         loop {
             let target_market = loop {
                 if let Some(m) = self.client.fetch_current_market_window(&self.asset, self.window_seconds()).await {
@@ -586,7 +658,7 @@ impl Strategy for MarketNeutralStrategy {
             });
             let _ = poly_ws.send(Message::Text(sub_msg.to_string())).await;
 
-            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            let mut interval = tokio::time::interval(Duration::from_millis(decision_interval_ms));
             let window_start_ts = Self::parse_window_start_ts(&target_market.slug).unwrap_or_else(|| {
                 let now_ts = Utc::now().timestamp();
                 now_ts - now_ts.rem_euclid(self.window_seconds())
@@ -687,7 +759,7 @@ impl Strategy for MarketNeutralStrategy {
                         let now_ms = Utc::now().timestamp_millis();
 
                         // Force-close if book stale beyond MAX_HOLD to free capital
-                        if now_ms - book.last_update_ms > BOOK_STALE_MS {
+                        if now_ms - book.last_update_ms > book_max_age_ms {
                             let mut pos_lock = self.open_position.write().await;
                             if let Some(pos) = pos_lock.as_ref() {
                                 let hold_ms = now_ms - pos.timestamp_ms;
@@ -727,7 +799,7 @@ impl Strategy for MarketNeutralStrategy {
                         }
 
                         let (spot, spot_ts_ms) = *self.latest_spot_price.read().await;
-                        if spot <= 0.0 || now_ms - spot_ts_ms > SPOT_STALE_MS {
+                        if spot <= 0.0 || now_ms - spot_ts_ms > spot_max_age_ms {
                             publish_heartbeat(&mut conn, &heartbeat_id).await;
                             continue;
                         }
@@ -872,10 +944,25 @@ impl Strategy for MarketNeutralStrategy {
                         }
 
                         let tte_years = remaining_seconds as f64 / 31_536_000.0;
-                        let sigma = {
+                        let realized_sigma = {
                             let history = self.spot_history.read().await;
-                            Self::estimate_annualized_vol(&history).unwrap_or(ASSUMED_VOLATILITY)
+                            Self::estimate_annualized_vol(&history)
                         };
+                        let iv_snapshot = self.implied_vol.read().await.clone();
+                        let iv_age_ms = iv_snapshot
+                            .as_ref()
+                            .map(|iv| now_ms.saturating_sub(iv.timestamp_ms))
+                            .unwrap_or(-1);
+                        let iv_is_fresh = iv_snapshot
+                            .as_ref()
+                            .map(|iv| now_ms.saturating_sub(iv.timestamp_ms) <= sigma_iv_max_stale_ms)
+                            .unwrap_or(false);
+                        let implied_sigma = if iv_is_fresh {
+                            iv_snapshot.as_ref().map(|iv| iv.annualized_iv)
+                        } else {
+                            None
+                        };
+                        let sigma = blend_sigma(realized_sigma, implied_sigma, sigma_iv_weight, ASSUMED_VOLATILITY);
                         let window_start_ms = window_start_ts * 1000;
                         let window_start_spot = {
                             let history = self.spot_history.read().await;
@@ -889,26 +976,72 @@ impl Strategy for MarketNeutralStrategy {
                         let adaptive_entry_edge = (params.entry_edge_threshold
                             + ((sigma - ASSUMED_VOLATILITY).max(0.0) * 0.02))
                             .clamp(params.entry_edge_threshold, params.max_entry_edge_threshold);
-                        let required_edge = adaptive_entry_edge + cost_model.round_trip_cost_rate();
+                        let divergence_uncertainty_bps = env_f64(
+                            &format!("{}_DIVERGENCE_UNCERTAINTY_BPS", self.env_prefix()),
+                            12.0,
+                            0.0,
+                            300.0,
+                        );
+                        let uncertainty_buffer = divergence_uncertainty_bps / 10_000.0;
+                        let required_edge = adaptive_entry_edge + cost_model.round_trip_cost_rate() + uncertainty_buffer;
+                        let divergence_floor = env_f64(
+                            &format!("{}_DIVERGENCE_MIN_FLOOR", self.env_prefix()),
+                            0.02,
+                            0.0,
+                            0.20,
+                        );
+                        let divergence_spread_mult = env_f64(
+                            &format!("{}_DIVERGENCE_SPREAD_MULT", self.env_prefix()),
+                            0.35,
+                            0.0,
+                            2.0,
+                        );
+                        let divergence_vol_mult = env_f64(
+                            &format!("{}_DIVERGENCE_VOL_MULT", self.env_prefix()),
+                            0.25,
+                            0.0,
+                            2.0,
+                        );
                         let parity_deviation = (yes_no_mid_sum - 1.0).abs();
                         let edge_to_spread_ratio = if yes_spread > 0.0 {
                             edge / yes_spread
                         } else {
                             f64::INFINITY
                         };
+                        let sigma_term = (sigma * tte_years.sqrt()).clamp(0.0, 1.0);
+                        let required_divergence = (
+                            divergence_floor
+                                + uncertainty_buffer
+                                + (divergence_spread_mult * yes_spread)
+                                + (divergence_vol_mult * sigma_term)
+                        )
+                            .clamp(0.0, 0.25);
+                        let divergence_ok = edge >= required_divergence;
                         let price_ok = book.yes.best_ask >= MIN_ENTRY_PRICE && book.yes.best_ask <= MAX_ENTRY_PRICE;
                         let parity_ok = parity_deviation <= MAX_PARITY_DEVIATION;
                         let spread_ok = yes_spread <= params.max_entry_spread;
                         let spread_efficiency_ok = yes_spread <= 0.0 || edge_to_spread_ratio >= params.min_edge_to_spread_ratio;
                         let risk_budget_ok = trades_this_window < params.max_trades_per_window
                             && consecutive_losses < params.max_consecutive_losses;
-                        let structural_filters_ok = price_ok && parity_ok && spread_ok && spread_efficiency_ok && risk_budget_ok;
-                        let passes_threshold = edge >= required_edge && structural_filters_ok;
-                        let reason = if edge < required_edge {
+                        let freshness_ok = spot_age_ms <= spot_max_age_ms && book_age_ms <= book_max_age_ms;
+                        let structural_filters_ok = freshness_ok && price_ok && parity_ok && spread_ok && spread_efficiency_ok && risk_budget_ok;
+                        let passes_threshold = edge >= required_edge && divergence_ok && structural_filters_ok;
+                        let reason = if !freshness_ok {
+                            format!(
+                                "Freshness gate blocked entry (spot {}ms>{}ms or book {}ms>{}ms)",
+                                spot_age_ms, spot_max_age_ms, book_age_ms, book_max_age_ms
+                            )
+                        } else if edge < required_edge {
                             format!(
                                 "Fair value edge {:.2}c below entry+cost threshold {:.2}c",
                                 edge * 100.0,
                                 required_edge * 100.0
+                            )
+                        } else if !divergence_ok {
+                            format!(
+                                "Fair/market divergence {:.1}bps below required {:.1}bps",
+                                edge * 10_000.0,
+                                required_divergence * 10_000.0
                             )
                         } else if !price_ok {
                             format!(
@@ -971,14 +1104,30 @@ impl Strategy for MarketNeutralStrategy {
                                 "window_start_spot": window_start_spot,
                                 "tte_years": tte_years,
                                 "sigma_annualized": sigma,
+                                "sigma_realized_annualized": realized_sigma.unwrap_or(-1.0),
+                                "sigma_implied_annualized": implied_sigma.unwrap_or(-1.0),
+                                "sigma_iv_blend_weight": sigma_iv_weight,
+                                "sigma_iv_fresh": iv_is_fresh,
+                                "sigma_iv_age_ms": iv_age_ms,
+                                "sigma_iv_sample_count": iv_snapshot.as_ref().map(|iv| iv.sample_count).unwrap_or(0),
+                                "sigma_iv_source": iv_snapshot.as_ref().map(|iv| iv.source.clone()).unwrap_or_else(|| "NONE".to_string()),
                                 "best_ask_yes": book.yes.best_ask,
                                 "fair_yes": fair_yes,
                                 "required_edge": required_edge,
+                                "required_divergence": required_divergence,
+                                "divergence_ok": divergence_ok,
+                                "divergence_floor": divergence_floor,
+                                "divergence_uncertainty_bps": divergence_uncertainty_bps,
+                                "divergence_spread_component": divergence_spread_mult * yes_spread,
+                                "divergence_vol_component": divergence_vol_mult * sigma_term,
                                 "yes_spread": yes_spread,
                                 "parity_deviation": parity_deviation,
                                 "edge_to_spread_ratio": edge_to_spread_ratio,
                                 "trades_this_window": trades_this_window,
                                 "consecutive_losses": consecutive_losses,
+                                "freshness_ok": freshness_ok,
+                                "spot_age_max_ms": spot_max_age_ms,
+                                "book_age_max_ms": book_max_age_ms,
                                 "price_ok": price_ok,
                                 "parity_ok": parity_ok,
                                 "spread_ok": spread_ok,
@@ -997,7 +1146,7 @@ impl Strategy for MarketNeutralStrategy {
                                 && yes_spread <= params.max_entry_spread
                                 && remaining_seconds > entry_expiry_cutoff_secs
                                 && now_ms - last_entry_ms >= ENTRY_COOLDOWN_MS
-                                && now_ms - last_live_preview_ms >= LIVE_PREVIEW_COOLDOWN_MS
+                                && now_ms - last_live_preview_ms >= live_preview_cooldown_ms
                             {
                                 let available_cash = read_sim_available_cash(&mut conn).await;
                                 let risk_cfg = read_risk_config(&mut conn).await;
@@ -1025,10 +1174,17 @@ impl Strategy for MarketNeutralStrategy {
                                             "edge": edge,
                                             "adaptive_entry_edge": adaptive_entry_edge,
                                             "required_edge": required_edge,
+                                            "required_divergence": required_divergence,
+                                            "divergence_ok": divergence_ok,
                                             "spot": spot,
                                             "spot_age_ms": spot_age_ms,
                                             "book_age_ms": book_age_ms,
+                                            "freshness_ok": freshness_ok,
                                             "sigma_annualized": sigma,
+                                            "sigma_realized_annualized": realized_sigma.unwrap_or(-1.0),
+                                            "sigma_implied_annualized": implied_sigma.unwrap_or(-1.0),
+                                            "sigma_iv_fresh": iv_is_fresh,
+                                            "sigma_iv_age_ms": iv_age_ms,
                                             "yes_spread": yes_spread,
                                             "parity_deviation": parity_deviation,
                                             "edge_to_spread_ratio": edge_to_spread_ratio,
@@ -1242,10 +1398,18 @@ impl Strategy for MarketNeutralStrategy {
                                         "fair_value": fair_yes,
                                         "edge": edge,
                                         "adaptive_entry_edge": adaptive_entry_edge,
+                                        "required_edge": required_edge,
+                                        "required_divergence": required_divergence,
+                                        "divergence_ok": divergence_ok,
                                         "spot": spot,
                                         "spot_age_ms": spot_age_ms,
                                         "book_age_ms": book_age_ms,
+                                        "freshness_ok": freshness_ok,
                                         "sigma_annualized": sigma,
+                                        "sigma_realized_annualized": realized_sigma.unwrap_or(-1.0),
+                                        "sigma_implied_annualized": implied_sigma.unwrap_or(-1.0),
+                                        "sigma_iv_fresh": iv_is_fresh,
+                                        "sigma_iv_age_ms": iv_age_ms,
                                         "parity_deviation": parity_deviation,
                                         "edge_to_spread_ratio": edge_to_spread_ratio,
                                         "trades_this_window": trades_this_window,

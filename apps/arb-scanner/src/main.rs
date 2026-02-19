@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "1024"]
 
 use tokio::time::{sleep, Duration};
 use tokio::signal;
@@ -43,12 +43,18 @@ fn env_flag_enabled(name: &str, default: bool) -> bool {
 
 fn canonical_strategy_id(input: &str) -> &'static str {
     match input {
+        "BTC_1M" => "BTC_1M",
         "BTC_5M" => "BTC_5M",
         "BTC_15M" => "BTC_15M",
+        "ETH_1M" => "ETH_1M",
         "ETH_5M" => "ETH_5M",
         "ETH_15M" => "ETH_15M",
+        "SOL_1M" => "SOL_1M",
         "SOL_5M" => "SOL_5M",
         "SOL_15M" => "SOL_15M",
+        "XRP_1M" => "XRP_1M",
+        "XRP_5M" => "XRP_5M",
+        "XRP_15M" => "XRP_15M",
         "CEX_ARB" | "CEX_SNIPER" => "CEX_SNIPER",
         "COPY_BOT" | "SYNDICATE" => "SYNDICATE",
         "ATOMIC_ARB" => "ATOMIC_ARB",
@@ -248,13 +254,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     spawn_strategy_lock_lease(client.clone(), strategy_id.clone(), owner.clone());
 
+    let enable_xrp_strategies = env_flag_enabled("ENABLE_XRP_STRATEGIES", false);
+    let enable_one_minute_strategies = env_flag_enabled("ENABLE_ONE_MINUTE_STRATEGIES", false);
+
     let strategy: Box<dyn Strategy + Send + Sync> = match strategy_type.as_str() {
+        "BTC_1M" if enable_one_minute_strategies => {
+            Box::new(MarketNeutralStrategy::new_with_window("BTC".to_string(), 60))
+        }
         "BTC_5M" => Box::new(Btc5mLagStrategy::new()),
         "BTC_15M" => Box::new(MarketNeutralStrategy::new("BTC".to_string())),
+        "ETH_1M" if enable_one_minute_strategies => {
+            Box::new(MarketNeutralStrategy::new_with_window("ETH".to_string(), 60))
+        }
         "ETH_5M" => Box::new(MarketNeutralStrategy::new_with_window("ETH".to_string(), 300)),
         "ETH_15M" => Box::new(MarketNeutralStrategy::new("ETH".to_string())),
+        "SOL_1M" if enable_one_minute_strategies => {
+            Box::new(MarketNeutralStrategy::new_with_window("SOL".to_string(), 60))
+        }
         "SOL_5M" => Box::new(MarketNeutralStrategy::new_with_window("SOL".to_string(), 300)),
         "SOL_15M" => Box::new(MarketNeutralStrategy::new("SOL".to_string())),
+        "XRP_1M" if enable_xrp_strategies && enable_one_minute_strategies => {
+            Box::new(MarketNeutralStrategy::new_with_window("XRP".to_string(), 60))
+        }
+        "XRP_5M" if enable_xrp_strategies => {
+            Box::new(MarketNeutralStrategy::new_with_window("XRP".to_string(), 300))
+        }
+        "XRP_15M" if enable_xrp_strategies => Box::new(MarketNeutralStrategy::new("XRP".to_string())),
         "CEX_ARB" | "CEX_SNIPER" => Box::new(CexArbStrategy::new()),
         "COPY_BOT" | "SYNDICATE" => Box::new(SyndicateStrategy::new()),
         "ATOMIC_ARB" => Box::new(AtomicArbStrategy::new()),
@@ -264,6 +289,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "MAKER_MM" => Box::new(MakerMmStrategy::new()),
         "AS_MARKET_MAKER" => Box::new(AsMarketMakerStrategy::new()),
         "LONGSHOT_BIAS" => Box::new(LongshotBiasStrategy::new()),
+        "XRP_1M" | "XRP_5M" | "XRP_15M" => {
+            error!("XRP strategies requested but ENABLE_XRP_STRATEGIES=false");
+            Box::new(MarketNeutralStrategy::new("BTC".to_string()))
+        }
+        "BTC_1M" | "ETH_1M" | "SOL_1M" => {
+            error!("1m strategies requested but ENABLE_ONE_MINUTE_STRATEGIES=false");
+            Box::new(MarketNeutralStrategy::new("BTC".to_string()))
+        }
         _ => {
             error!("Unknown Strategy Type. Defaulting to BTC_15M");
             Box::new(MarketNeutralStrategy::new("BTC".to_string()))

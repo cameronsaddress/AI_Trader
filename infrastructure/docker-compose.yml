@@ -28,13 +28,15 @@ services:
       - INTELLIGENCE_GATE_ENABLED=${INTELLIGENCE_GATE_ENABLED:-true}
       - INTELLIGENCE_GATE_MAX_STALENESS_MS=${INTELLIGENCE_GATE_MAX_STALENESS_MS:-3000}
       - INTELLIGENCE_GATE_MIN_MARGIN=${INTELLIGENCE_GATE_MIN_MARGIN:-0}
+      - ENABLE_XRP_STRATEGIES=${ENABLE_XRP_STRATEGIES:-false}
+      - ENABLE_ONE_MINUTE_STRATEGIES=${ENABLE_ONE_MINUTE_STRATEGIES:-false}
       - FEATURE_DATASET_MANIFEST_PATH=/app/reports/feature_dataset_manifest.json
       - SIGNAL_MODEL_REPORT_PATH=/app/reports/models/signal_model_report.json
       - SIGNAL_MODEL_ARTIFACT_PATH=/app/reports/models/signal_model_latest.json
       - DEFAULT_DISABLED_STRATEGIES=
       - STRATEGY_WEIGHT_CAP=${STRATEGY_WEIGHT_CAP:-2.0}
       - STRATEGY_ALLOCATOR_EMA_ALPHA=0.05
-      - RISK_GUARD_STRATEGIES=BTC_5M,BTC_15M,ETH_15M,SOL_15M,CEX_SNIPER,OBI_SCALPER,SYNDICATE,ATOMIC_ARB,GRAPH_ARB,CONVERGENCE_CARRY,MAKER_MM,AS_MARKET_MAKER,LONGSHOT_BIAS
+      - RISK_GUARD_STRATEGIES=BTC_1M,BTC_5M,BTC_15M,ETH_1M,ETH_5M,ETH_15M,SOL_1M,SOL_5M,SOL_15M,XRP_1M,XRP_5M,XRP_15M,CEX_SNIPER,OBI_SCALPER,SYNDICATE,ATOMIC_ARB,GRAPH_ARB,CONVERGENCE_CARRY,MAKER_MM,AS_MARKET_MAKER,LONGSHOT_BIAS
       - VAULT_ENABLED=true
       - VAULT_BANKROLL_CEILING=1100
       - RISK_GUARD_TRAILING_STOP=100
@@ -224,6 +226,19 @@ services:
       - BTC_5M_EDGE_SCALE_TARGET_RATIO=1.25
       - BTC_5M_EDGE_SCALE_FLOOR=0.40
       - BTC_5M_FEE_CURVE_BASE_RATE=0.02
+      - BTC_5M_MAX_SPOT_AGE_MS=1200
+      - BTC_5M_MAX_BOOK_AGE_MS=900
+      - BTC_5M_LIVE_PREVIEW_COOLDOWN_MS=900
+      - BTC_5M_IV_BLEND_WEIGHT=0.65
+      - BTC_5M_IV_MAX_STALE_MS=90000
+      - BTC_5M_DIVERGENCE_MIN_FLOOR=0.03
+      - BTC_5M_DIVERGENCE_SPREAD_MULT=0.40
+      - BTC_5M_DIVERGENCE_VOL_MULT=0.30
+      - BTC_5M_DIVERGENCE_UNCERTAINTY_BPS=12
+      - DERIBIT_IV_REFRESH_MS=10000
+      - DERIBIT_IV_HTTP_TIMEOUT_MS=4000
+      - DERIBIT_IV_MAX_SPOT_AGE_MS=15000
+      - DERIBIT_IV_MIN_SAMPLES=4
     dns:
       - 8.8.8.8
     depends_on:
@@ -250,6 +265,15 @@ services:
       - STRATEGY_VARIANT=baseline
       - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - ETH_15M_MAX_SPOT_AGE_MS=2200
+      - ETH_15M_MAX_BOOK_AGE_MS=1500
+      - ETH_15M_LIVE_PREVIEW_COOLDOWN_MS=1500
+      - ETH_15M_DECISION_INTERVAL_MS=220
+      - ETH_15M_IV_BLEND_WEIGHT=0.55
+      - ETH_15M_DIVERGENCE_MIN_FLOOR=0.018
+      - ETH_15M_DIVERGENCE_SPREAD_MULT=0.30
+      - ETH_15M_DIVERGENCE_VOL_MULT=0.20
+      - ETH_15M_DIVERGENCE_UNCERTAINTY_BPS=10
     dns:
       - 8.8.8.8
     depends_on:
@@ -278,6 +302,15 @@ services:
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
+      - ETH_5M_MAX_SPOT_AGE_MS=1400
+      - ETH_5M_MAX_BOOK_AGE_MS=1000
+      - ETH_5M_LIVE_PREVIEW_COOLDOWN_MS=900
+      - ETH_5M_DECISION_INTERVAL_MS=150
+      - ETH_5M_IV_BLEND_WEIGHT=0.60
+      - ETH_5M_DIVERGENCE_MIN_FLOOR=0.025
+      - ETH_5M_DIVERGENCE_SPREAD_MULT=0.35
+      - ETH_5M_DIVERGENCE_VOL_MULT=0.25
+      - ETH_5M_DIVERGENCE_UNCERTAINTY_BPS=12
     dns:
       - 8.8.8.8
     depends_on:
@@ -304,6 +337,14 @@ services:
       - STRATEGY_VARIANT=baseline
       - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - SOL_15M_MAX_SPOT_AGE_MS=2400
+      - SOL_15M_MAX_BOOK_AGE_MS=1600
+      - SOL_15M_LIVE_PREVIEW_COOLDOWN_MS=1500
+      - SOL_15M_DECISION_INTERVAL_MS=220
+      - SOL_15M_DIVERGENCE_MIN_FLOOR=0.020
+      - SOL_15M_DIVERGENCE_SPREAD_MULT=0.35
+      - SOL_15M_DIVERGENCE_VOL_MULT=0.25
+      - SOL_15M_DIVERGENCE_UNCERTAINTY_BPS=14
     dns:
       - 8.8.8.8
     depends_on:
@@ -332,6 +373,235 @@ services:
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
+      - SOL_5M_MAX_SPOT_AGE_MS=1500
+      - SOL_5M_MAX_BOOK_AGE_MS=1000
+      - SOL_5M_LIVE_PREVIEW_COOLDOWN_MS=900
+      - SOL_5M_DECISION_INTERVAL_MS=150
+      - SOL_5M_DIVERGENCE_MIN_FLOOR=0.028
+      - SOL_5M_DIVERGENCE_SPREAD_MULT=0.40
+      - SOL_5M_DIVERGENCE_VOL_MULT=0.30
+      - SOL_5M_DIVERGENCE_UNCERTAINTY_BPS=16
+    dns:
+      - 8.8.8.8
+    depends_on:
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
+
+  arb-scanner-xrp:
+    profiles: ["experimental"]
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=XRP_15M
+      - STRATEGY_VARIANT=baseline
+      - ENABLE_XRP_STRATEGIES=true
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - XRP_15M_MAX_SPOT_AGE_MS=2400
+      - XRP_15M_MAX_BOOK_AGE_MS=1600
+      - XRP_15M_LIVE_PREVIEW_COOLDOWN_MS=1500
+      - XRP_15M_DECISION_INTERVAL_MS=220
+      - XRP_15M_DIVERGENCE_MIN_FLOOR=0.022
+      - XRP_15M_DIVERGENCE_SPREAD_MULT=0.35
+      - XRP_15M_DIVERGENCE_VOL_MULT=0.25
+      - XRP_15M_DIVERGENCE_UNCERTAINTY_BPS=16
+    dns:
+      - 8.8.8.8
+    depends_on:
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
+
+  arb-scanner-xrp-5m:
+    profiles: ["experimental"]
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=XRP_5M
+      - STRATEGY_VARIANT=baseline
+      - ENABLE_XRP_STRATEGIES=true
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - SIM_FEE_BPS_PER_SIDE=0
+      - SIM_SLIPPAGE_BPS_PER_SIDE=2
+      - XRP_5M_MAX_SPOT_AGE_MS=1600
+      - XRP_5M_MAX_BOOK_AGE_MS=1100
+      - XRP_5M_LIVE_PREVIEW_COOLDOWN_MS=900
+      - XRP_5M_DECISION_INTERVAL_MS=150
+      - XRP_5M_DIVERGENCE_MIN_FLOOR=0.030
+      - XRP_5M_DIVERGENCE_SPREAD_MULT=0.42
+      - XRP_5M_DIVERGENCE_VOL_MULT=0.30
+      - XRP_5M_DIVERGENCE_UNCERTAINTY_BPS=18
+    dns:
+      - 8.8.8.8
+    depends_on:
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
+
+  arb-scanner-btc-1m:
+    profiles: ["experimental"]
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=BTC_1M
+      - STRATEGY_VARIANT=baseline
+      - ENABLE_ONE_MINUTE_STRATEGIES=true
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - BTC_1M_MAX_SPOT_AGE_MS=900
+      - BTC_1M_MAX_BOOK_AGE_MS=700
+      - BTC_1M_LIVE_PREVIEW_COOLDOWN_MS=500
+      - BTC_1M_DECISION_INTERVAL_MS=100
+      - BTC_1M_IV_BLEND_WEIGHT=0.70
+      - BTC_1M_DIVERGENCE_MIN_FLOOR=0.050
+      - BTC_1M_DIVERGENCE_SPREAD_MULT=0.50
+      - BTC_1M_DIVERGENCE_VOL_MULT=0.35
+      - BTC_1M_DIVERGENCE_UNCERTAINTY_BPS=20
+    dns:
+      - 8.8.8.8
+    depends_on:
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
+
+  arb-scanner-eth-1m:
+    profiles: ["experimental"]
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=ETH_1M
+      - STRATEGY_VARIANT=baseline
+      - ENABLE_ONE_MINUTE_STRATEGIES=true
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - ETH_1M_MAX_SPOT_AGE_MS=950
+      - ETH_1M_MAX_BOOK_AGE_MS=700
+      - ETH_1M_LIVE_PREVIEW_COOLDOWN_MS=500
+      - ETH_1M_DECISION_INTERVAL_MS=100
+      - ETH_1M_IV_BLEND_WEIGHT=0.68
+      - ETH_1M_DIVERGENCE_MIN_FLOOR=0.048
+      - ETH_1M_DIVERGENCE_SPREAD_MULT=0.48
+      - ETH_1M_DIVERGENCE_VOL_MULT=0.35
+      - ETH_1M_DIVERGENCE_UNCERTAINTY_BPS=20
+    dns:
+      - 8.8.8.8
+    depends_on:
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
+
+  arb-scanner-sol-1m:
+    profiles: ["experimental"]
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=SOL_1M
+      - STRATEGY_VARIANT=baseline
+      - ENABLE_ONE_MINUTE_STRATEGIES=true
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - SOL_1M_MAX_SPOT_AGE_MS=1000
+      - SOL_1M_MAX_BOOK_AGE_MS=750
+      - SOL_1M_LIVE_PREVIEW_COOLDOWN_MS=500
+      - SOL_1M_DECISION_INTERVAL_MS=100
+      - SOL_1M_DIVERGENCE_MIN_FLOOR=0.055
+      - SOL_1M_DIVERGENCE_SPREAD_MULT=0.55
+      - SOL_1M_DIVERGENCE_VOL_MULT=0.38
+      - SOL_1M_DIVERGENCE_UNCERTAINTY_BPS=24
+    dns:
+      - 8.8.8.8
+    depends_on:
+      arb-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    volumes:
+      - ../apps/arb-scanner:/usr/src/app
+      - arb_target:/usr/src/app/target
+    command: ./target/debug/arb-scanner
+    restart: unless-stopped
+    mem_limit: 256m
+
+  arb-scanner-xrp-1m:
+    profiles: ["experimental"]
+    build:
+      context: ../apps/arb-scanner
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RUST_LOG=info
+      - STRATEGY_TYPE=XRP_1M
+      - STRATEGY_VARIANT=baseline
+      - ENABLE_XRP_STRATEGIES=true
+      - ENABLE_ONE_MINUTE_STRATEGIES=true
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
+      - XRP_1M_MAX_SPOT_AGE_MS=1000
+      - XRP_1M_MAX_BOOK_AGE_MS=750
+      - XRP_1M_LIVE_PREVIEW_COOLDOWN_MS=500
+      - XRP_1M_DECISION_INTERVAL_MS=100
+      - XRP_1M_DIVERGENCE_MIN_FLOOR=0.058
+      - XRP_1M_DIVERGENCE_SPREAD_MULT=0.56
+      - XRP_1M_DIVERGENCE_VOL_MULT=0.40
+      - XRP_1M_DIVERGENCE_UNCERTAINTY_BPS=25
     dns:
       - 8.8.8.8
     depends_on:

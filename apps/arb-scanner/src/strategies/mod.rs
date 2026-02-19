@@ -13,6 +13,7 @@ pub mod control;
 pub mod market_data;
 pub mod simulation;
 pub mod vol_regime;
+pub mod implied_vol;
 
 use async_trait::async_trait;
 

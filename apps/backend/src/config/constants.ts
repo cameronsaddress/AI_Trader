@@ -6,8 +6,17 @@
 import path from 'path';
 import type { RuntimePhase, RuntimeModuleState } from '../types/backend-types';
 
+function envFlag(name: string, fallback = false): boolean {
+    const raw = process.env[name];
+    if (raw === undefined) {
+        return fallback;
+    }
+    const normalized = raw.trim().toLowerCase();
+    return !(normalized === '0' || normalized === 'false' || normalized === 'no');
+}
+
 // ── Strategy identifiers ────────────────────────────────────────────
-export const STRATEGY_IDS = [
+const CORE_STRATEGY_IDS = [
     'BTC_5M',
     'BTC_15M',
     'ETH_5M',
@@ -24,8 +33,16 @@ export const STRATEGY_IDS = [
     'AS_MARKET_MAKER',
     'LONGSHOT_BIAS',
 ];
+const ENABLE_XRP_STRATEGIES = envFlag('ENABLE_XRP_STRATEGIES', false);
+const ENABLE_ONE_MINUTE_STRATEGIES = envFlag('ENABLE_ONE_MINUTE_STRATEGIES', false);
+const FEATURE_STRATEGY_IDS = [
+    ...(ENABLE_XRP_STRATEGIES ? ['XRP_5M', 'XRP_15M'] : []),
+    ...(ENABLE_ONE_MINUTE_STRATEGIES ? ['BTC_1M', 'ETH_1M', 'SOL_1M'] : []),
+    ...(ENABLE_XRP_STRATEGIES && ENABLE_ONE_MINUTE_STRATEGIES ? ['XRP_1M'] : []),
+];
+export const STRATEGY_IDS = [...CORE_STRATEGY_IDS, ...FEATURE_STRATEGY_IDS];
 
-export const SCANNER_HEARTBEAT_IDS = [
+const CORE_SCANNER_HEARTBEAT_IDS = [
     'scanner_swarms',
     'btc_5m',
     'btc_15m',
@@ -44,6 +61,12 @@ export const SCANNER_HEARTBEAT_IDS = [
     'AS_MARKET_MAKER',
     'LONGSHOT_BIAS',
 ];
+const FEATURE_SCANNER_HEARTBEAT_IDS = [
+    ...(ENABLE_XRP_STRATEGIES ? ['xrp_5m', 'xrp_15m'] : []),
+    ...(ENABLE_ONE_MINUTE_STRATEGIES ? ['btc_1m', 'eth_1m', 'sol_1m'] : []),
+    ...(ENABLE_XRP_STRATEGIES && ENABLE_ONE_MINUTE_STRATEGIES ? ['xrp_1m'] : []),
+];
+export const SCANNER_HEARTBEAT_IDS = [...CORE_SCANNER_HEARTBEAT_IDS, ...FEATURE_SCANNER_HEARTBEAT_IDS];
 
 // ── Execution trace ─────────────────────────────────────────────────
 export const EXECUTION_TRACE_TTL_MS = Math.max(60_000, Number(process.env.EXECUTION_TRACE_TTL_MS || String(6 * 60 * 60 * 1000)));
@@ -160,6 +183,7 @@ export const INTELLIGENCE_GATE_CONFIRMATION_STRATEGIES = new Set([
     'ETH_15M',
     'SOL_5M',
     'SOL_15M',
+    ...(FEATURE_STRATEGY_IDS.filter((id) => /^(BTC|ETH|SOL|XRP)_(1M|5M|15M)$/.test(id))),
     'CEX_SNIPER',
     'OBI_SCALPER',
     'CONVERGENCE_CARRY',

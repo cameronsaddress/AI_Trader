@@ -35,6 +35,7 @@ use crate::strategies::control::{
     strategy_variant,
     TradingMode,
 };
+use crate::strategies::implied_vol::{blend_sigma, spawn_deribit_iv_feed, ImpliedVolSnapshot};
 use crate::strategies::market_data::{update_book_from_market_ws, BinaryBook};
 use crate::strategies::simulation::{SimCostModel, polymarket_taker_fee};
 use crate::strategies::Strategy;
@@ -65,6 +66,46 @@ fn entry_expiry_cutoff_secs() -> i64 {
 
 const LIVE_PREVIEW_COOLDOWN_MS: i64 = 2_000;
 const SETTLEMENT_SPOT_TIMEOUT_MS: i64 = 12_000;
+
+fn live_preview_cooldown_ms() -> i64 {
+    std::env::var("BTC_5M_LIVE_PREVIEW_COOLDOWN_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v >= 200 && *v <= 30_000)
+        .unwrap_or(LIVE_PREVIEW_COOLDOWN_MS)
+}
+
+fn max_spot_age_ms() -> i64 {
+    std::env::var("BTC_5M_MAX_SPOT_AGE_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v >= 300 && *v <= 30_000)
+        .unwrap_or(SPOT_STALE_MS)
+}
+
+fn max_book_age_ms() -> i64 {
+    std::env::var("BTC_5M_MAX_BOOK_AGE_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v >= 300 && *v <= 30_000)
+        .unwrap_or(BOOK_STALE_MS)
+}
+
+fn iv_max_stale_ms() -> i64 {
+    std::env::var("BTC_5M_IV_MAX_STALE_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v >= 1_000 && *v <= 10 * 60_000)
+        .unwrap_or(90_000)
+}
+
+fn iv_blend_weight() -> f64 {
+    std::env::var("BTC_5M_IV_BLEND_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(0.65)
+}
 
 const OPEN_POSITION_REDIS_PREFIX: &str = "strategy:open_position:";
 const OPEN_POSITION_TTL_SECS: i64 = 60 * 60; // 1h
@@ -1126,6 +1167,7 @@ pub struct Btc5mLagStrategy {
     client: PolymarketClient,
     latest_spot_price: Arc<RwLock<(f64, i64)>>,
     spot_history: Arc<RwLock<VecDeque<(i64, f64)>>>,
+    implied_vol: Arc<RwLock<Option<ImpliedVolSnapshot>>>,
 }
 
 impl Btc5mLagStrategy {
@@ -1134,6 +1176,7 @@ impl Btc5mLagStrategy {
             client: PolymarketClient::new(),
             latest_spot_price: Arc::new(RwLock::new((0.0, 0))),
             spot_history: Arc::new(RwLock::new(VecDeque::new())),
+            implied_vol: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -1202,6 +1245,11 @@ impl Strategy for Btc5mLagStrategy {
         let cost_model = SimCostModel::from_env();
         let variant = strategy_variant();
         let mut last_seen_reset_ts = 0_i64;
+        let spot_max_age_ms = max_spot_age_ms();
+        let book_max_age_ms = max_book_age_ms();
+        let live_preview_cooldown_ms = live_preview_cooldown_ms();
+        let sigma_iv_weight = iv_blend_weight();
+        let sigma_iv_max_stale_ms = iv_max_stale_ms();
 
         // 3E: Consecutive loss circuit breaker (local)
         let mut consecutive_losses: u32 = 0;
@@ -1302,6 +1350,7 @@ impl Strategy for Btc5mLagStrategy {
         spawn_bybit_feed(cex_prices.clone());
         spawn_kraken_feed(cex_prices.clone());
         spawn_bitfinex_feed(cex_prices.clone());
+        spawn_deribit_iv_feed("BTC", self.latest_spot_price.clone(), self.implied_vol.clone());
 
         // Resume any open PAPER-mode position after restarts so reserved notional
         // is released/settled and the UI can hydrate open positions correctly.
@@ -1452,7 +1501,7 @@ impl Strategy for Btc5mLagStrategy {
                             drop(history);
 
                             let near_boundary = (now_ms - expiry_ms).abs() <= WINDOW_START_SPOT_MAX_SKEW_MS;
-                            let fresh_spot = spot > 0.0 && now_ms - spot_ts_ms <= SPOT_STALE_MS;
+                            let fresh_spot = spot > 0.0 && now_ms - spot_ts_ms <= spot_max_age_ms;
                             let mut end_spot = boundary_spot
                                 .or(if near_boundary && fresh_spot { Some(spot) } else { None })
                                 .unwrap_or(0.0);
@@ -1464,7 +1513,7 @@ impl Strategy for Btc5mLagStrategy {
                                     .iter()
                                     .map(|(venue, (px, ts_ms))| (*venue, *px, *ts_ms))
                                     .collect();
-                                end_spot = reliability_weighted_median(&venue_entries, now_ms, SPOT_STALE_MS)
+                                end_spot = reliability_weighted_median(&venue_entries, now_ms, spot_max_age_ms)
                                     .unwrap_or(0.0);
                             }
 
@@ -1747,8 +1796,8 @@ impl Strategy for Btc5mLagStrategy {
                         }
 
                         if !book.yes.is_valid() || !book.no.is_valid()
-                            || now_ms - book.yes_update_ms > BOOK_STALE_MS
-                            || now_ms - book.no_update_ms > BOOK_STALE_MS
+                            || now_ms - book.yes_update_ms > book_max_age_ms
+                            || now_ms - book.no_update_ms > book_max_age_ms
                         {
                             if now_ms - last_hold_scan_ms >= 1000 {
                                 let yes_age_ms = now_ms.saturating_sub(book.yes_update_ms);
@@ -1789,7 +1838,8 @@ impl Strategy for Btc5mLagStrategy {
 
                         let (raw_spot, spot_ts_ms) = *self.latest_spot_price.read().await;
                         let mut spot = raw_spot;
-                        if spot <= 0.0 || now_ms - spot_ts_ms > SPOT_STALE_MS {
+                        let mut spot_age_for_gate_ms = now_ms.saturating_sub(spot_ts_ms);
+                        if spot <= 0.0 || now_ms - spot_ts_ms > spot_max_age_ms {
                             // If Coinbase stalls, continue with the reliability-weighted CEX median
                             // instead of freezing BTC_5M scans and starving downstream consumers.
                             let cex_snapshot = { cex_prices.read().await.clone() };
@@ -1797,8 +1847,16 @@ impl Strategy for Btc5mLagStrategy {
                                 .iter()
                                 .map(|(venue, (px, ts_ms))| (*venue, *px, *ts_ms))
                                 .collect();
-                            if let Some(fallback_spot) = reliability_weighted_median(&venue_entries, now_ms, SPOT_STALE_MS) {
+                            if let Some(fallback_spot) = reliability_weighted_median(&venue_entries, now_ms, spot_max_age_ms) {
                                 spot = fallback_spot;
+                                if let Some(best_age) = venue_entries
+                                    .iter()
+                                    .filter(|(_, px, ts_ms)| *px > 0.0 && now_ms.saturating_sub(*ts_ms) <= spot_max_age_ms)
+                                    .map(|(_, _, ts_ms)| now_ms.saturating_sub(*ts_ms))
+                                    .min()
+                                {
+                                    spot_age_for_gate_ms = best_age;
+                                }
                             } else {
                                 publish_heartbeat(&mut conn, self.heartbeat_id()).await;
                                 continue;
@@ -1921,7 +1979,7 @@ impl Strategy for Btc5mLagStrategy {
                             }
                             venue_entries.push((*venue, *px, *ts_ms));
                         }
-                        let cex_mid = reliability_weighted_median(&venue_entries, now_ms, SPOT_STALE_MS)
+                        let cex_mid = reliability_weighted_median(&venue_entries, now_ms, spot_max_age_ms)
                             .unwrap_or(spot);
 
                         let remaining_seconds = expiry_ts - now_ts;
@@ -1979,16 +2037,31 @@ impl Strategy for Btc5mLagStrategy {
                         }
 
                         let tte_years = remaining_seconds as f64 / 31_536_000.0;
-                        let sigma = {
+                        let realized_sigma = {
                             let history = self.spot_history.read().await;
-                            estimate_annualized_vol(&history).unwrap_or(0.65)
+                            estimate_annualized_vol(&history)
                         };
+                        let iv_snapshot = self.implied_vol.read().await.clone();
+                        let iv_age_ms = iv_snapshot
+                            .as_ref()
+                            .map(|iv| now_ms.saturating_sub(iv.timestamp_ms))
+                            .unwrap_or(-1);
+                        let iv_is_fresh = iv_snapshot
+                            .as_ref()
+                            .map(|iv| now_ms.saturating_sub(iv.timestamp_ms) <= sigma_iv_max_stale_ms)
+                            .unwrap_or(false);
+                        let implied_sigma = if iv_is_fresh {
+                            iv_snapshot.as_ref().map(|iv| iv.annualized_iv)
+                        } else {
+                            None
+                        };
+                        let sigma = blend_sigma(realized_sigma, implied_sigma, sigma_iv_weight, 0.65);
                         let vol_estimate: Option<f64> = if sigma > 0.0 { Some(sigma) } else { None };
 
                         // 3F: Volatility circuit breaker — skip entry when volatility is extreme.
                         if open_position.is_none() {
                             if let Some(vol) = vol_estimate {
-                                if vol > 2.0 { // 200% annualized = extreme volatility
+                                if vol > 2.20 { // extreme volatility fails safe even with blended IV
                                     warn!("[BTC_5M] Volatility circuit breaker: vol={:.2} too high", vol);
                                     publish_heartbeat(&mut conn, self.heartbeat_id()).await;
                                     continue;
@@ -2045,6 +2118,44 @@ impl Strategy for Btc5mLagStrategy {
                             Side::Up => up_price_ok,
                             Side::Down => down_price_ok,
                         };
+                        let yes_book_age_ms = now_ms.saturating_sub(book.yes_update_ms);
+                        let no_book_age_ms = now_ms.saturating_sub(book.no_update_ms);
+                        let freshness_ok = spot_age_for_gate_ms <= spot_max_age_ms
+                            && yes_book_age_ms <= book_max_age_ms
+                            && no_book_age_ms <= book_max_age_ms;
+
+                        // Divergence-first execution gate. Net expectancy already includes fees/slippage;
+                        // this enforces a separate fair-vs-market gap buffer for model uncertainty.
+                        let divergence_min_floor = std::env::var("BTC_5M_DIVERGENCE_MIN_FLOOR")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(0.03)
+                            .clamp(0.0, 0.20);
+                        let divergence_spread_mult = std::env::var("BTC_5M_DIVERGENCE_SPREAD_MULT")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(0.40)
+                            .clamp(0.0, 2.0);
+                        let divergence_vol_mult = std::env::var("BTC_5M_DIVERGENCE_VOL_MULT")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(0.30)
+                            .clamp(0.0, 2.0);
+                        let divergence_uncertainty_bps = std::env::var("BTC_5M_DIVERGENCE_UNCERTAINTY_BPS")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(12.0)
+                            .clamp(0.0, 300.0);
+                        let sigma_term = (sigma * tte_years.sqrt()).clamp(0.0, 1.0);
+                        let required_divergence = (
+                            divergence_min_floor
+                                + (divergence_uncertainty_bps / 10_000.0)
+                                + (divergence_spread_mult * best_spread)
+                                + (divergence_vol_mult * sigma_term)
+                        )
+                            .clamp(0.0, 0.25);
+                        let fair_market_divergence = (best_prob - best_price).clamp(-1.0, 1.0);
+                        let divergence_ok = fair_market_divergence >= required_divergence;
 
                         // Hard coinflip exclusion zone: entries within this band of 0.50
                         // are NEVER taken. At 0.50, the market correctly prices a coinflip
@@ -2369,8 +2480,10 @@ impl Strategy for Btc5mLagStrategy {
                         // Seasonality > 1.0 means favorable window: lower threshold.
                         let effective_min_edge = (threshold_before_seasonality / seasonality).max(0.0);
 
-                        let passes_threshold = parity_ok
+                        let passes_threshold = freshness_ok
+                            && parity_ok
                             && best_price_ok
+                            && divergence_ok
                             && !coinflip_blocked
                             && best_net_expected >= effective_min_edge;
 
@@ -2407,7 +2520,16 @@ impl Strategy for Btc5mLagStrategy {
                         let dynamic_size_scale = (kelly_scale * edge_scale).clamp(0.10, 1.0);
 
                         let best_side_label = match best_side { Side::Up => "UP", Side::Down => "DOWN" };
-                        let reason = if !parity_ok {
+                        let reason = if !freshness_ok {
+                            format!(
+                                "Freshness gate blocked entry (spot={}ms>{}ms or yes/no age {}ms/{}ms>{}ms)",
+                                spot_age_for_gate_ms,
+                                spot_max_age_ms,
+                                yes_book_age_ms,
+                                no_book_age_ms,
+                                book_max_age_ms,
+                            )
+                        } else if !parity_ok {
                             format!(
                                 "YES+NO mid sum {:.4} deviates from parity by {:.2}c (> {:.2}c)",
                                 yes_no_mid_sum,
@@ -2422,6 +2544,17 @@ impl Strategy for Btc5mLagStrategy {
                                 MIN_ENTRY_PRICE * 100.0,
                                 MAX_ENTRY_PRICE * 100.0,
                                 best_spread * 100.0,
+                            )
+                        } else if !divergence_ok {
+                            format!(
+                                "{} fair/market divergence {:.1}bps below required {:.1}bps (floor {:.1} + uncertainty {:.1} + spread {:.1} + vol {:.1})",
+                                best_side_label,
+                                fair_market_divergence * 10_000.0,
+                                required_divergence * 10_000.0,
+                                divergence_min_floor * 10_000.0,
+                                divergence_uncertainty_bps,
+                                (divergence_spread_mult * best_spread) * 10_000.0,
+                                (divergence_vol_mult * sigma_term) * 10_000.0,
                             )
                         } else if coinflip_blocked {
                             format!(
@@ -2500,6 +2633,14 @@ impl Strategy for Btc5mLagStrategy {
                                 "fair_yes": fair_yes,
                                 "fair_no": fair_no,
                                 "sigma_annualized": sigma,
+                                "sigma_realized_annualized": realized_sigma.unwrap_or(-1.0),
+                                "sigma_implied_annualized": implied_sigma.unwrap_or(-1.0),
+                                "sigma_iv_blend_weight": sigma_iv_weight,
+                                "sigma_iv_source": iv_snapshot.as_ref().map(|iv| iv.source.clone()).unwrap_or_else(|| "NONE".to_string()),
+                                "sigma_iv_age_ms": iv_age_ms,
+                                "sigma_iv_fresh": iv_is_fresh,
+                                "sigma_iv_sample_count": iv_snapshot.as_ref().map(|iv| iv.sample_count).unwrap_or(0),
+                                "sigma_iv_median_tte_years": iv_snapshot.as_ref().map(|iv| iv.median_tte_years).unwrap_or(0.0),
                                 "tte_years": tte_years,
                                 "yes_bid": book.yes.best_bid,
                                 "yes_ask": book.yes.best_ask,
@@ -2518,6 +2659,13 @@ impl Strategy for Btc5mLagStrategy {
                                 "best_prob": best_prob,
                                 "best_expected_roi": best_expected,
                                 "best_net_expected_roi": best_net_expected,
+                                "fair_market_divergence_bps": fair_market_divergence * 10_000.0,
+                                "required_divergence_bps": required_divergence * 10_000.0,
+                                "divergence_ok": divergence_ok,
+                                "divergence_floor_bps": divergence_min_floor * 10_000.0,
+                                "divergence_uncertainty_bps": divergence_uncertainty_bps,
+                                "divergence_spread_component_bps": (divergence_spread_mult * best_spread) * 10_000.0,
+                                "divergence_vol_component_bps": (divergence_vol_mult * sigma_term) * 10_000.0,
                                 "kelly_fraction": kelly,
                                 "kelly_scale": kelly_scale,
                                 "edge_scale": edge_scale,
@@ -2537,6 +2685,12 @@ impl Strategy for Btc5mLagStrategy {
                                 "min_expected_net_return": effective_min_edge,
                                 "coinflip_blocked": coinflip_blocked,
                                 "coinflip_block_band": coinflip_block_band,
+                                "freshness_ok": freshness_ok,
+                                "spot_age_ms": spot_age_for_gate_ms,
+                                "spot_age_max_ms": spot_max_age_ms,
+                                "yes_book_age_ms": yes_book_age_ms,
+                                "no_book_age_ms": no_book_age_ms,
+                                "book_age_max_ms": book_max_age_ms,
                                 "fair_price_penalty_bps": fair_price_penalty * 10_000.0,
                                 "momentum_penalty_bps": momentum_penalty * 10_000.0,
                                 "momentum_label": momentum_label,
@@ -2582,7 +2736,7 @@ impl Strategy for Btc5mLagStrategy {
                                     clear_open_position(&mut conn, self.strategy_id()).await;
                                 }
                             }
-                            if passes_threshold && now_ms - last_live_preview_ms >= LIVE_PREVIEW_COOLDOWN_MS {
+                            if passes_threshold && now_ms - last_live_preview_ms >= live_preview_cooldown_ms {
                                 let available_cash = read_sim_available_cash(&mut conn).await;
                                 let risk_cfg = read_risk_config(&mut conn).await;
                                 let raw_size = compute_strategy_bet_size(
@@ -2619,9 +2773,17 @@ impl Strategy for Btc5mLagStrategy {
                                             "dynamic_size_scale": dynamic_size_scale,
                                             "raw_size": raw_size,
                                             "effective_threshold": effective_min_edge,
-                                            "spot_age_ms": now_ms.saturating_sub(spot_ts_ms),
-                                            "yes_book_age_ms": now_ms.saturating_sub(book.yes_update_ms),
-                                            "no_book_age_ms": now_ms.saturating_sub(book.no_update_ms),
+                                            "spot_age_ms": spot_age_for_gate_ms,
+                                            "yes_book_age_ms": yes_book_age_ms,
+                                            "no_book_age_ms": no_book_age_ms,
+                                            "freshness_ok": freshness_ok,
+                                            "fair_market_divergence_bps": fair_market_divergence * 10_000.0,
+                                            "required_divergence_bps": required_divergence * 10_000.0,
+                                            "divergence_ok": divergence_ok,
+                                            "sigma_realized_annualized": realized_sigma.unwrap_or(-1.0),
+                                            "sigma_implied_annualized": implied_sigma.unwrap_or(-1.0),
+                                            "sigma_iv_fresh": iv_is_fresh,
+                                            "sigma_iv_age_ms": iv_age_ms,
                                             "ml_features_age_ms": ml_age_ms.unwrap_or(-1),
                                             "model_signal_label": model_signal_label,
                                             "model_signal_confidence": model_signal_confidence,
@@ -2721,9 +2883,17 @@ impl Strategy for Btc5mLagStrategy {
                                         "dynamic_size_scale": dynamic_size_scale,
                                         "raw_size": raw_size,
                                         "effective_threshold": effective_min_edge,
-                                        "spot_age_ms": now_ms.saturating_sub(spot_ts_ms),
-                                        "yes_book_age_ms": now_ms.saturating_sub(book.yes_update_ms),
-                                        "no_book_age_ms": now_ms.saturating_sub(book.no_update_ms),
+                                        "spot_age_ms": spot_age_for_gate_ms,
+                                        "yes_book_age_ms": yes_book_age_ms,
+                                        "no_book_age_ms": no_book_age_ms,
+                                        "freshness_ok": freshness_ok,
+                                        "fair_market_divergence_bps": fair_market_divergence * 10_000.0,
+                                        "required_divergence_bps": required_divergence * 10_000.0,
+                                        "divergence_ok": divergence_ok,
+                                        "sigma_realized_annualized": realized_sigma.unwrap_or(-1.0),
+                                        "sigma_implied_annualized": implied_sigma.unwrap_or(-1.0),
+                                        "sigma_iv_fresh": iv_is_fresh,
+                                        "sigma_iv_age_ms": iv_age_ms,
                                         "ml_features_age_ms": ml_age_ms.unwrap_or(-1),
                                         "seasonality_multiplier": seasonality,
                                         "sigma_annualized": sigma,

@@ -776,12 +776,18 @@ const OPTIONAL_SCANNER_HEARTBEAT_IDS = new Set<string>(
         .filter((value) => value.length > 0),
 );
 const STRATEGY_HEARTBEAT_ID_MAP: Record<string, string> = {
+    BTC_1M: 'btc_1m',
     BTC_5M: 'btc_5m',
     BTC_15M: 'btc_15m',
+    ETH_1M: 'eth_1m',
     ETH_5M: 'eth_5m',
     ETH_15M: 'eth_15m',
+    SOL_1M: 'sol_1m',
     SOL_5M: 'sol_5m',
     SOL_15M: 'sol_15m',
+    XRP_1M: 'xrp_1m',
+    XRP_5M: 'xrp_5m',
+    XRP_15M: 'xrp_15m',
     CEX_SNIPER: 'cex_arb',
     SYNDICATE: 'SYNDICATE',
     ATOMIC_ARB: 'atomic_arb',
@@ -913,11 +919,21 @@ type ExecutionPreparationResult = {
     reason?: string;
     details?: Record<string, unknown>;
 };
-const DEFAULT_CROSS_HORIZON_STRATEGY_PAIRS: Array<{ asset: string; fast: string; slow: string }> = [
-    { asset: 'BTC', fast: 'BTC_5M', slow: 'BTC_15M' },
-    { asset: 'ETH', fast: 'ETH_5M', slow: 'ETH_15M' },
-    { asset: 'SOL', fast: 'SOL_5M', slow: 'SOL_15M' },
-];
+const DEFAULT_CROSS_HORIZON_STRATEGY_PAIRS: Array<{ asset: string; fast: string; slow: string }> = (() => {
+    const pairs: Array<{ asset: string; fast: string; slow: string }> = [];
+    for (const asset of ['BTC', 'ETH', 'SOL', 'XRP']) {
+        const fast = `${asset}_5M`;
+        const slow = `${asset}_15M`;
+        if (STRATEGY_IDS.includes(fast) && STRATEGY_IDS.includes(slow)) {
+            pairs.push({ asset, fast, slow });
+        }
+        const ultraFast = `${asset}_1M`;
+        if (STRATEGY_IDS.includes(ultraFast) && STRATEGY_IDS.includes(fast)) {
+            pairs.push({ asset, fast: ultraFast, slow: fast });
+        }
+    }
+    return pairs;
+})();
 function parseCrossHorizonStrategyPairs(raw: string | null | undefined): Array<{ asset: string; fast: string; slow: string }> {
     const fallback = DEFAULT_CROSS_HORIZON_STRATEGY_PAIRS.filter((pair) => (
         STRATEGY_IDS.includes(pair.fast) && STRATEGY_IDS.includes(pair.slow) && pair.fast !== pair.slow
@@ -1147,14 +1163,7 @@ function parseMetricDirection(input: unknown): MetricDirection | null {
 
 function strategyFamily(strategyRaw: string): string {
     const strategy = strategyRaw.trim().toUpperCase();
-    if (
-        strategy === 'BTC_5M'
-        || strategy === 'BTC_15M'
-        || strategy === 'ETH_5M'
-        || strategy === 'ETH_15M'
-        || strategy === 'SOL_5M'
-        || strategy === 'SOL_15M'
-    ) {
+    if (/^(BTC|ETH|SOL|XRP)_(1M|5M|15M)$/.test(strategy)) {
         return 'FAIR_VALUE';
     }
     if (strategy === 'ATOMIC_ARB' || strategy === 'GRAPH_ARB') {
@@ -1183,14 +1192,17 @@ function strategyFamily(strategyRaw: string): string {
 
 function strategyUnderlying(strategyRaw: string): string {
     const strategy = strategyRaw.trim().toUpperCase();
-    if (strategy === 'BTC_5M' || strategy === 'BTC_15M') {
+    if (strategy.startsWith('BTC_')) {
         return 'BTC';
     }
-    if (strategy === 'ETH_5M' || strategy === 'ETH_15M') {
+    if (strategy.startsWith('ETH_')) {
         return 'ETH';
     }
-    if (strategy === 'SOL_5M' || strategy === 'SOL_15M') {
+    if (strategy.startsWith('SOL_')) {
         return 'SOL';
+    }
+    if (strategy.startsWith('XRP_')) {
+        return 'XRP';
     }
     if (strategy === 'CEX_SNIPER' || strategy === 'OBI_SCALPER') {
         return 'BTC';

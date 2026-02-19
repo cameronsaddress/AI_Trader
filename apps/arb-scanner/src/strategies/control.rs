@@ -278,7 +278,10 @@ fn global_utilization_cap_pct() -> f64 {
 
 pub fn strategy_family(strategy_id: &str) -> &'static str {
     match strategy_id.trim().to_uppercase().as_str() {
-        "BTC_5M" | "BTC_15M" | "ETH_5M" | "ETH_15M" | "SOL_5M" | "SOL_15M" => "FAIR_VALUE",
+        "BTC_1M" | "BTC_5M" | "BTC_15M"
+            | "ETH_1M" | "ETH_5M" | "ETH_15M"
+            | "SOL_1M" | "SOL_5M" | "SOL_15M"
+            | "XRP_1M" | "XRP_5M" | "XRP_15M" => "FAIR_VALUE",
         "ATOMIC_ARB" | "GRAPH_ARB" => "ARBITRAGE",
         "CEX_SNIPER" => "CEX_MICROSTRUCTURE",
         "OBI_SCALPER" => "ORDER_FLOW",
@@ -293,9 +296,10 @@ pub fn strategy_family(strategy_id: &str) -> &'static str {
 
 pub fn strategy_underlying(strategy_id: &str) -> &'static str {
     match strategy_id.trim().to_uppercase().as_str() {
-        "BTC_5M" | "BTC_15M" => "BTC",
-        "ETH_5M" | "ETH_15M" => "ETH",
-        "SOL_5M" | "SOL_15M" => "SOL",
+        "BTC_1M" | "BTC_5M" | "BTC_15M" => "BTC",
+        "ETH_1M" | "ETH_5M" | "ETH_15M" => "ETH",
+        "SOL_1M" | "SOL_5M" | "SOL_15M" => "SOL",
+        "XRP_1M" | "XRP_5M" | "XRP_15M" => "XRP",
         "CEX_SNIPER" | "OBI_SCALPER" => "BTC",
         "ATOMIC_ARB" | "GRAPH_ARB" | "CONVERGENCE_CARRY" | "MAKER_MM"
             | "AS_MARKET_MAKER" | "LONGSHOT_BIAS" | "SYNDICATE" => "POLY_EVENT",
@@ -1150,8 +1154,10 @@ mod tests {
 
     #[test]
     fn strategy_family_maps_known_ids() {
+        assert_eq!(strategy_family("BTC_1M"), "FAIR_VALUE");
         assert_eq!(strategy_family("BTC_5M"), "FAIR_VALUE");
         assert_eq!(strategy_family("BTC_15M"), "FAIR_VALUE");
+        assert_eq!(strategy_family("XRP_5M"), "FAIR_VALUE");
         assert_eq!(strategy_family("ATOMIC_ARB"), "ARBITRAGE");
         assert_eq!(strategy_family("OBI_SCALPER"), "ORDER_FLOW");
         assert_eq!(strategy_family("MAKER_MM"), "MARKET_MAKING");
@@ -1160,10 +1166,12 @@ mod tests {
 
     #[test]
     fn strategy_underlying_maps_known_ids() {
+        assert_eq!(strategy_underlying("BTC_1M"), "BTC");
         assert_eq!(strategy_underlying("BTC_5M"), "BTC");
         assert_eq!(strategy_underlying("BTC_15M"), "BTC");
         assert_eq!(strategy_underlying("ETH_15M"), "ETH");
         assert_eq!(strategy_underlying("SOL_15M"), "SOL");
+        assert_eq!(strategy_underlying("XRP_5M"), "XRP");
         assert_eq!(strategy_underlying("CEX_SNIPER"), "BTC");
         assert_eq!(strategy_underlying("MAKER_MM"), "POLY_EVENT");
         assert_eq!(strategy_underlying("AS_MARKET_MAKER"), "POLY_EVENT");
