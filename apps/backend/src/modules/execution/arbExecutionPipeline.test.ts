@@ -116,9 +116,11 @@ describe('processArbitrageExecutionWorker', () => {
         });
         const preflightSpy = deps.preflightFromExecution as jest.Mock;
 
-        await processArbitrageExecutionWorker(buildContext(), deps);
+        const result = await processArbitrageExecutionWorker(buildContext(), deps);
 
         expect(preflightSpy).not.toHaveBeenCalled();
+        expect(result.decision).toBe('REJECTED');
+        expect(result.stage).toBe('INTELLIGENCE_GATE');
         expect(emitCalls.some((entry) => entry.event === 'strategy_intelligence_block')).toBe(true);
         expect(rejected).toHaveLength(1);
         expect(rejected[0]?.stage).toBe('INTELLIGENCE_GATE');
@@ -139,9 +141,11 @@ describe('processArbitrageExecutionWorker', () => {
             preflightFromExecution: preflightSpy,
         });
 
-        await processArbitrageExecutionWorker(context, deps);
+        const result = await processArbitrageExecutionWorker(context, deps);
 
         expect(preflightSpy).not.toHaveBeenCalled();
+        expect(result.decision).toBe('REJECTED');
+        expect(result.stage).toBe('INTELLIGENCE_GATE');
         expect(emitCalls.some((entry) => entry.event === 'execution_invariant_alert')).toBe(true);
         expect(rejected.some((entry) => entry.reason.includes('[ENTRY_INVARIANT]'))).toBe(true);
     });
@@ -162,12 +166,32 @@ describe('processArbitrageExecutionWorker', () => {
         });
         const preflightSpy = deps.preflightFromExecution as jest.Mock;
 
-        await processArbitrageExecutionWorker(buildContext(), deps);
+        const result = await processArbitrageExecutionWorker(buildContext(), deps);
 
         expect(preflightSpy).not.toHaveBeenCalled();
+        expect(result.decision).toBe('REJECTED');
+        expect(result.stage).toBe('MODEL_GATE');
         expect(emitCalls.some((entry) => entry.event === 'strategy_model_block')).toBe(true);
         expect(rejected).toHaveLength(1);
         expect(rejected[0]?.stage).toBe('MODEL_GATE');
+    });
+
+    it('bypasses preflight/live stages in PAPER mode and accepts immediately', async () => {
+        const preflightSpy = jest.fn(async () => buildPreflight());
+        const executeSpy = jest.fn(async () => buildLiveExecution());
+        const { deps, emitCalls } = createDeps({
+            getTradingMode: async () => 'PAPER',
+            preflightFromExecution: preflightSpy,
+            executeFromExecution: executeSpy,
+        });
+
+        const result = await processArbitrageExecutionWorker(buildContext(), deps);
+
+        expect(result.decision).toBe('ACCEPTED');
+        expect(result.stage).toBe('NONE');
+        expect(preflightSpy).not.toHaveBeenCalled();
+        expect(executeSpy).not.toHaveBeenCalled();
+        expect(emitCalls.some((entry) => entry.event === 'strategy_preflight')).toBe(false);
     });
 
     it('handles preflight bypass when there is no polymarket payload', async () => {
@@ -177,9 +201,10 @@ describe('processArbitrageExecutionWorker', () => {
             executeFromExecution: executeSpy,
         });
 
-        await processArbitrageExecutionWorker(buildContext(), deps);
+        const result = await processArbitrageExecutionWorker(buildContext(), deps);
 
         expect(executeSpy).toHaveBeenCalledTimes(1);
+        expect(result.decision).toBe('ACCEPTED');
         expect(emitCalls.some((entry) => entry.event === 'strategy_preflight')).toBe(false);
     });
 
@@ -196,8 +221,9 @@ describe('processArbitrageExecutionWorker', () => {
             emitSettlementEvents: emitSettlementSpy,
         });
 
-        await processArbitrageExecutionWorker(buildContext(), deps);
+        const result = await processArbitrageExecutionWorker(buildContext(), deps);
 
+        expect(result.decision).toBe('ACCEPTED');
         expect(emitCalls.some((entry) => entry.event === 'strategy_preflight')).toBe(true);
         expect(emitCalls.some((entry) => entry.event === 'strategy_live_execution')).toBe(true);
         expect(settlementSpy).toHaveBeenCalledTimes(1);
@@ -215,8 +241,10 @@ describe('processArbitrageExecutionWorker', () => {
             executeFromExecution: executeSpy,
         });
 
-        await processArbitrageExecutionWorker(buildContext(), deps);
+        const result = await processArbitrageExecutionWorker(buildContext(), deps);
 
+        expect(result.decision).toBe('REJECTED');
+        expect(result.stage).toBe('PREFLIGHT');
         expect(executeSpy).not.toHaveBeenCalled();
         expect(rejected.some((entry) => entry.stage === 'PREFLIGHT')).toBe(true);
     });
@@ -232,8 +260,10 @@ describe('processArbitrageExecutionWorker', () => {
             executeFromExecution: executeSpy,
         });
 
-        await processArbitrageExecutionWorker(buildContext(), deps);
+        const result = await processArbitrageExecutionWorker(buildContext(), deps);
 
+        expect(result.decision).toBe('REJECTED');
+        expect(result.stage).toBe('PREFLIGHT');
         expect(executeSpy).not.toHaveBeenCalled();
         expect(rejected.some((entry) => entry.stage === 'PREFLIGHT')).toBe(true);
         expect(rejected.some((entry) => entry.reason.includes('throttled'))).toBe(true);
@@ -248,8 +278,10 @@ describe('processArbitrageExecutionWorker', () => {
             }),
         });
 
-        await processArbitrageExecutionWorker(buildContext(), deps);
+        const result = await processArbitrageExecutionWorker(buildContext(), deps);
 
+        expect(result.decision).toBe('REJECTED');
+        expect(result.stage).toBe('LIVE_EXECUTION');
         expect(rejected.some((entry) => entry.stage === 'LIVE_EXECUTION')).toBe(true);
     });
 
@@ -264,8 +296,9 @@ describe('processArbitrageExecutionWorker', () => {
             registerAtomicExecution: settlementSpy,
         });
 
-        await processArbitrageExecutionWorker(buildContext(), deps);
+        const result = await processArbitrageExecutionWorker(buildContext(), deps);
 
+        expect(result.decision).toBe('ACCEPTED');
         expect(settlementSpy).not.toHaveBeenCalled();
     });
 
@@ -276,7 +309,9 @@ describe('processArbitrageExecutionWorker', () => {
             },
         });
 
-        await expect(processArbitrageExecutionWorker(buildContext(), deps)).resolves.toBeUndefined();
+        const result = await processArbitrageExecutionWorker(buildContext(), deps);
+        expect(result.decision).toBe('REJECTED');
+        expect(result.stage).toBe('PREFLIGHT');
         expect(rejected.some((entry) => entry.stage === 'PREFLIGHT')).toBe(true);
         expect(rejected.some((entry) => entry.reason.includes('preflight error'))).toBe(true);
     });
@@ -289,7 +324,9 @@ describe('processArbitrageExecutionWorker', () => {
             },
         });
 
-        await expect(processArbitrageExecutionWorker(buildContext(), deps)).resolves.toBeUndefined();
+        const result = await processArbitrageExecutionWorker(buildContext(), deps);
+        expect(result.decision).toBe('REJECTED');
+        expect(result.stage).toBe('LIVE_EXECUTION');
         expect(rejected.some((entry) => entry.stage === 'LIVE_EXECUTION')).toBe(true);
         expect(rejected.some((entry) => entry.reason.includes('live execution error'))).toBe(true);
     });
@@ -301,8 +338,36 @@ describe('processArbitrageExecutionWorker', () => {
             },
         });
 
-        await expect(processArbitrageExecutionWorker(buildContext(), deps)).resolves.toBeUndefined();
+        const result = await processArbitrageExecutionWorker(buildContext(), deps);
+        expect(result.decision).toBe('ACCEPTED');
+        expect(result.stage).toBe('NONE');
         expect(rejected.some((entry) => entry.stage === 'SETTLEMENT')).toBe(true);
         expect(rejected.some((entry) => entry.reason.includes('settlement error'))).toBe(true);
+    });
+
+    it('enqueues settlement DLQ and sends ops alert when settlement registration fails', async () => {
+        const enqueueSpy = jest.fn(async () => undefined);
+        const notifySpy = jest.fn(async () => undefined);
+        const { deps } = createDeps({
+            registerAtomicExecution: async () => {
+                throw new Error('redis unavailable');
+            },
+            enqueueSettlementDlq: enqueueSpy,
+            notifyOps: notifySpy,
+        });
+
+        const result = await processArbitrageExecutionWorker(buildContext(), deps);
+
+        expect(result.decision).toBe('ACCEPTED');
+        expect(enqueueSpy).toHaveBeenCalledTimes(1);
+        const [enqueueCall] = enqueueSpy.mock.calls as Array<Array<unknown>>;
+        const dlqEntry = enqueueCall?.[0] as { execution_id?: string; strategy?: string } | undefined;
+        expect(dlqEntry?.execution_id).toBe('exec-1');
+        expect(dlqEntry?.strategy).toBe('ATOMIC_ARB');
+        expect(notifySpy).toHaveBeenCalledTimes(1);
+        const [notifyCall] = notifySpy.mock.calls as Array<Array<unknown>>;
+        const alert = notifyCall?.[0] as { scope?: string; severity?: string } | undefined;
+        expect(alert?.scope).toBe('SETTLEMENT');
+        expect(alert?.severity).toBe('CRITICAL');
     });
 });

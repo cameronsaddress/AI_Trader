@@ -9,9 +9,10 @@ services:
     environment:
       - NODE_ENV=development
       - PORT=5114
-      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/ai_trader
-      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-ai_trader}
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - CONTROL_PLANE_TOKEN=${CONTROL_PLANE_TOKEN}
+      - READ_API_TOKEN=${READ_API_TOKEN:-}
       - LIVE_ORDER_POSTING_ENABLED=${LIVE_ORDER_POSTING_ENABLED:-false}
       - PRIVATE_KEY=${PRIVATE_KEY:-}
       - POLY_PRIVATE_KEY=${POLY_PRIVATE_KEY:-}
@@ -72,7 +73,7 @@ services:
       timeout: 8s
       retries: 5
       start_period: 45s
-    mem_limit: 1g
+    mem_limit: 2g
 
   frontend:
     build:
@@ -97,34 +98,96 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: ai_trader
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_trader}
     ports:
-      - "5544:5432"
+      - "127.0.0.1:5544:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    command: redis-server --appendonly yes --appendfsync everysec --save 900 1 --save 300 10
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+    command: /bin/sh -c "redis-server --appendonly yes --appendfsync always --save 900 1 --save 300 10 --requirepass \"$$REDIS_PASSWORD\""
     ports:
-      - "6491:6379"
+      - "127.0.0.1:6491:6379"
     volumes:
       - redis_data:/data
     restart: unless-stopped
     mem_limit: 1g
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  redis-backup:
+    profiles: ["ops"]
+    image: alpine:3.20
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
+      - REDIS_BACKUP_DIR=/backups
+      - REDIS_BACKUP_INTERVAL_SEC=${REDIS_BACKUP_INTERVAL_SEC:-300}
+      - REDIS_BACKUP_KEEP=${REDIS_BACKUP_KEEP:-288}
+      - REDIS_BACKUP_S3_URI=${REDIS_BACKUP_S3_URI:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../scripts/redis_backup.sh:/usr/local/bin/redis_backup.sh:ro
+      - ../scripts/redis_backup_loop.sh:/usr/local/bin/redis_backup_loop.sh:ro
+      - ../backups/redis:/backups
+    command: >
+      /bin/sh -c
+      "apk add --no-cache bash redis aws-cli >/dev/null
+      && /usr/local/bin/redis_backup_loop.sh"
+    restart: unless-stopped
+    mem_limit: 256m
+
+  postgres-backup:
+    profiles: ["ops"]
+    image: alpine:3.20
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      - POSTGRES_DB=${POSTGRES_DB:-ai_trader}
+      - POSTGRES_BACKUP_DIR=/backups
+      - POSTGRES_BACKUP_INTERVAL_SEC=${POSTGRES_BACKUP_INTERVAL_SEC:-900}
+      - POSTGRES_BACKUP_KEEP=${POSTGRES_BACKUP_KEEP:-168}
+      - POSTGRES_BACKUP_S3_URI=${POSTGRES_BACKUP_S3_URI:-}
+      - POSTGRES_BACKUP_S3_RETRIES=${POSTGRES_BACKUP_S3_RETRIES:-3}
+      - POSTGRES_BACKUP_S3_RETRY_DELAY_SEC=${POSTGRES_BACKUP_S3_RETRY_DELAY_SEC:-3}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../scripts/postgres_backup.sh:/usr/local/bin/postgres_backup.sh:ro
+      - ../scripts/postgres_backup_loop.sh:/usr/local/bin/postgres_backup_loop.sh:ro
+      - ../backups/postgres:/backups
+    command: >
+      /bin/sh -c
+      "apk add --no-cache bash postgresql-client aws-cli >/dev/null
+      && /usr/local/bin/postgres_backup_loop.sh"
+    restart: unless-stopped
+    mem_limit: 256m
 
   ml-service:
     build:
@@ -133,7 +196,7 @@ services:
     ports:
       - "8112:8112"
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
     depends_on:
       - redis
     volumes:
@@ -155,6 +218,7 @@ services:
       context: ../apps/arb-scanner
       dockerfile: Dockerfile
       target: dev
+    user: "0:0"
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -172,11 +236,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=BTC_15M
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
@@ -186,7 +249,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -200,11 +263,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=BTC_5M
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
@@ -245,7 +307,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -259,11 +321,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=ETH_15M
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - ETH_15M_MAX_SPOT_AGE_MS=2200
       - ETH_15M_MAX_BOOK_AGE_MS=1500
@@ -280,7 +341,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -294,11 +355,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=ETH_5M
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
@@ -317,7 +377,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -331,11 +391,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=SOL_15M
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SOL_15M_MAX_SPOT_AGE_MS=2400
       - SOL_15M_MAX_BOOK_AGE_MS=1600
@@ -351,7 +410,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -365,11 +424,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=SOL_5M
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
@@ -387,7 +445,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -402,12 +460,11 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=XRP_15M
       - STRATEGY_VARIANT=baseline
       - ENABLE_XRP_STRATEGIES=true
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - XRP_15M_MAX_SPOT_AGE_MS=2400
       - XRP_15M_MAX_BOOK_AGE_MS=1600
@@ -423,7 +480,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -438,12 +495,11 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=XRP_5M
       - STRATEGY_VARIANT=baseline
       - ENABLE_XRP_STRATEGIES=true
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
@@ -461,7 +517,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -476,12 +532,11 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=BTC_1M
       - STRATEGY_VARIANT=baseline
       - ENABLE_ONE_MINUTE_STRATEGIES=true
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - BTC_1M_MAX_SPOT_AGE_MS=900
       - BTC_1M_MAX_BOOK_AGE_MS=700
@@ -498,7 +553,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -513,12 +568,11 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=ETH_1M
       - STRATEGY_VARIANT=baseline
       - ENABLE_ONE_MINUTE_STRATEGIES=true
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - ETH_1M_MAX_SPOT_AGE_MS=950
       - ETH_1M_MAX_BOOK_AGE_MS=700
@@ -535,7 +589,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -550,12 +604,11 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=SOL_1M
       - STRATEGY_VARIANT=baseline
       - ENABLE_ONE_MINUTE_STRATEGIES=true
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SOL_1M_MAX_SPOT_AGE_MS=1000
       - SOL_1M_MAX_BOOK_AGE_MS=750
@@ -571,7 +624,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -586,13 +639,12 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=XRP_1M
       - STRATEGY_VARIANT=baseline
       - ENABLE_XRP_STRATEGIES=true
       - ENABLE_ONE_MINUTE_STRATEGIES=true
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - XRP_1M_MAX_SPOT_AGE_MS=1000
       - XRP_1M_MAX_BOOK_AGE_MS=750
@@ -608,7 +660,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -622,11 +674,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=CEX_ARB
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
     dns:
       - 8.8.8.8
@@ -634,7 +685,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -648,11 +699,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=COPY_BOT
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
     dns:
       - 8.8.8.8
@@ -660,7 +710,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -674,11 +724,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=ATOMIC_ARB
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
@@ -690,7 +739,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -704,11 +753,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=OBI_SCALPER
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
     dns:
       - 8.8.8.8
@@ -716,7 +764,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -730,11 +778,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=GRAPH_ARB
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
@@ -747,7 +794,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -761,11 +808,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=CONVERGENCE_CARRY
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
@@ -777,7 +823,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -791,11 +837,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=MAKER_MM
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
@@ -806,7 +851,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -820,11 +865,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=AS_MARKET_MAKER
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
@@ -839,7 +883,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target
@@ -853,11 +897,10 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       - RUST_LOG=info
       - STRATEGY_TYPE=LONGSHOT_BIAS
       - STRATEGY_VARIANT=baseline
-      - PRIVATE_KEY=${PRIVATE_KEY}
       - PROXY_WALLET_ADDRESS=${PROXY_WALLET_ADDRESS}
       - SIM_FEE_BPS_PER_SIDE=0
       - SIM_SLIPPAGE_BPS_PER_SIDE=2
@@ -870,7 +913,7 @@ services:
       arb-builder:
         condition: service_completed_successfully
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ../apps/arb-scanner:/usr/src/app
       - arb_target:/usr/src/app/target

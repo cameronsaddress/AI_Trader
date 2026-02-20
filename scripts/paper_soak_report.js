@@ -33,6 +33,7 @@ const MIN_EDGE_CAPTURE_RATIO = Number(process.env.SOAK_MIN_EDGE_CAPTURE_RATIO ||
 const MIN_NET_PNL_USD = Number(process.env.SOAK_MIN_NET_PNL_USD || '0');
 const MAX_REJECT_RATE_PCT = Number(process.env.SOAK_MAX_REJECT_RATE_PCT || '20');
 const MAX_STALE_FORCED_CLOSES = Math.max(0, Number(process.env.SOAK_MAX_STALE_FORCED_CLOSES || '0'));
+const MAX_NEGATIVE_TAKE_PROFIT_CLOSES = Math.max(0, Number(process.env.SOAK_MAX_NEGATIVE_TAKE_PROFIT_CLOSES || '0'));
 
 if (!CONTROL_PLANE_TOKEN) {
     console.error('CONTROL_PLANE_TOKEN is required');
@@ -178,6 +179,7 @@ function summarizeTrades(rows) {
     let costDragSum = 0;
     let costDragSamples = 0;
     let staleForcedCloses = 0;
+    let negativeTakeProfitCloses = 0;
 
     for (const row of rows) {
         tradeCount += 1;
@@ -199,6 +201,9 @@ function summarizeTrades(rows) {
             || row.closure_class === 'FORCED'
         ) {
             staleForcedCloses += 1;
+        }
+        if (row.reason.includes('TAKE_PROFIT') && row.net_return < 0) {
+            negativeTakeProfitCloses += 1;
         }
 
         if (row.gross_return !== null) {
@@ -238,6 +243,7 @@ function summarizeTrades(rows) {
         edge_capture_ratio: edgeCaptureRatio,
         avg_cost_drag_bps: avgCostDragBps,
         stale_forced_closes: staleForcedCloses,
+        negative_take_profit_closes: negativeTakeProfitCloses,
         by_strategy: byStrategy,
     };
 }
@@ -324,6 +330,13 @@ function buildChecks(metrics) {
         threshold: MAX_STALE_FORCED_CLOSES,
     };
 
+    checks.no_negative_take_profit_closes = {
+        ok: (metrics.trades.negative_take_profit_closes || 0) <= MAX_NEGATIVE_TAKE_PROFIT_CLOSES,
+        skipped: false,
+        actual: metrics.trades.negative_take_profit_closes || 0,
+        threshold: MAX_NEGATIVE_TAKE_PROFIT_CLOSES,
+    };
+
     checks.reject_rate = metrics.rejected_signals.preflight_reject_rate_pct === null
         ? {
             ok: true,
@@ -374,6 +387,7 @@ function toMarkdown(report) {
     lines.push(`- Edge Capture Ratio: ${report.metrics.trades.edge_capture_ratio === null ? 'n/a' : report.metrics.trades.edge_capture_ratio.toFixed(3)}`);
     lines.push(`- Net PnL: $${Number(report.metrics.trades.net_pnl || 0).toFixed(2)}`);
     lines.push(`- Stale Forced Closes: ${report.metrics.trades.stale_forced_closes || 0}`);
+    lines.push(`- Negative TAKE_PROFIT Closes: ${report.metrics.trades.negative_take_profit_closes || 0}`);
     lines.push(`- Reject Rate: ${report.metrics.rejected_signals.preflight_reject_rate_pct === null ? 'n/a' : report.metrics.rejected_signals.preflight_reject_rate_pct.toFixed(2) + '%'}`);
     lines.push(`- Live Execution Events While In PAPER: ${report.metrics.activity.live_execution_events}`);
     lines.push('');
@@ -418,7 +432,7 @@ async function main() {
     }
 
     const resetTrades = await api('/api/arb/validation-trades/reset', { method: 'POST', body: {} });
-    const tradeInfo = await api('/api/arb/validation-trades', { auth: false });
+    const tradeInfo = await api('/api/arb/validation-trades', { auth: true });
     await api('/api/arb/rejected-signals/reset', { method: 'POST', body: {} });
 
     const reportedTradePath = resetTrades.json?.path || tradeInfo.json?.path || null;
@@ -517,7 +531,7 @@ async function main() {
 
     const statsOut = fs.createWriteStream(path.resolve(STATS_JSONL_PATH), { flags: 'w' });
     while (Date.now() < soakEndAt) {
-        const response = await api('/api/arb/stats', { auth: false });
+        const response = await api('/api/arb/stats', { auth: true });
         const now = Date.now();
         const stats = response.json || {};
         sampleCount += 1;
@@ -550,9 +564,10 @@ async function main() {
     const trades = parseTradeRows(tradeLogPath, runStartMs);
     const tradeSummary = summarizeTrades(trades);
 
-    const rejectedResp = await api(`/api/arb/rejected-signals?source=file&limit=${REJECTED_LIMIT}`, { auth: false });
+    const rejectedResp = await api(`/api/arb/rejected-signals?source=file&limit=${REJECTED_LIMIT}`, { auth: true });
     const rejectedEntriesRaw = Array.isArray(rejectedResp.json?.entries) ? rejectedResp.json.entries : [];
     const rejectedEntries = rejectedEntriesRaw.filter((entry) => parseTimestampMs(entry?.timestamp) >= runStartMs);
+    const preflightRejectedEntries = rejectedEntries.filter((entry) => upper(entry?.stage) === 'PREFLIGHT');
     const rejectedByStage = {};
     let rejectedShortfall = 0;
     let rejectedNetting = 0;
@@ -577,7 +592,7 @@ async function main() {
         ? (observedNetting / preflightTotal) * 100
         : null;
     const preflightRejectRate = preflightTotal > 0
-        ? (rejectedEntries.length / preflightTotal) * 100
+        ? (preflightRejectedEntries.length / preflightTotal) * 100
         : null;
 
     const finalAllocator = (lastStats && typeof lastStats.strategy_allocator === 'object')
@@ -630,6 +645,7 @@ async function main() {
         trades: tradeSummary,
         rejected_signals: {
             count: rejectedEntries.length,
+            preflight_count: preflightRejectedEntries.length,
             by_stage: rejectedByStage,
             shortfall_tagged: rejectedShortfall,
             netting_tagged: rejectedNetting,
@@ -656,6 +672,7 @@ async function main() {
             min_net_pnl_usd: MIN_NET_PNL_USD,
             max_reject_rate_pct: MAX_REJECT_RATE_PCT,
             max_stale_forced_closes: MAX_STALE_FORCED_CLOSES,
+            max_negative_take_profit_closes: MAX_NEGATIVE_TAKE_PROFIT_CLOSES,
         },
         metrics,
         checks: checkResults.checks,

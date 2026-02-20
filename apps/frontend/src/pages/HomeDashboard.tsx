@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useSocket } from '../context/SocketContext';
 import { DashboardLayout } from '../components/layout/DashboardLayout';
-import { apiUrl } from '../lib/api';
+import { apiFetch } from '../lib/api';
 import type {
   ScannerUpdateEvent,
   ExecutionLogEvent,
@@ -113,6 +113,12 @@ type RuntimeModuleState = {
 type RuntimeStatusState = {
   modules: RuntimeModuleState[];
   timestamp: number;
+};
+
+type ExecutionHaltState = {
+  halted: boolean;
+  reason: string;
+  updated_at: number;
 };
 
 const ALL_STRATEGIES = [
@@ -351,6 +357,15 @@ function parseRuntimeStatus(input: unknown): RuntimeStatusState {
   };
 }
 
+function parseExecutionHaltState(input: unknown): ExecutionHaltState {
+  const row = asRecord(input);
+  return {
+    halted: row?.halted === true,
+    reason: parseText(row?.reason) || '',
+    updated_at: parseNumber(row?.updated_at) ?? Date.now(),
+  };
+}
+
 export function HomeDashboard() {
   const { socket } = useSocket();
   const navigate = useNavigate();
@@ -371,6 +386,13 @@ export function HomeDashboard() {
   const [entryFreshnessSlo, setEntryFreshnessSlo] = useState<EntryFreshnessSloState>(emptyEntryFreshnessSloState());
   const [silentCatchTelemetry, setSilentCatchTelemetry] = useState<SilentCatchTelemetryState>({});
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatusState>({ modules: [], timestamp: 0 });
+  const [executionHalt, setExecutionHalt] = useState<ExecutionHaltState>({
+    halted: false,
+    reason: '',
+    updated_at: 0,
+  });
+  const [executionHaltBusy, setExecutionHaltBusy] = useState(false);
+  const [executionHaltError, setExecutionHaltError] = useState<string | null>(null);
   const [dataIntegrityTotalScans, setDataIntegrityTotalScans] = useState(0);
 
   useEffect(() => {
@@ -556,6 +578,11 @@ export function HomeDashboard() {
       touchData();
       setRuntimeStatus(parseRuntimeStatus(payload));
     };
+    const handleExecutionHaltUpdate = (payload: unknown) => {
+      touchData();
+      setExecutionHalt(parseExecutionHaltState(payload));
+      setExecutionHaltError(null);
+    };
     const handleSimulationReset = (payload: { bankroll?: number }) => {
       touchData();
       const resetBankroll = parseNumber(payload?.bankroll) ?? 1000;
@@ -601,6 +628,7 @@ export function HomeDashboard() {
     socket.on('silent_catch_telemetry_snapshot', handleSilentCatchSnapshot);
     socket.on('silent_catch_telemetry_update', handleSilentCatchUpdate);
     socket.on('runtime_status_update', handleRuntimeStatus);
+    socket.on('execution_halt_update', handleExecutionHaltUpdate);
     socket.on('simulation_reset', handleSimulationReset);
     socket.on('connect', requestAllState);
 
@@ -622,6 +650,7 @@ export function HomeDashboard() {
       socket.off('silent_catch_telemetry_snapshot', handleSilentCatchSnapshot);
       socket.off('silent_catch_telemetry_update', handleSilentCatchUpdate);
       socket.off('runtime_status_update', handleRuntimeStatus);
+      socket.off('execution_halt_update', handleExecutionHaltUpdate);
       socket.off('simulation_reset', handleSimulationReset);
       socket.off('connect', requestAllState);
     };
@@ -635,6 +664,32 @@ export function HomeDashboard() {
 
   useEffect(() => {
     let active = true;
+    let timer: number | null = null;
+    const refreshExecutionHalt = async () => {
+      try {
+        const res = await apiFetch('/api/system/execution-halt');
+        if (!res.ok || !active) return;
+        const payload = await res.json();
+        if (!active) return;
+        setExecutionHalt(parseExecutionHaltState(payload));
+      } catch {
+        // keep previous state on transient request failures
+      }
+    };
+    void refreshExecutionHalt();
+    timer = window.setInterval(() => {
+      void refreshExecutionHalt();
+    }, 5000);
+    return () => {
+      active = false;
+      if (timer !== null) {
+        window.clearInterval(timer);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
     let inFlight = false;
     let rerunRequested = false;
     let activeController: AbortController | null = null;
@@ -642,7 +697,7 @@ export function HomeDashboard() {
       const controller = new AbortController();
       activeController = controller;
       try {
-        const res = await fetch(apiUrl('/api/arb/stats'), { signal: controller.signal });
+        const res = await apiFetch('/api/arb/stats', { signal: controller.signal });
         if (!res.ok || !active) return;
         const payload = await res.json() as {
           entry_freshness_slo?: unknown;
@@ -754,6 +809,37 @@ export function HomeDashboard() {
     }
     return fp;
   }, [metrics]);
+
+  const setExecutionHaltMode = async (halted: boolean) => {
+    if (executionHaltBusy) return;
+    setExecutionHaltBusy(true);
+    setExecutionHaltError(null);
+    try {
+      const reason = halted
+        ? `manual halt from dashboard at ${new Date().toISOString()}`
+        : 'manual resume from dashboard';
+      const res = await apiFetch('/api/system/execution-halt', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ halted, reason }),
+      });
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({}));
+        const message = typeof payload?.error === 'string' && payload.error.trim().length > 0
+          ? payload.error
+          : `request failed (${res.status})`;
+        setExecutionHaltError(message);
+        return;
+      }
+      const payload = await res.json();
+      setExecutionHalt(parseExecutionHaltState(payload));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'network error';
+      setExecutionHaltError(message);
+    } finally {
+      setExecutionHaltBusy(false);
+    }
+  };
 
   return (
     <DashboardLayout>
@@ -913,6 +999,44 @@ export function HomeDashboard() {
                     <div className="bg-red-500/10 border border-red-500/20 text-red-400 rounded px-1 py-0.5">OFF {runtimeCounts.offline}</div>
                     <div className="bg-white/5 border border-white/10 text-gray-300 rounded px-1 py-0.5">STB {runtimeCounts.standby}</div>
                   </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-white/5 border border-white/10 rounded-xl p-4">
+              <h3 className="text-xs font-bold text-gray-400 uppercase mb-3">Execution Kill Switch</h3>
+              <div className="space-y-2 text-[10px] font-mono">
+                <div className="flex items-center justify-between">
+                  <span className="text-gray-500">State</span>
+                  <span className={`font-bold ${executionHalt.halted ? 'text-red-400' : 'text-emerald-400'}`}>
+                    {executionHalt.halted ? 'HALTED' : 'RUNNING'}
+                  </span>
+                </div>
+                {executionHalt.reason && (
+                  <div className="text-gray-500 truncate" title={executionHalt.reason}>
+                    {executionHalt.reason}
+                  </div>
+                )}
+                {executionHaltError && (
+                  <div className="text-red-400">{executionHaltError}</div>
+                )}
+                <div className="grid grid-cols-2 gap-2 pt-1">
+                  <button
+                    type="button"
+                    disabled={executionHaltBusy || executionHalt.halted}
+                    onClick={() => { void setExecutionHaltMode(true); }}
+                    className="px-2 py-1 rounded border border-red-500/30 bg-red-500/10 text-red-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    HALT
+                  </button>
+                  <button
+                    type="button"
+                    disabled={executionHaltBusy || !executionHalt.halted}
+                    onClick={() => { void setExecutionHaltMode(false); }}
+                    className="px-2 py-1 rounded border border-emerald-500/30 bg-emerald-500/10 text-emerald-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    RESUME
+                  </button>
                 </div>
               </div>
             </div>

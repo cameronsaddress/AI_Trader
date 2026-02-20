@@ -1,15 +1,18 @@
 use chrono::Utc;
 use hmac::{Hmac, Mac};
-use log::warn;
+use log::{error, warn};
 use redis::AsyncCommands;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::Sha256;
+use std::time::Instant;
+use tokio::time::{sleep, Duration};
 
 pub const DEFAULT_SIM_BANKROLL: f64 = 1000.0;
 const SIM_BANKROLL_KEY: &str = "sim_bankroll";
 const SIM_LEDGER_CASH_KEY: &str = "sim_ledger:cash";
 const SIM_LEDGER_RESERVED_KEY: &str = "sim_ledger:reserved";
 const SIM_LEDGER_REALIZED_PNL_KEY: &str = "sim_ledger:realized_pnl";
+const SIM_LEDGER_HALT_KEY: &str = "sim_ledger:halt_reason";
 const SIM_LEDGER_RESERVED_BY_STRATEGY_PREFIX: &str = "sim_ledger:reserved:strategy:";
 const SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX: &str = "sim_ledger:reserved:family:";
 const STRATEGY_RISK_MULTIPLIER_PREFIX: &str = "strategy:risk_multiplier:";
@@ -24,6 +27,10 @@ const DEFAULT_GLOBAL_UTILIZATION_CAP_PCT: f64 = 0.90;
 const DEFAULT_GLOBAL_MAX_DRAWDOWN_PCT: f64 = -5.0;
 const DEFAULT_NUMERIC_EPSILON: f64 = 1e-9;
 const SIM_LEDGER_RESERVED_BY_UNDERLYING_PREFIX: &str = "sim_ledger:reserved:underlying:";
+const SIM_LEDGER_PEAK_EQUITY_KEY: &str = "sim_ledger:peak_equity";
+const EXECUTION_DECISION_KEY_PREFIX: &str = "execution:decision:";
+const DEFAULT_EXECUTION_DECISION_WAIT_MS: u64 = 3_000;
+const DEFAULT_EXECUTION_DECISION_POLL_MS: u64 = 30;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiskConfig {
@@ -44,6 +51,13 @@ impl Default for RiskConfig {
 pub enum TradingMode {
     Paper,
     Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionDecision {
+    Accepted,
+    Rejected,
+    Timeout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +210,54 @@ async fn read_f64_or(
     }
 }
 
+fn allow_bankroll_bootstrap_on_miss() -> bool {
+    matches!(
+        std::env::var("SIM_BANKROLL_BOOTSTRAP_ON_MISS"),
+        Ok(raw) if matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    )
+}
+
+fn bankroll_bootstrap_value() -> f64 {
+    std::env::var("SIM_BANKROLL_BOOTSTRAP_VALUE")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_SIM_BANKROLL)
+        .clamp(10.0, 100_000_000.0)
+}
+
+async fn publish_bankroll_halt(
+    conn: &mut redis::aio::MultiplexedConnection,
+    reason: &str,
+) {
+    let halt_written = match conn
+        .set_nx::<_, _, bool>(SIM_LEDGER_HALT_KEY, reason)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            warn!("[Ledger] failed to set {}: {}", SIM_LEDGER_HALT_KEY, error);
+            false
+        }
+    };
+    if halt_written {
+        error!(
+            "[Ledger] HALT: {} missing/invalid. Trading reservations disabled until ledger is restored.",
+            SIM_BANKROLL_KEY,
+        );
+        if let Err(error) = redis::cmd("PUBLISH")
+            .arg("system:alert")
+            .arg(
+                r#"{"level":"CRITICAL","msg":"BANKROLL_MISSING","action":"TRADING_HALTED","component":"scanner_ledger"}"#,
+            )
+            .query_async::<()>(&mut *conn)
+            .await
+        {
+            warn!("[Ledger] failed to publish bankroll halt alert: {}", error);
+        }
+    }
+}
+
 pub async fn read_risk_config(conn: &mut redis::aio::MultiplexedConnection) -> RiskConfig {
     let raw: String = match conn.get("system:risk_config").await {
         Ok(payload) => payload,
@@ -214,8 +276,54 @@ pub async fn read_risk_config(conn: &mut redis::aio::MultiplexedConnection) -> R
 }
 
 async fn ensure_sim_ledger(conn: &mut redis::aio::MultiplexedConnection) {
-    let fallback_equity = read_f64_or(conn, SIM_BANKROLL_KEY, DEFAULT_SIM_BANKROLL).await;
-    if let Err(error) = conn.set_nx::<_, _, bool>(SIM_BANKROLL_KEY, fallback_equity).await {
+    let mut force_set_bankroll = false;
+    let fallback_equity = match conn.get::<_, Option<f64>>(SIM_BANKROLL_KEY).await {
+        Ok(Some(value)) if value.is_finite() && value > 0.0 => value,
+        Ok(Some(_)) => {
+            if allow_bankroll_bootstrap_on_miss() {
+                let value = bankroll_bootstrap_value();
+                warn!(
+                    "[Ledger] {} contains non-finite/non-positive value; bootstrapping to {:.2}",
+                    SIM_BANKROLL_KEY,
+                    value,
+                );
+                force_set_bankroll = true;
+                value
+            } else {
+                publish_bankroll_halt(conn, "bankroll_invalid").await;
+                return;
+            }
+        }
+        Ok(None) => {
+            if allow_bankroll_bootstrap_on_miss() {
+                let value = bankroll_bootstrap_value();
+                warn!(
+                    "[Ledger] {} missing; bootstrapping to {:.2} (SIM_BANKROLL_BOOTSTRAP_ON_MISS=true)",
+                    SIM_BANKROLL_KEY,
+                    value,
+                );
+                value
+            } else {
+                publish_bankroll_halt(conn, "bankroll_missing").await;
+                return;
+            }
+        }
+        Err(error) => {
+            warn!("[Ledger] failed to read {}: {}", SIM_BANKROLL_KEY, error);
+            publish_bankroll_halt(conn, "bankroll_read_error").await;
+            return;
+        }
+    };
+
+    if let Err(error) = conn.del::<_, ()>(SIM_LEDGER_HALT_KEY).await {
+        warn!("[Ledger] failed to clear {}: {}", SIM_LEDGER_HALT_KEY, error);
+    }
+
+    if force_set_bankroll {
+        if let Err(error) = conn.set::<_, _, ()>(SIM_BANKROLL_KEY, fallback_equity).await {
+            warn!("failed to restore {}: {}", SIM_BANKROLL_KEY, error);
+        }
+    } else if let Err(error) = conn.set_nx::<_, _, bool>(SIM_BANKROLL_KEY, fallback_equity).await {
         warn!("failed to initialize {}: {}", SIM_BANKROLL_KEY, error);
     }
     if let Err(error) = conn.set_nx::<_, _, bool>(SIM_LEDGER_CASH_KEY, fallback_equity).await {
@@ -229,6 +337,23 @@ async fn ensure_sim_ledger(conn: &mut redis::aio::MultiplexedConnection) {
         .await
     {
         warn!("failed to initialize {}: {}", SIM_LEDGER_REALIZED_PNL_KEY, error);
+    }
+    if let Err(error) = conn
+        .set_nx::<_, _, bool>(SIM_LEDGER_PEAK_EQUITY_KEY, fallback_equity)
+        .await
+    {
+        warn!("failed to initialize {}: {}", SIM_LEDGER_PEAK_EQUITY_KEY, error);
+    }
+}
+
+async fn is_bankroll_halted(conn: &mut redis::aio::MultiplexedConnection) -> bool {
+    match conn.get::<_, Option<String>>(SIM_LEDGER_HALT_KEY).await {
+        Ok(Some(reason)) if !reason.trim().is_empty() => true,
+        Ok(_) => false,
+        Err(error) => {
+            warn!("[Ledger] failed to read {}: {}", SIM_LEDGER_HALT_KEY, error);
+            false
+        }
     }
 }
 
@@ -274,6 +399,15 @@ fn global_utilization_cap_pct() -> f64 {
         0.10,
         1.0,
     )
+}
+
+fn aggregate_overlay_cap() -> f64 {
+    let parsed = std::env::var("STRATEGY_OVERLAY_AGGREGATE_CAP")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(3.0);
+    parsed.clamp(1.0, 10.0)
 }
 
 pub fn strategy_family(strategy_id: &str) -> &'static str {
@@ -340,11 +474,17 @@ pub async fn read_family_reserved_notional(conn: &mut redis::aio::MultiplexedCon
 
 pub async fn read_sim_available_cash(conn: &mut redis::aio::MultiplexedConnection) -> f64 {
     ensure_sim_ledger(conn).await;
-    read_f64_or(conn, SIM_LEDGER_CASH_KEY, DEFAULT_SIM_BANKROLL).await
+    if is_bankroll_halted(conn).await {
+        return 0.0;
+    }
+    read_f64_or(conn, SIM_LEDGER_CASH_KEY, 0.0).await
 }
 
 pub async fn read_sim_reserved_notional(conn: &mut redis::aio::MultiplexedConnection) -> f64 {
     ensure_sim_ledger(conn).await;
+    if is_bankroll_halted(conn).await {
+        return 0.0;
+    }
     read_f64_or(conn, SIM_LEDGER_RESERVED_KEY, 0.0).await
 }
 
@@ -385,8 +525,6 @@ pub async fn validate_ledger_invariant(conn: &mut redis::aio::MultiplexedConnect
     true
 }
 
-const SIM_LEDGER_PEAK_EQUITY_KEY: &str = "sim_ledger:peak_equity";
-
 pub async fn read_sim_realized_pnl(conn: &mut redis::aio::MultiplexedConnection) -> f64 {
     ensure_sim_ledger(conn).await;
     read_f64_or(conn, SIM_LEDGER_REALIZED_PNL_KEY, 0.0).await
@@ -402,15 +540,31 @@ pub async fn check_drawdown_breached(conn: &mut redis::aio::MultiplexedConnectio
     if equity <= 0.0 {
         return true; // Zero equity is a breach
     }
-    let peak = read_f64_or(conn, SIM_LEDGER_PEAK_EQUITY_KEY, equity).await;
-    let peak = if equity > peak || peak <= 0.0 {
-        if let Err(error) = conn.set::<_, _, ()>(SIM_LEDGER_PEAK_EQUITY_KEY, equity).await {
+    let peak_opt = match conn.get::<_, Option<f64>>(SIM_LEDGER_PEAK_EQUITY_KEY).await {
+        Ok(value) => value,
+        Err(error) => {
+            warn!("[Ledger] failed to read {}: {}", SIM_LEDGER_PEAK_EQUITY_KEY, error);
+            None
+        }
+    };
+    let mut peak = match peak_opt {
+        Some(value) if value.is_finite() && value > 0.0 => value,
+        _ => {
+            let baseline = read_f64_or(conn, SIM_BANKROLL_KEY, equity)
+                .await
+                .max(equity);
+            if let Err(error) = conn.set::<_, _, ()>(SIM_LEDGER_PEAK_EQUITY_KEY, baseline).await {
+                warn!("[Ledger] failed to seed {}: {}", SIM_LEDGER_PEAK_EQUITY_KEY, error);
+            }
+            baseline
+        }
+    };
+    if equity > peak {
+        peak = equity;
+        if let Err(error) = conn.set::<_, _, ()>(SIM_LEDGER_PEAK_EQUITY_KEY, peak).await {
             warn!("[Ledger] failed to persist {}: {}", SIM_LEDGER_PEAK_EQUITY_KEY, error);
         }
-        equity
-    } else {
-        peak
-    };
+    }
     let dd_pct = ((equity - peak) / peak) * 100.0;
     dd_pct <= max_dd_pct
 }
@@ -425,6 +579,9 @@ pub async fn reserve_sim_notional_for_strategy(
     }
 
     ensure_sim_ledger(conn).await;
+    if is_bankroll_halted(conn).await {
+        return false;
+    }
     let family_id = strategy_family(strategy_id);
     let underlying_id = strategy_underlying(strategy_id);
     let strategy_key = strategy_reserved_key(strategy_id);
@@ -620,9 +777,6 @@ pub async fn settle_sim_position_for_strategy(
         family_reserved = math.max(0, family_reserved - family_release)
         underlying_reserved = math.max(0, underlying_reserved - underlying_release)
         cash = cash + release + pnl
-        if cash < 0 then
-            cash = 0
-        end
         local equity = cash + reserved
         redis.call("SET", KEYS[1], cash)
         redis.call("SET", KEYS[2], reserved)
@@ -992,6 +1146,14 @@ pub async fn compute_strategy_bet_size(
         sized *= regime_multiplier;
     }
 
+    let max_overlay_multiple = aggregate_overlay_cap();
+    if max_overlay_multiple > 0.0 && base > 0.0 {
+        let overlay_multiple = sized / base;
+        if overlay_multiple.is_finite() && overlay_multiple > max_overlay_multiple {
+            sized = base * max_overlay_multiple;
+        }
+    }
+
     // Per-strategy hard notional cap (env: {STRATEGY_ID}_NOTIONAL_CAP).
     let cap_key = format!("{}_NOTIONAL_CAP", strategy_id);
     let notional_cap: f64 = std::env::var(&cap_key)
@@ -1108,6 +1270,94 @@ pub async fn publish_execution_event(
         payload.to_string()
     };
     publish_event(conn, "arbitrage:execution", encoded).await;
+}
+
+fn execution_decision_key(execution_id: &str) -> Option<String> {
+    let normalized = execution_id.trim();
+    if normalized.is_empty() {
+        None
+    } else {
+        let prefix = std::env::var("EXECUTION_DECISION_KEY_PREFIX")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| EXECUTION_DECISION_KEY_PREFIX.to_string());
+        Some(format!("{}{}", prefix, normalized))
+    }
+}
+
+fn execution_decision_wait_ms() -> u64 {
+    std::env::var("EXECUTION_DECISION_WAIT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 100 && *v <= 30_000)
+        .unwrap_or(DEFAULT_EXECUTION_DECISION_WAIT_MS)
+}
+
+fn execution_decision_poll_ms() -> u64 {
+    std::env::var("EXECUTION_DECISION_POLL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 10 && *v <= 2_000)
+        .unwrap_or(DEFAULT_EXECUTION_DECISION_POLL_MS)
+}
+
+fn parse_execution_decision(raw: &str) -> Option<ExecutionDecision> {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(decision) = parsed
+            .as_object()
+            .and_then(|obj| obj.get("decision"))
+            .and_then(|value| value.as_str())
+        {
+            return parse_execution_decision(decision);
+        }
+    }
+    let normalized = raw.trim().to_ascii_uppercase();
+    if normalized == "ACCEPTED" {
+        Some(ExecutionDecision::Accepted)
+    } else if normalized == "REJECTED" {
+        Some(ExecutionDecision::Rejected)
+    } else {
+        None
+    }
+}
+
+pub async fn await_execution_decision(
+    conn: &mut redis::aio::MultiplexedConnection,
+    execution_id: &str,
+) -> ExecutionDecision {
+    let Some(key) = execution_decision_key(execution_id) else {
+        return ExecutionDecision::Rejected;
+    };
+
+    let wait_ms = execution_decision_wait_ms();
+    let poll_ms = execution_decision_poll_ms().min(wait_ms.max(10));
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+
+    loop {
+        match conn.get::<_, Option<String>>(&key).await {
+            Ok(Some(raw)) => {
+                if let Some(decision) = parse_execution_decision(&raw) {
+                    return decision;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    "[ExecutionDecision] read error key={} execution_id={} error={}",
+                    key, execution_id, error
+                );
+                if Instant::now() >= deadline {
+                    return ExecutionDecision::Timeout;
+                }
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return ExecutionDecision::Timeout;
+        }
+        sleep(Duration::from_millis(poll_ms)).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

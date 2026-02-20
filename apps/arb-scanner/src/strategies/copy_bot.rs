@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use uuid::Uuid;
 
 use crate::engine::PolymarketClient;
@@ -54,6 +54,36 @@ const STOP_LOSS_PCT: f64 = -0.08;
 const MAX_HOLD_SECS: i64 = 120;
 const LIVE_PREVIEW_COOLDOWN_SECS: i64 = 20;
 const SYNDICATE_STRATEGY_ID: &str = "SYNDICATE";
+
+fn ws_read_timeout_ms() -> u64 {
+    std::env::var("SCANNER_WS_READ_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 5_000 && *v <= 180_000)
+        .unwrap_or(45_000)
+}
+
+fn next_backoff_secs(current: u64) -> u64 {
+    (current * 2).clamp(1, 30)
+}
+
+fn spawn_supervised_feed_task<F>(name: &'static str, mut spawn_once: F)
+where
+    F: FnMut() -> tokio::task::JoinHandle<()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut restart_backoff_secs = 1_u64;
+        loop {
+            let handle = spawn_once();
+            match handle.await {
+                Ok(()) => warn!("{} feed task exited; restarting", name),
+                Err(error) => error!("{} feed task crashed: {}; restarting", name, error),
+            }
+            sleep(Duration::from_secs(restart_backoff_secs)).await;
+            restart_backoff_secs = next_backoff_secs(restart_backoff_secs);
+        }
+    });
+}
 
 #[derive(Debug, Clone)]
 struct TrackedTrade {
@@ -155,53 +185,15 @@ impl SyndicateStrategy {
         }
         out
     }
-}
 
-#[async_trait]
-impl Strategy for SyndicateStrategy {
-    async fn run(&self, redis_client: redis::Client) {
-        info!("Starting Syndicate strategy [on-chain cluster follower]");
-
-        let mut conn = match redis_client.get_multiplexed_async_connection().await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to connect to Redis: {}", e);
-                return;
-            }
-        };
-        let cost_model = SimCostModel::from_env();
-        let variant = strategy_variant();
-        let event_variant = variant.clone();
-
-        if let Some(restored) = restore_strategy_open_positions::<Vec<PersistedOpenPosition>>(&mut conn, SYNDICATE_STRATEGY_ID).await {
-            let restored_positions = Self::restore_open_positions(restored);
-            if restored_positions.is_empty() {
-                clear_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID).await;
-            } else {
-                let restored_count = restored_positions.len();
-                let sanitized_snapshot = Self::snapshot_open_positions(&restored_positions);
-                {
-                    let mut positions = self.open_positions.write().await;
-                    *positions = restored_positions;
-                }
-                if sanitized_snapshot.is_empty() {
-                    clear_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID).await;
-                } else {
-                    persist_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID, &sanitized_snapshot).await;
-                }
-                info!(
-                    "Syndicate restored {} persisted open position(s)",
-                    restored_count
-                );
-            }
-        }
-
-        let trade_window_writer = self.trade_window.clone();
-        let positions_writer = self.open_positions.clone();
-        let last_entry_writer = self.last_entry_ts.clone();
-        let redis_client_clone = redis_client.clone();
-        let event_cost_model = cost_model;
-
+    fn spawn_polygon_orderfilled_feed(
+        trade_window_writer: Arc<RwLock<HashMap<U256, Vec<TrackedTrade>>>>,
+        positions_writer: Arc<RwLock<HashMap<U256, Position>>>,
+        last_entry_writer: Arc<RwLock<HashMap<U256, i64>>>,
+        redis_client_clone: redis::Client,
+        event_cost_model: SimCostModel,
+        event_variant: String,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut event_conn = match redis_client_clone.get_multiplexed_async_connection().await {
                 Ok(c) => c,
@@ -219,22 +211,26 @@ impl Strategy for SyndicateStrategy {
                 ]"#
             );
 
+            let mut backoff_secs = 1_u64;
             loop {
                 info!("Connecting to Polygon WS for OrderFilled feed...");
                 let provider = match Provider::<Ws>::connect(POLYGON_WS).await {
                     Ok(p) => p,
                     Err(e) => {
                         error!("Polygon WS connect error: {}", e);
-                        sleep(Duration::from_secs(5)).await;
+                        sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = next_backoff_secs(backoff_secs);
                         continue;
                     }
                 };
+                backoff_secs = 1;
 
                 let exchange_address = match CTF_EXCHANGE.parse::<Address>() {
                     Ok(addr) => addr,
                     Err(e) => {
                         error!("Invalid CTF exchange address: {}", e);
-                        sleep(Duration::from_secs(5)).await;
+                        sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = next_backoff_secs(backoff_secs);
                         continue;
                     }
                 };
@@ -247,12 +243,26 @@ impl Strategy for SyndicateStrategy {
                     Ok(s) => s,
                     Err(e) => {
                         error!("Polygon subscribe error: {}", e);
-                        sleep(Duration::from_secs(5)).await;
+                        sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = next_backoff_secs(backoff_secs);
                         continue;
                     }
                 };
 
-                while let Some(log) = stream.next().await {
+                loop {
+                    let next = timeout(Duration::from_millis(ws_read_timeout_ms()), stream.next()).await;
+                    let Some(log) = (match next {
+                        Ok(value) => value,
+                        Err(_) => {
+                            warn!(
+                                "Syndicate Polygon log stream timed out after {}ms; reconnecting",
+                                ws_read_timeout_ms(),
+                            );
+                            None
+                        }
+                    }) else {
+                        break;
+                    };
                     let reset_ts = read_simulation_reset_ts(&mut event_conn).await;
                     if reset_ts > event_last_reset_ts {
                         event_last_reset_ts = reset_ts;
@@ -406,12 +416,68 @@ impl Strategy for SyndicateStrategy {
                                 publish_event(&mut event_conn, "strategy:pnl", pnl_msg.to_string()).await;
                             }
                         }
-                        Err(e) => {
-                            warn!("OrderFilled parse error: {:?}", e);
-                        }
+                        Err(e) => warn!("Syndicate log parse error: {}", e),
                     }
                 }
             }
+        })
+    }
+}
+
+#[async_trait]
+impl Strategy for SyndicateStrategy {
+    async fn run(&self, redis_client: redis::Client) {
+        info!("Starting Syndicate strategy [on-chain cluster follower]");
+
+        let mut conn = match redis_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to connect to Redis: {}", e);
+                return;
+            }
+        };
+        let cost_model = SimCostModel::from_env();
+        let variant = strategy_variant();
+        let event_variant = variant.clone();
+
+        if let Some(restored) = restore_strategy_open_positions::<Vec<PersistedOpenPosition>>(&mut conn, SYNDICATE_STRATEGY_ID).await {
+            let restored_positions = Self::restore_open_positions(restored);
+            if restored_positions.is_empty() {
+                clear_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID).await;
+            } else {
+                let restored_count = restored_positions.len();
+                let sanitized_snapshot = Self::snapshot_open_positions(&restored_positions);
+                {
+                    let mut positions = self.open_positions.write().await;
+                    *positions = restored_positions;
+                }
+                if sanitized_snapshot.is_empty() {
+                    clear_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID).await;
+                } else {
+                    persist_strategy_open_positions(&mut conn, SYNDICATE_STRATEGY_ID, &sanitized_snapshot).await;
+                }
+                info!(
+                    "Syndicate restored {} persisted open position(s)",
+                    restored_count
+                );
+            }
+        }
+
+        let trade_window_writer = self.trade_window.clone();
+        let positions_writer = self.open_positions.clone();
+        let last_entry_writer = self.last_entry_ts.clone();
+        let redis_client_clone = redis_client.clone();
+        let event_cost_model = cost_model;
+
+        spawn_supervised_feed_task("SYNDICATE_POLYGON_FEED", move || {
+            SyndicateStrategy::spawn_polygon_orderfilled_feed(
+                trade_window_writer.clone(),
+                positions_writer.clone(),
+                last_entry_writer.clone(),
+                redis_client_clone.clone(),
+                event_cost_model,
+                event_variant.clone(),
+            )
         });
 
         let mut last_seen_reset_ts = 0_i64;

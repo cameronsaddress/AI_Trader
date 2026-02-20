@@ -4,7 +4,7 @@ import { DashboardLayout } from '../components/layout/DashboardLayout';
 import { ArbitrageScannerWidget } from '../components/widgets/ArbitrageScannerWidget';
 import { StrategyControlWidget } from '../components/widgets/StrategyControlWidget';
 import { useSocket } from '../context/SocketContext';
-import { apiUrl } from '../lib/api';
+import { apiFetch } from '../lib/api';
 import { SequencedAbortController } from '../lib/SequencedAbortController';
 
 type TradingMode = 'PAPER' | 'LIVE';
@@ -2112,7 +2112,7 @@ export const PolymarketPage: React.FC = () => {
             const controller = new AbortController();
             activeController = controller;
             try {
-                const response = await fetch(apiUrl('/api/arb/stats'), { signal: controller.signal });
+                const response = await apiFetch('/api/arb/stats', { signal: controller.signal });
                 if (!response.ok || !mounted) {
                     return;
                 }
@@ -2803,8 +2803,8 @@ export const PolymarketPage: React.FC = () => {
         setExecutionTraceError(null);
         setExecutionTraceLoading(true);
         try {
-            const response = await fetch(
-                apiUrl(`/api/arb/execution-trace/${encodeURIComponent(executionId)}`),
+            const response = await apiFetch(
+                `/api/arb/execution-trace/${encodeURIComponent(executionId)}`,
                 { signal: request.signal },
             );
             if (!response.ok) {

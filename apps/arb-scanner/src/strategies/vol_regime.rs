@@ -12,7 +12,7 @@ pub enum Regime {
 pub struct VolRegime {
     pub regime: Regime,
     pub hurst_exponent: f64,
-    pub parkinson_vol: f64, // Intraday volatility estimate (annualized)
+    pub parkinson_vol: f64, // Annualized close-to-close volatility proxy
 }
 
 /// Detect the current volatility regime from a time series of (timestamp_ms, price) tuples.
@@ -27,8 +27,8 @@ pub fn detect_regime(price_history: &[(i64, f64)]) -> Option<VolRegime> {
     // Compute Hurst exponent via R/S analysis (simplified)
     let hurst = estimate_hurst(&prices);
 
-    // Compute Parkinson volatility (uses high/low range, more efficient than close-to-close)
-    let parkinson = estimate_parkinson_vol(&prices);
+    // Close-to-close volatility proxy (high/low candles are unavailable here).
+    let parkinson = estimate_close_to_close_vol(&prices);
 
     let regime = if hurst > 0.55 {
         Regime::Trending
@@ -89,7 +89,18 @@ fn estimate_hurst(prices: &[f64]) -> f64 {
 
     let mut rs_values: Vec<(f64, f64)> = Vec::new(); // (log(n), log(R/S))
 
-    for chunk_size in [10, 20, 30, 50].iter().copied() {
+    let mut chunk_sizes = Vec::new();
+    let mut chunk_size = 8usize;
+    let max_chunk_size = (returns.len() / 2).max(chunk_size);
+    while chunk_size <= max_chunk_size {
+        if returns.len() / chunk_size >= 4 {
+            chunk_sizes.push(chunk_size);
+        }
+        let next = ((chunk_size as f64) * 1.4).round() as usize;
+        chunk_size = if next <= chunk_size { chunk_size + 1 } else { next };
+    }
+
+    for chunk_size in chunk_sizes {
         if chunk_size > returns.len() { continue; }
         let mut rs_sum = 0.0;
         let mut count = 0;
@@ -134,10 +145,11 @@ fn estimate_hurst(prices: &[f64]) -> f64 {
     hurst.clamp(0.0, 1.0)
 }
 
-/// Parkinson volatility estimator using price range.
-/// Uses close-to-close when high/low not available.
+/// Annualized close-to-close volatility estimator.
+/// This module receives only close prices, so true Parkinson
+/// high/low range volatility cannot be computed here.
 /// Returns annualized volatility.
-fn estimate_parkinson_vol(prices: &[f64]) -> f64 {
+fn estimate_close_to_close_vol(prices: &[f64]) -> f64 {
     if prices.len() < 10 {
         return 0.0;
     }

@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 import numpy as np
+from sklearn import __version__ as sklearn_version
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score
@@ -18,13 +19,44 @@ from sklearn.preprocessing import StandardScaler
 
 try:
     from xgboost import XGBClassifier
+    from xgboost import __version__ as xgboost_version
 except Exception:  # pragma: no cover - fallback if xgboost wheel is unavailable
     XGBClassifier = None
+    xgboost_version = "unavailable"
 
 
 logger = logging.getLogger(__name__)
 
 EPS = 1e-9
+MODEL_STATE_VERSION = 3
+FEATURE_NAMES = [
+    "rsi_centered",
+    "momentum_10",
+    "realized_vol_5m",
+    "latest_return",
+    "sma_gap_20",
+    "sma_gap_50",
+    "ema_gap",
+    "macd_norm",
+    "macd_signal_norm",
+    "bb_position",
+    "spread_norm",
+    "book_staleness",
+    "flow_tilt",
+    "uptick_tilt",
+    "cluster_tilt",
+    "obi_norm",
+    "parity_norm",
+    "edge_to_spread_norm",
+    "flow_accel_norm",
+    "dynamic_cost_norm",
+    "momentum_sigma_norm",
+    "micro_fresh",
+    "spot_strike_delta",
+    "time_remaining_norm",
+    "fair_yes_centered",
+    "iv_annualized_norm",
+]
 
 
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
@@ -109,6 +141,12 @@ class EnsembleSignalModel:
         self.min_retrain_interval_ms = _env_int("ML_SIGNAL_MIN_RETRAIN_INTERVAL_MS", 45_000, 5_000, 900_000)
         self.min_class_samples = _env_int("ML_SIGNAL_MIN_CLASS_SAMPLES", 40, 10, 2000)
         self.eval_min_samples = _env_int("ML_SIGNAL_EVAL_MIN_SAMPLES", 80, 20, 5000)
+        self.micro_book_age_scale_ms = _env_float(
+            "ML_MICROSTRUCTURE_BOOK_AGE_SCALE_MS",
+            float(_env_int("ML_MICROSTRUCTURE_MAX_AGE_MS", 5_000, 500, 120_000)),
+            500.0,
+            120_000.0,
+        )
 
         self.pending_samples: deque[PendingSample] = deque(maxlen=self.max_train_samples * 2)
         self.train_features: deque[np.ndarray] = deque(maxlen=self.max_train_samples)
@@ -122,6 +160,7 @@ class EnsembleSignalModel:
         self.last_eval_brier: float | None = None
         self.last_eval_accuracy: float | None = None
         self.last_eval_auc: float | None = None
+        self.last_walk_forward_auc: float | None = None
         self.exception_counts: dict[str, int] = {}
         self.last_exception_scope: str | None = None
         self.last_exception_message: str | None = None
@@ -139,6 +178,24 @@ class EnsembleSignalModel:
             16,
             10_000,
         )
+        self.model_version = os.getenv("ML_SIGNAL_MODEL_VERSION", "ensemble_v2").strip() or "ensemble_v2"
+        self.model_state_version = MODEL_STATE_VERSION
+        self.feature_mean_vector: np.ndarray | None = None
+        self.feature_std_vector: np.ndarray | None = None
+        self.feature_drift_last = 0.0
+        self.feature_drift_ema = 0.0
+        self.feature_drift_ema_alpha = _env_float("ML_SIGNAL_DRIFT_EMA_ALPHA", 0.08, 0.01, 0.50)
+        self.feature_drift_alert_threshold = _env_float("ML_SIGNAL_FEATURE_DRIFT_ALERT", 2.5, 0.5, 12.0)
+        self.feature_drift_blend_threshold = _env_float("ML_SIGNAL_FEATURE_DRIFT_BLEND", 4.0, 1.0, 20.0)
+        self.feature_drift_alert_cooldown_ms = _env_int(
+            "ML_SIGNAL_FEATURE_DRIFT_ALERT_COOLDOWN_MS",
+            60_000,
+            1_000,
+            3_600_000,
+        )
+        self.feature_drift_last_alert_ts_ms = 0
+        self.feature_importance_top: list[dict[str, float]] = []
+        self.feature_importance_updated_at_ms = 0
         default_state_dir = os.path.abspath(os.path.join("reports", "models", "ml_service"))
         self.state_dir = os.getenv("ML_SIGNAL_STATE_DIR", default_state_dir)
         safe_symbol = self.symbol.replace("-", "_").replace("/", "_").strip().upper()
@@ -164,6 +221,112 @@ class EnsembleSignalModel:
                 self.last_exception_message,
             )
 
+    def _library_versions(self) -> dict[str, str]:
+        return {
+            "numpy": str(np.__version__),
+            "sklearn": str(sklearn_version),
+            "xgboost": str(xgboost_version),
+        }
+
+    def _extract_feature_importance_vector(self, estimator: Any) -> np.ndarray | None:
+        model_ref = estimator
+        if isinstance(estimator, Pipeline):
+            named_steps = getattr(estimator, "named_steps", {})
+            model_ref = named_steps.get("model", estimator)
+
+        if hasattr(model_ref, "feature_importances_"):
+            raw = np.asarray(getattr(model_ref, "feature_importances_"), dtype=np.float64)
+            if raw.ndim == 1 and raw.size == len(FEATURE_NAMES):
+                return np.abs(raw)
+
+        if hasattr(model_ref, "coef_"):
+            coef = np.asarray(getattr(model_ref, "coef_"), dtype=np.float64)
+            if coef.ndim == 2 and coef.shape[1] == len(FEATURE_NAMES):
+                return np.abs(coef[0])
+            if coef.ndim == 1 and coef.size == len(FEATURE_NAMES):
+                return np.abs(coef)
+
+        return None
+
+    def _estimator_feature_count(self, estimator: Any) -> int | None:
+        refs: list[Any] = [estimator]
+        if isinstance(estimator, Pipeline):
+            named_steps = getattr(estimator, "named_steps", {})
+            model_ref = named_steps.get("model")
+            if model_ref is not None:
+                refs.append(model_ref)
+        for ref in refs:
+            count = getattr(ref, "n_features_in_", None)
+            if isinstance(count, (int, np.integer)):
+                parsed = int(count)
+                if parsed > 0:
+                    return parsed
+        return None
+
+    def _refresh_feature_importance(self, now_ms: int) -> None:
+        if not self.models:
+            return
+        combined = np.zeros(len(FEATURE_NAMES), dtype=np.float64)
+        weight_sum = 0.0
+        for model in self.models:
+            vector = self._extract_feature_importance_vector(model.estimator)
+            if vector is None:
+                continue
+            weight = max(0.0, float(model.weight))
+            combined += weight * vector
+            weight_sum += weight
+        if weight_sum <= EPS:
+            return
+        combined /= weight_sum
+        ranking = sorted(
+            zip(FEATURE_NAMES, combined.tolist()),
+            key=lambda entry: abs(float(entry[1])),
+            reverse=True,
+        )[:6]
+        self.feature_importance_top = [
+            {
+                "feature": str(name),
+                "importance": float(_safe_number(score, 0.0)),
+            }
+            for name, score in ranking
+        ]
+        self.feature_importance_updated_at_ms = int(now_ms)
+
+    def _update_feature_drift(self, vector: np.ndarray, now_ms: int) -> float:
+        if self.feature_mean_vector is None or self.feature_std_vector is None:
+            self.feature_drift_last = 0.0
+            return 0.0
+        if self.feature_mean_vector.shape != vector.shape or self.feature_std_vector.shape != vector.shape:
+            self.feature_drift_last = 0.0
+            return 0.0
+
+        z = np.abs((vector - self.feature_mean_vector) / np.maximum(self.feature_std_vector, 1e-6))
+        drift_score = float(np.mean(np.clip(z, 0.0, 20.0)))
+        if not math.isfinite(drift_score):
+            drift_score = 0.0
+        self.feature_drift_last = drift_score
+        if self.feature_drift_ema <= 0:
+            self.feature_drift_ema = drift_score
+        else:
+            alpha = _clip(self.feature_drift_ema_alpha, 0.01, 0.50)
+            self.feature_drift_ema = ((1.0 - alpha) * self.feature_drift_ema) + (alpha * drift_score)
+
+        should_alert = (
+            drift_score >= self.feature_drift_alert_threshold
+            and (now_ms - self.feature_drift_last_alert_ts_ms) >= self.feature_drift_alert_cooldown_ms
+        )
+        if should_alert:
+            self.feature_drift_last_alert_ts_ms = now_ms
+            logger.warning(
+                "[ML][drift] symbol=%s drift_score=%.3f drift_ema=%.3f threshold=%.3f",
+                self.symbol,
+                drift_score,
+                self.feature_drift_ema,
+                self.feature_drift_alert_threshold,
+            )
+
+        return drift_score
+
     def _load_state(self) -> None:
         if not self.state_path or not os.path.exists(self.state_path):
             return
@@ -174,20 +337,43 @@ class EnsembleSignalModel:
                 return
             if str(payload.get("symbol") or "") != self.symbol:
                 return
+            state_version = int(_safe_number(payload.get("version"), 0))
+            if state_version > self.model_state_version:
+                logger.warning(
+                    "[ML] state version mismatch for %s: file=%d runtime=%d",
+                    self.symbol,
+                    state_version,
+                    self.model_state_version,
+                )
+                return
 
             train_features = payload.get("train_features")
             train_labels = payload.get("train_labels")
             loaded_features: list[np.ndarray] = []
             loaded_labels: list[int] = []
+            expected_feature_count = len(FEATURE_NAMES)
+            dropped_feature_rows = 0
             if isinstance(train_features, np.ndarray) and train_features.ndim == 2:
                 for row in train_features[-self.max_train_samples :]:
-                    loaded_features.append(np.asarray(row, dtype=np.float64))
+                    row_arr = np.asarray(row, dtype=np.float64).reshape(-1)
+                    if row_arr.shape != (expected_feature_count,):
+                        dropped_feature_rows += 1
+                        continue
+                    loaded_features.append(row_arr)
             elif isinstance(train_features, list):
                 for row in train_features[-self.max_train_samples :]:
                     if isinstance(row, np.ndarray):
-                        loaded_features.append(np.asarray(row, dtype=np.float64))
+                        row_arr = np.asarray(row, dtype=np.float64).reshape(-1)
+                        if row_arr.shape != (expected_feature_count,):
+                            dropped_feature_rows += 1
+                            continue
+                        loaded_features.append(row_arr)
                     elif isinstance(row, (list, tuple)):
-                        loaded_features.append(np.asarray(row, dtype=np.float64))
+                        row_arr = np.asarray(row, dtype=np.float64).reshape(-1)
+                        if row_arr.shape != (expected_feature_count,):
+                            dropped_feature_rows += 1
+                            continue
+                        loaded_features.append(row_arr)
 
             if isinstance(train_labels, np.ndarray):
                 loaded_labels = [int(v) for v in train_labels.tolist()[-self.max_train_samples :]]
@@ -199,6 +385,14 @@ class EnsembleSignalModel:
                 self.train_features = deque(loaded_features[-pair_len:], maxlen=self.max_train_samples)
                 self.train_labels = deque(loaded_labels[-pair_len:], maxlen=self.max_train_samples)
 
+            if dropped_feature_rows > 0:
+                logger.info(
+                    "[ML] discarded %d persisted feature rows for %s due to feature-size mismatch (expected=%d)",
+                    dropped_feature_rows,
+                    self.symbol,
+                    expected_feature_count,
+                )
+
             self.new_labels_since_train = int(payload.get("new_labels_since_train") or 0)
             self.model_name = str(payload.get("model_name") or self.model_name)
             self.last_train_ts_ms = int(payload.get("last_train_ts_ms") or 0)
@@ -206,6 +400,8 @@ class EnsembleSignalModel:
             self.last_eval_brier = payload.get("last_eval_brier")
             self.last_eval_accuracy = payload.get("last_eval_accuracy")
             self.last_eval_auc = payload.get("last_eval_auc")
+            self.last_walk_forward_auc = payload.get("last_walk_forward_auc")
+            self.model_version = str(payload.get("model_version") or self.model_version)
 
             loaded_models: list[TrainedModel] = []
             raw_models = payload.get("models")
@@ -215,6 +411,9 @@ class EnsembleSignalModel:
                         continue
                     estimator = entry.get("estimator")
                     if estimator is None or not hasattr(estimator, "predict_proba"):
+                        continue
+                    feature_count = self._estimator_feature_count(estimator)
+                    if feature_count is None or feature_count != len(FEATURE_NAMES):
                         continue
                     loaded_models.append(
                         TrainedModel(
@@ -235,6 +434,34 @@ class EnsembleSignalModel:
                 self.models = loaded_models
                 if self.model_name == "HEURISTIC_BOOTSTRAP":
                     self.model_name = "+".join(model.name for model in self.models)
+
+            feature_mean = payload.get("feature_mean_vector")
+            feature_std = payload.get("feature_std_vector")
+            if isinstance(feature_mean, np.ndarray) and isinstance(feature_std, np.ndarray):
+                if feature_mean.shape == (len(FEATURE_NAMES),) and feature_std.shape == (len(FEATURE_NAMES),):
+                    self.feature_mean_vector = feature_mean.astype(np.float64)
+                    self.feature_std_vector = np.maximum(feature_std.astype(np.float64), 1e-6)
+            elif isinstance(feature_mean, list) and isinstance(feature_std, list):
+                mean_arr = np.asarray(feature_mean, dtype=np.float64)
+                std_arr = np.asarray(feature_std, dtype=np.float64)
+                if mean_arr.shape == (len(FEATURE_NAMES),) and std_arr.shape == (len(FEATURE_NAMES),):
+                    self.feature_mean_vector = mean_arr
+                    self.feature_std_vector = np.maximum(std_arr, 1e-6)
+
+            self.feature_drift_ema = float(_safe_number(payload.get("feature_drift_ema"), self.feature_drift_ema))
+            raw_importance = payload.get("feature_importance_top")
+            if isinstance(raw_importance, list):
+                normalized_importance: list[dict[str, float]] = []
+                for entry in raw_importance[:6]:
+                    if not isinstance(entry, dict):
+                        continue
+                    name = str(entry.get("feature") or "").strip()
+                    score = float(_safe_number(entry.get("importance"), 0.0))
+                    if name:
+                        normalized_importance.append({"feature": name, "importance": score})
+                self.feature_importance_top = normalized_importance
+            self.feature_importance_updated_at_ms = int(_safe_number(payload.get("feature_importance_updated_at_ms"), 0))
+
             logger.info(
                 "[ML] loaded persisted state for %s (samples=%d, models=%d)",
                 self.symbol,
@@ -252,9 +479,11 @@ class EnsembleSignalModel:
             feature_matrix = np.vstack(self.train_features) if self.train_features else np.empty((0, 0), dtype=np.float64)
             label_array = np.asarray(self.train_labels, dtype=np.int32)
             payload: dict[str, Any] = {
-                "version": 1,
+                "version": int(self.model_state_version),
                 "symbol": self.symbol,
                 "saved_at_ms": int(now_ms if now_ms is not None else (time.time() * 1000)),
+                "model_version": self.model_version,
+                "library_versions": self._library_versions(),
                 "train_features": feature_matrix,
                 "train_labels": label_array,
                 "new_labels_since_train": int(self.new_labels_since_train),
@@ -272,6 +501,12 @@ class EnsembleSignalModel:
                 "last_eval_brier": self.last_eval_brier,
                 "last_eval_accuracy": self.last_eval_accuracy,
                 "last_eval_auc": self.last_eval_auc,
+                "last_walk_forward_auc": self.last_walk_forward_auc,
+                "feature_mean_vector": self.feature_mean_vector,
+                "feature_std_vector": self.feature_std_vector,
+                "feature_drift_ema": float(self.feature_drift_ema),
+                "feature_importance_top": self.feature_importance_top,
+                "feature_importance_updated_at_ms": int(self.feature_importance_updated_at_ms),
             }
             temp_path = f"{self.state_path}.tmp"
             with open(temp_path, "wb") as handle:
@@ -324,6 +559,10 @@ class EnsembleSignalModel:
         micro_dynamic_cost_rate = _safe_number(row.get("micro_dynamic_cost_rate"), 0.0)
         micro_momentum_sigma = _safe_number(row.get("micro_momentum_sigma"), 0.0)
         micro_data_fresh = _safe_number(row.get("micro_data_fresh"), 0.0)
+        micro_spot_strike_delta = _safe_number(row.get("micro_spot_strike_delta"), 0.0)
+        micro_time_remaining_norm = _safe_number(row.get("micro_time_remaining_norm"), 0.5)
+        micro_fair_yes_centered = _safe_number(row.get("micro_fair_yes_centered"), 0.0)
+        micro_iv_annualized = _safe_number(row.get("micro_iv_annualized"), 0.0)
 
         rsi_centered = _clip((rsi - 50.0) / 50.0, -1.0, 1.0)
         momentum = _clip(momentum_10, -0.06, 0.06)
@@ -343,7 +582,7 @@ class EnsembleSignalModel:
             bb_position = _clip(normalized, -1.0, 1.0)
 
         spread_norm = _clip(micro_spread / 0.20, 0.0, 1.0)
-        book_staleness = _clip(micro_book_age_ms / 15_000.0, 0.0, 1.0)
+        book_staleness = _clip(micro_book_age_ms / self.micro_book_age_scale_ms, 0.0, 1.0)
         flow_tilt = _clip((micro_buy_pressure - 0.5) * 2.0, -1.0, 1.0)
         uptick_tilt = _clip((micro_uptick_ratio - 0.5) * 2.0, -1.0, 1.0)
         cluster_tilt = _clip((micro_cluster_confidence * 2.0) - 1.0, -1.0, 1.0)
@@ -354,8 +593,12 @@ class EnsembleSignalModel:
         dynamic_cost_norm = _clip(micro_dynamic_cost_rate / 0.05, 0.0, 1.0)
         momentum_sigma_norm = _clip(micro_momentum_sigma / 0.05, 0.0, 1.0)
         micro_fresh = _clip(micro_data_fresh, 0.0, 1.0)
+        spot_strike_delta = _clip(micro_spot_strike_delta / 0.03, -1.0, 1.0)
+        time_remaining_norm = _clip(micro_time_remaining_norm, 0.0, 1.0)
+        fair_yes_centered = _clip(micro_fair_yes_centered, -1.0, 1.0)
+        iv_annualized_norm = _clip(micro_iv_annualized / 1.50, 0.0, 1.0)
 
-        return np.array(
+        vector = np.array(
             [
                 rsi_centered,
                 momentum,
@@ -379,9 +622,16 @@ class EnsembleSignalModel:
                 dynamic_cost_norm,
                 momentum_sigma_norm,
                 micro_fresh,
+                spot_strike_delta,
+                time_remaining_norm,
+                fair_yes_centered,
+                iv_annualized_norm,
             ],
             dtype=np.float64,
         )
+        if vector.shape[0] != len(FEATURE_NAMES):
+            raise ValueError(f"feature vector mismatch: expected {len(FEATURE_NAMES)}, got {vector.shape[0]}")
+        return vector
 
     def _materialize_labels(self, now_ms: int, now_price: float) -> None:
         while self.pending_samples and (now_ms - self.pending_samples[0].timestamp_ms) >= self.label_horizon_ms:
@@ -518,6 +768,7 @@ class EnsembleSignalModel:
         for item in trained:
             ensemble_eval += float(item["weight"]) * item["proba_eval"]
         ensemble_metrics = self._evaluate(y_eval, ensemble_eval)
+        self.last_walk_forward_auc = self._walk_forward_auc(x, y)
 
         self.models = [
             TrainedModel(
@@ -527,6 +778,10 @@ class EnsembleSignalModel:
             )
             for item in trained
         ]
+        self.feature_mean_vector = np.mean(x_train, axis=0).astype(np.float64)
+        self.feature_std_vector = np.std(x_train, axis=0, ddof=1).astype(np.float64)
+        self.feature_std_vector = np.maximum(self.feature_std_vector, 1e-6)
+        self._refresh_feature_importance(now_ms)
         self.model_name = "+".join(model.name for model in self.models)
         self.last_train_ts_ms = now_ms
         self.new_labels_since_train = 0
@@ -537,13 +792,14 @@ class EnsembleSignalModel:
         self._persist_state(now_ms)
 
         logger.info(
-            "[ML] %s trained %s with %d samples (eval=%d, auc=%s, logloss=%s)",
+            "[ML] %s trained %s with %d samples (eval=%d, auc=%s, logloss=%s, wf_auc=%s)",
             self.symbol,
             self.model_name,
             y.shape[0],
             y_eval.shape[0],
             f"{self.last_eval_auc:.4f}" if self.last_eval_auc is not None else "n/a",
             f"{self.last_eval_logloss:.4f}" if self.last_eval_logloss is not None else "n/a",
+            f"{self.last_walk_forward_auc:.4f}" if self.last_walk_forward_auc is not None else "n/a",
         )
 
     def _evaluate(self, y_true: np.ndarray, proba: np.ndarray) -> dict[str, float | None]:
@@ -563,6 +819,51 @@ class EnsembleSignalModel:
                 metrics["auc"] = None
         return metrics
 
+    def _walk_forward_auc(self, x: np.ndarray, y: np.ndarray) -> float | None:
+        total = int(y.shape[0])
+        fold_size = max(self.eval_min_samples, total // 6)
+        if total < (fold_size * 3):
+            return None
+
+        auc_scores: list[float] = []
+        split_idx = fold_size
+        while (split_idx + fold_size) <= total and len(auc_scores) < 4:
+            x_train = x[:split_idx]
+            y_train = y[:split_idx]
+            x_eval = x[split_idx:split_idx + fold_size]
+            y_eval = y[split_idx:split_idx + fold_size]
+
+            if len(np.unique(y_train)) < 2 or len(np.unique(y_eval)) < 2:
+                split_idx += fold_size
+                continue
+
+            estimator = Pipeline(
+                steps=[
+                    ("scaler", StandardScaler()),
+                    (
+                        "model",
+                        LogisticRegression(
+                            max_iter=500,
+                            class_weight="balanced",
+                            C=0.85,
+                            solver="lbfgs",
+                        ),
+                    ),
+                ],
+            )
+            try:
+                estimator.fit(x_train, y_train)
+                proba_eval = estimator.predict_proba(x_eval)[:, 1].astype(np.float64)
+                auc_scores.append(float(roc_auc_score(y_eval, np.clip(proba_eval, 0.001, 0.999))))
+            except Exception as exc:
+                self._record_exception("walk_forward_auc", exc)
+
+            split_idx += fold_size
+
+        if len(auc_scores) < 2:
+            return None
+        return float(np.mean(auc_scores))
+
     def _quality(self, metrics: dict[str, float | None]) -> float:
         auc = metrics.get("auc")
         logloss_value = metrics.get("logloss")
@@ -581,6 +882,8 @@ class EnsembleSignalModel:
         return max(0.01, quality)
 
     def _predict_probability(self, vector: np.ndarray) -> float:
+        now_ms = int(time.time() * 1000)
+        drift_score = self._update_feature_drift(vector, now_ms)
         if self.models:
             weighted = 0.0
             weight_sum = 0.0
@@ -596,7 +899,15 @@ class EnsembleSignalModel:
                     self._record_exception("predict_probability", exc)
                     continue
             if weight_sum > 0:
-                return _safe_probability(weighted / weight_sum)
+                model_probability = _safe_probability(weighted / weight_sum)
+                if drift_score >= self.feature_drift_blend_threshold:
+                    bootstrap_probability = self._bootstrap_probability(vector)
+                    blend_weight = _clip((drift_score - self.feature_drift_blend_threshold) / 2.5, 0.0, 0.65)
+                    blended_probability = (
+                        (1.0 - blend_weight) * model_probability
+                    ) + (blend_weight * bootstrap_probability)
+                    return _safe_probability(blended_probability)
+                return model_probability
 
         return self._bootstrap_probability(vector)
 
@@ -622,6 +933,10 @@ class EnsembleSignalModel:
             - 0.15 * vector[19]  # dynamic cost drag
             - 0.10 * vector[20]  # sigma expansion risk
             + 0.20 * vector[21]  # microstructure freshness bonus
+            + 0.85 * vector[22]  # normalized spot-vs-strike delta (binary payoff core)
+            + 0.05 * (vector[23] - 0.5)  # mild phase-of-window bias
+            + 0.30 * vector[24]  # fair-value model directional prior
+            - 0.08 * vector[25]  # very high implied vol reduces confidence
         )
         return _safe_probability(_sigmoid(score))
 
@@ -640,6 +955,8 @@ class EnsembleSignalModel:
             "ml_signal_confidence": float(confidence),
             "ml_signal_direction": "UP" if edge > 0.0 else ("DOWN" if edge < 0.0 else "NEUTRAL"),
             "ml_model": self.model_name,
+            "ml_model_version": self.model_version,
+            "ml_model_state_version": self.model_state_version,
             "ml_model_ready": bool(self.models),
             "ml_model_samples": int(len(self.train_labels)),
             "ml_model_horizon_ms": int(self.label_horizon_ms),
@@ -649,6 +966,17 @@ class EnsembleSignalModel:
             "ml_model_eval_auc": self.last_eval_auc,
             "ml_model_eval_accuracy": self.last_eval_accuracy,
             "ml_model_eval_brier": self.last_eval_brier,
+            "ml_model_walk_forward_auc": self.last_walk_forward_auc,
+            "ml_feature_drift_score": float(self.feature_drift_last),
+            "ml_feature_drift_ema": float(self.feature_drift_ema),
+            "ml_feature_drift_alert_threshold": float(self.feature_drift_alert_threshold),
+            "ml_feature_drift_blend_threshold": float(self.feature_drift_blend_threshold),
+            "ml_feature_importance_top": self.feature_importance_top,
+            "ml_feature_importance_updated_ts": (
+                int(self.feature_importance_updated_at_ms)
+                if self.feature_importance_updated_at_ms > 0
+                else None
+            ),
             "ml_telemetry_exception_total": int(sum(self.exception_counts.values())),
             "ml_telemetry_last_exception_scope": self.last_exception_scope,
             "ml_telemetry_last_exception_message": self.last_exception_message,

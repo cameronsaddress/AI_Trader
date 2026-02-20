@@ -89,6 +89,11 @@ export type PolymarketLiveExecutionResult = {
     orders: LiveExecutionOrderResult[];
     throttled?: boolean;
     bypassed?: boolean;
+    slippageBlocked?: boolean;
+    rollbackAttempted?: boolean;
+    rollbackCancelled?: number;
+    rollbackFailed?: number;
+    rollbackError?: string;
 };
 
 export type PolymarketPreflightReadiness = {
@@ -127,6 +132,13 @@ type DedupeStoreLike = {
         },
     ): Promise<unknown>;
 };
+
+class PolymarketTimeoutError extends Error {
+    public constructor(operation: string, timeoutMs: number) {
+        super(`${operation} timed out after ${timeoutMs}ms`);
+        this.name = 'PolymarketTimeoutError';
+    }
+}
 
 function asRecord(input: unknown): Record<string, unknown> | null {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
@@ -209,6 +221,118 @@ function maskSignature(signature: string | undefined): string | undefined {
         return signature;
     }
     return `${signature.slice(0, 10)}...${signature.slice(-8)}`;
+}
+
+function asBoolean(input: unknown): boolean | null {
+    if (typeof input === 'boolean') {
+        return input;
+    }
+    if (typeof input === 'number') {
+        return Number.isFinite(input) ? input !== 0 : null;
+    }
+    if (typeof input === 'string') {
+        const normalized = input.trim().toLowerCase();
+        if (normalized === 'true' || normalized === '1') {
+            return true;
+        }
+        if (normalized === 'false' || normalized === '0') {
+            return false;
+        }
+    }
+    return null;
+}
+
+function parseOrderId(input: unknown): string | null {
+    if (typeof input !== 'string') {
+        return null;
+    }
+    const trimmed = input.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function cancellationStatusLooksSuccessful(status: string | null): boolean {
+    if (!status) {
+        return false;
+    }
+    const normalized = status.toLowerCase();
+    return normalized.includes('cancel')
+        || normalized === 'ok'
+        || normalized === 'success';
+}
+
+function extractRollbackCancelledOrderIds(
+    rawResult: unknown,
+    requestedOrderIds: string[],
+): Set<string> {
+    const requested = new Set(requestedOrderIds);
+    const cancelled = new Set<string>();
+
+    const markIfRequested = (rawId: unknown): void => {
+        const id = parseOrderId(rawId);
+        if (!id || !requested.has(id)) {
+            return;
+        }
+        cancelled.add(id);
+    };
+
+    const inspectEntry = (entry: unknown): void => {
+        if (typeof entry === 'string') {
+            markIfRequested(entry);
+            return;
+        }
+        const record = asRecord(entry);
+        if (!record) {
+            return;
+        }
+        const id = parseOrderId(record.orderID)
+            || parseOrderId(record.orderId)
+            || parseOrderId(record.id);
+        if (!id || !requested.has(id)) {
+            return;
+        }
+
+        const cancelledFlag = asBoolean(record.cancelled)
+            ?? asBoolean(record.canceled)
+            ?? asBoolean(record.success);
+        const status = asString(record.status);
+        if (cancelledFlag === true || cancellationStatusLooksSuccessful(status)) {
+            cancelled.add(id);
+        }
+    };
+
+    const root = asRecord(rawResult);
+    if (!root) {
+        if (asBoolean(rawResult) === true) {
+            requestedOrderIds.forEach((id) => cancelled.add(id));
+        }
+        return cancelled;
+    }
+
+    const explicitCollections = [
+        root.cancelled,
+        root.canceled,
+        root.cancelledOrders,
+        root.canceledOrders,
+        root.orderIds,
+        root.orderIDs,
+        root.orders,
+        root.results,
+    ];
+    for (const collection of explicitCollections) {
+        if (!Array.isArray(collection)) {
+            continue;
+        }
+        collection.forEach((entry) => inspectEntry(entry));
+    }
+
+    if (cancelled.size === 0 && asBoolean(root.success) === true) {
+        requestedOrderIds.forEach((id) => cancelled.add(id));
+    }
+
+    if (cancelled.size === 0) {
+        inspectEntry(root);
+    }
+    return cancelled;
 }
 
 function parseExecutionCandidate(input: unknown): ParsedExecutionCandidate | null {
@@ -329,10 +453,19 @@ export class PolymarketPreflightService {
     private readonly executionDedupeTtlMs: number;
     private readonly preflightRetentionMs: number;
     private readonly executionRetentionMs: number;
+    private readonly clobCallTimeoutMs: number;
+    private readonly slippageCheckEnabled: boolean;
+    private readonly slippageMaxBps: number;
+    private readonly slippageMinAbsolute: number;
+    private readonly depthCheckEnabled: boolean;
+    private readonly minBookFillRatio: number;
+    private readonly rollbackOnPartialFill: boolean;
+    private readonly initRetryCooldownMs: number;
 
     private client: ClobClient | null = null;
     private initPromise: Promise<void> | null = null;
     private disabledReason: string | null = null;
+    private lastInitAttemptMs = 0;
 
     constructor(dedupeStore?: DedupeStoreLike | null) {
         this.host = process.env.POLYMARKET_CLOB_HOST || 'https://clob.polymarket.com';
@@ -359,6 +492,20 @@ export class PolymarketPreflightService {
         this.executionDedupeTtlMs = Math.max(
             this.executionMinIntervalMs,
             Number(process.env.POLY_EXECUTION_REDIS_DEDUPE_TTL_MS || String(this.executionRetentionMs)),
+        );
+        this.clobCallTimeoutMs = Math.max(1_000, Number(process.env.POLY_CLOB_CALL_TIMEOUT_MS || '8000'));
+        this.slippageCheckEnabled = process.env.POLY_EXECUTION_SLIPPAGE_CHECK_ENABLED !== 'false';
+        this.slippageMaxBps = Math.max(0, Number(process.env.POLY_EXECUTION_SLIPPAGE_MAX_BPS || '45'));
+        this.slippageMinAbsolute = Math.max(0, Number(process.env.POLY_EXECUTION_SLIPPAGE_MIN_ABS || '0.008'));
+        this.depthCheckEnabled = process.env.POLY_EXECUTION_DEPTH_CHECK_ENABLED !== 'false';
+        this.minBookFillRatio = Math.min(
+            1.5,
+            Math.max(0.5, Number(process.env.POLY_EXECUTION_MIN_BOOK_FILL_RATIO || '1.0')),
+        );
+        this.rollbackOnPartialFill = process.env.POLY_EXECUTION_ROLLBACK_ON_PARTIAL_FILL !== 'false';
+        this.initRetryCooldownMs = Math.max(
+            2_000,
+            Number(process.env.POLY_INIT_RETRY_COOLDOWN_MS || '15_000'),
         );
         this.liveStrategyAllowlist = new Set(
             (process.env.POLY_LIVE_STRATEGY_ALLOWLIST || '*')
@@ -387,14 +534,49 @@ export class PolymarketPreflightService {
         if (this.client) {
             return true;
         }
-        if (this.disabledReason) {
+        const now = Date.now();
+        if (this.disabledReason && !this.canRetryInit(now)) {
             return false;
+        }
+        if (this.canRetryInit(now)) {
+            logger.warn('[PolymarketPreflight] retrying client initialization after transient failure');
+            this.disabledReason = null;
         }
         if (!this.initPromise) {
             this.initPromise = this.initClient();
         }
-        await this.initPromise;
+        try {
+            await this.initPromise;
+        } finally {
+            this.initPromise = null;
+        }
         return this.client !== null;
+    }
+
+    private canRetryInit(now = Date.now()): boolean {
+        if (!this.disabledReason || !this.disabledReason.startsWith('Initialization failed:')) {
+            return false;
+        }
+        return now - this.lastInitAttemptMs >= this.initRetryCooldownMs;
+    }
+
+    private async withTimeout<T>(operation: string, task: () => Promise<T>): Promise<T> {
+        if (this.clobCallTimeoutMs <= 0) {
+            return task();
+        }
+        let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+        const timeoutPromise = new Promise<T>((_resolve, reject) => {
+            timeoutHandle = setTimeout(() => {
+                reject(new PolymarketTimeoutError(operation, this.clobCallTimeoutMs));
+            }, this.clobCallTimeoutMs);
+        });
+        try {
+            return await Promise.race([task(), timeoutPromise]);
+        } finally {
+            if (timeoutHandle) {
+                clearTimeout(timeoutHandle);
+            }
+        }
     }
 
     private async initClient(): Promise<void> {
@@ -403,9 +585,13 @@ export class PolymarketPreflightService {
         }
 
         try {
+            this.lastInitAttemptMs = Date.now();
             const signer = new Wallet(this.privateKey!);
             const l1Client = new ClobClient(this.host, this.chainId as 137 | 80002, signer);
-            const creds = await l1Client.createOrDeriveApiKey();
+            const creds = await this.withTimeout(
+                'createOrDeriveApiKey',
+                () => l1Client.createOrDeriveApiKey(),
+            );
 
             this.client = new ClobClient(
                 this.host,
@@ -420,6 +606,7 @@ export class PolymarketPreflightService {
                 undefined,
                 this.retryOnError,
             );
+            this.disabledReason = null;
 
             logger.info(
                 `[PolymarketPreflight] initialized for funder ${this.funderAddress} on chain ${this.chainId} (${this.host})`,
@@ -428,6 +615,7 @@ export class PolymarketPreflightService {
             const message = error instanceof Error ? error.message : String(error);
             this.disabledReason = `Initialization failed: ${message}`;
             logger.error(`[PolymarketPreflight] initialization failed: ${message}`);
+            this.client = null;
         }
     }
 
@@ -625,6 +813,152 @@ export class PolymarketPreflightService {
         };
     }
 
+    private normalizeBookTopPrice(raw: unknown): number | null {
+        const parsed = asNumber(raw);
+        if (parsed === null || !(parsed > 0 && parsed < 1)) {
+            return null;
+        }
+        return parsed;
+    }
+
+    private slippageTolerance(price: number): number {
+        const bpsTolerance = (this.slippageMaxBps / 10_000) * Math.abs(price);
+        return Math.max(this.slippageMinAbsolute, bpsTolerance);
+    }
+
+    private normalizeBookSize(raw: unknown): number | null {
+        const parsed = asNumber(raw);
+        if (parsed === null || !(parsed > 0)) {
+            return null;
+        }
+        return parsed;
+    }
+
+    private orderBookLevels(orderBook: unknown, side: Side): unknown[] {
+        const record = asRecord(orderBook);
+        const levels = side === Side.BUY ? record?.asks : record?.bids;
+        return Array.isArray(levels) ? levels : [];
+    }
+
+    private availableBookSizeWithinLimit(orderBook: unknown, side: Side, limitPrice: number): number {
+        const levels = this.orderBookLevels(orderBook, side);
+        let available = 0;
+        for (const entry of levels) {
+            const level = asRecord(entry);
+            if (!level) {
+                continue;
+            }
+            const levelPrice = this.normalizeBookTopPrice(level.price);
+            const levelSize = this.normalizeBookSize(level.size ?? level.amount ?? level.quantity);
+            if (levelPrice === null || levelSize === null) {
+                continue;
+            }
+            const priceWithinLimit = side === Side.BUY
+                ? levelPrice <= limitPrice
+                : levelPrice >= limitPrice;
+            if (!priceWithinLimit) {
+                continue;
+            }
+            available += levelSize;
+        }
+        return available;
+    }
+
+    private buildFailedExecutionFromCandidate(
+        candidate: ParsedExecutionCandidate,
+        reason: string,
+        options: { slippageBlocked?: boolean } = {},
+    ): PolymarketLiveExecutionResult {
+        return {
+            market: candidate.market,
+            strategy: candidate.strategy,
+            mode: candidate.mode,
+            timestamp: candidate.timestamp,
+            total: candidate.orders.length,
+            posted: 0,
+            failed: candidate.orders.length,
+            ok: false,
+            dryRun: true,
+            reason,
+            slippageBlocked: options.slippageBlocked,
+            orders: candidate.orders.map((order) => ({
+                tokenId: order.tokenId,
+                conditionId: order.conditionId,
+                side: order.side,
+                price: order.price,
+                inputSize: order.inputSize,
+                sizeUnit: order.sizeUnit,
+                notionalUsd: order.notionalUsd,
+                size: order.size,
+                ok: false,
+                error: reason,
+            })),
+        };
+    }
+
+    private async validateSlippage(
+        candidate: ParsedExecutionCandidate,
+    ): Promise<{ ok: true } | { ok: false; reason: string }> {
+        if (!this.slippageCheckEnabled) {
+            return { ok: true };
+        }
+        for (const order of candidate.orders) {
+            const orderBook = await this.withTimeout(
+                `getOrderBook(${order.tokenId})`,
+                () => this.client!.getOrderBook(order.tokenId),
+            );
+            const top = order.side === Side.BUY
+                ? this.normalizeBookTopPrice(orderBook?.asks?.[0]?.price)
+                : this.normalizeBookTopPrice(orderBook?.bids?.[0]?.price);
+            if (top === null) {
+                return {
+                    ok: false,
+                    reason: `slippage guard: missing top-of-book for ${order.tokenId} (${order.side})`,
+                };
+            }
+            const tolerance = this.slippageTolerance(order.price);
+            const allowed = order.side === Side.BUY
+                ? order.price + tolerance
+                : order.price - tolerance;
+            const ok = order.side === Side.BUY
+                ? top <= allowed
+                : top >= allowed;
+            if (!ok) {
+                const direction = order.side === Side.BUY ? 'up' : 'down';
+                return {
+                    ok: false,
+                    reason: [
+                        `slippage guard blocked ${order.side} ${order.tokenId}:`,
+                        `signal=${order.price.toFixed(4)}`,
+                        `book_top=${top.toFixed(4)}`,
+                        `allowed=${allowed.toFixed(4)}`,
+                        `tol=${tolerance.toFixed(4)}`,
+                        `drift_${direction}=${Math.abs(top - order.price).toFixed(4)}`,
+                    ].join(' '),
+                };
+            }
+
+            if (this.depthCheckEnabled) {
+                const requiredShares = Math.max(0, order.size * this.minBookFillRatio);
+                const availableShares = this.availableBookSizeWithinLimit(orderBook, order.side, allowed);
+                if (availableShares + 1e-9 < requiredShares) {
+                    return {
+                        ok: false,
+                        reason: [
+                            `depth guard blocked ${order.side} ${order.tokenId}:`,
+                            `required_shares=${requiredShares.toFixed(4)}`,
+                            `available_shares=${availableShares.toFixed(4)}`,
+                            `signal_size=${order.size.toFixed(4)}`,
+                            `fill_ratio=${this.minBookFillRatio.toFixed(2)}`,
+                            `price_limit=${allowed.toFixed(4)}`,
+                        ].join(' '),
+                    };
+                }
+            }
+        }
+        return { ok: true };
+    }
+
     private async signCandidateOrders(
         candidate: ParsedExecutionCandidate,
     ): Promise<{ results: PreflightOrderResult[]; signedOrders: SignedOrderCandidate[] }> {
@@ -633,24 +967,33 @@ export class PolymarketPreflightService {
 
         for (const order of candidate.orders) {
             try {
-                const tickSize = order.tickSize || (await this.client!.getTickSize(order.tokenId));
+                const tickSize = order.tickSize || (await this.withTimeout(
+                    `getTickSize(${order.tokenId})`,
+                    () => this.client!.getTickSize(order.tokenId),
+                ));
                 const negRisk = typeof order.negRisk === 'boolean'
                     ? order.negRisk
-                    : await this.client!.getNegRisk(order.tokenId);
+                    : await this.withTimeout(
+                        `getNegRisk(${order.tokenId})`,
+                        () => this.client!.getNegRisk(order.tokenId),
+                    );
 
                 const createOrderOptions: CreateOrderOptionsArg = {
                     tickSize,
                     negRisk,
                 };
 
-                const signedOrder = await this.client!.createOrder(
-                    {
-                        tokenID: order.tokenId,
-                        price: order.price,
-                        size: order.size,
-                        side: order.side,
-                    },
-                    createOrderOptions,
+                const signedOrder = await this.withTimeout(
+                    `createOrder(${order.tokenId})`,
+                    () => this.client!.createOrder(
+                        {
+                            tokenID: order.tokenId,
+                            price: order.price,
+                            size: order.size,
+                            side: order.side,
+                        },
+                        createOrderOptions,
+                    ),
                 );
 
                 signedOrders.push({
@@ -750,7 +1093,11 @@ export class PolymarketPreflightService {
                     ? 'LIVE_THROTTLED'
                     : result.bypassed
                         ? 'LIVE_BYPASS'
-                        : 'LIVE_SAFE'
+                        : result.slippageBlocked
+                            ? 'LIVE_SLIPPAGE_BLOCK'
+                            : result.ok
+                                ? 'LIVE_SAFE'
+                                : 'LIVE_GUARD_BLOCK'
             )
             : result.ok
                 ? 'LIVE_POST'
@@ -992,10 +1339,18 @@ export class PolymarketPreflightService {
             };
         }
 
+        const slippage = await this.validateSlippage(candidate);
+        if (!slippage.ok) {
+            return this.buildFailedExecutionFromCandidate(candidate, slippage.reason, { slippageBlocked: true });
+        }
+
         const orderType = candidate.orderType || this.liveOrderType;
         const orderResults = await Promise.all(signedOrders.map(async (order): Promise<LiveExecutionOrderResult> => {
             try {
-                const response = await this.client!.postOrder(order.signedOrder, orderType);
+                const response = await this.withTimeout(
+                    `postOrder(${order.tokenId})`,
+                    () => this.client!.postOrder(order.signedOrder, orderType),
+                );
                 const orderId = asString(asRecord(response)?.orderID);
                 const status = asString(asRecord(response)?.status);
                 const txHashesRaw = asRecord(response)?.transactionsHashes;
@@ -1038,6 +1393,43 @@ export class PolymarketPreflightService {
 
         const posted = orderResults.filter((order) => order.ok).length;
         const failed = orderResults.length - posted;
+        const successfulOrderIds = orderResults
+            .filter((order) => order.ok && order.orderId)
+            .map((order) => order.orderId as string);
+        let rollbackAttempted = false;
+        let rollbackCancelled = 0;
+        let rollbackFailed = 0;
+        let rollbackError: string | undefined;
+
+        if (this.rollbackOnPartialFill && posted > 0 && failed > 0 && successfulOrderIds.length > 0) {
+            rollbackAttempted = true;
+            try {
+                const cancelResult = await this.withTimeout(
+                    `cancelOrders(${successfulOrderIds.length})`,
+                    () => this.client!.cancelOrders(successfulOrderIds),
+                );
+                const cancelledIds = extractRollbackCancelledOrderIds(cancelResult, successfulOrderIds);
+                rollbackCancelled = cancelledIds.size;
+                rollbackFailed = Math.max(0, successfulOrderIds.length - rollbackCancelled);
+                if (rollbackFailed > 0) {
+                    rollbackError = `rollback cancellation unverified for ${rollbackFailed}/${successfulOrderIds.length} order(s)`;
+                    logger.error(
+                        `[PolymarketPreflight] partial fill rollback incomplete for ${candidate.strategy}: ${rollbackError}`,
+                    );
+                } else {
+                    logger.warn(
+                        `[PolymarketPreflight] partial fill detected for ${candidate.strategy}; rollback verified for ${rollbackCancelled} order(s)`,
+                    );
+                }
+            } catch (error) {
+                rollbackCancelled = 0;
+                rollbackFailed = successfulOrderIds.length;
+                rollbackError = error instanceof Error ? error.message : String(error);
+                logger.error(
+                    `[PolymarketPreflight] partial fill rollback failed for ${candidate.strategy}: ${rollbackError}`,
+                );
+            }
+        }
 
         return {
             market: candidate.market,
@@ -1049,8 +1441,18 @@ export class PolymarketPreflightService {
             failed,
             ok: failed === 0,
             dryRun: false,
-            reason: failed === 0 ? undefined : `${failed} order(s) failed to post`,
+            reason: failed === 0
+                ? undefined
+                : (
+                    rollbackAttempted
+                        ? `partial fill detected (${failed} failed); rollback ${rollbackError ? 'failed' : 'attempted'}`
+                        : `${failed} order(s) failed to post`
+                ),
             orders: orderResults,
+            rollbackAttempted: rollbackAttempted || undefined,
+            rollbackCancelled: rollbackAttempted ? rollbackCancelled : undefined,
+            rollbackFailed: rollbackAttempted ? rollbackFailed : undefined,
+            rollbackError,
         };
     }
 }

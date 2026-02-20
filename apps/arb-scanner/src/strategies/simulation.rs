@@ -75,6 +75,14 @@ pub enum FillStyle {
     Taker,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MakerFillOutcome {
+    pub fill_probability: f64,
+    pub filled: bool,
+    pub execution_price: f64,
+    pub adverse_bps: f64,
+}
+
 pub fn side_cost_rate(model: SimCostModel, style: FillStyle) -> f64 {
     match style {
         FillStyle::Maker => model.maker_side_cost_rate(),
@@ -84,6 +92,47 @@ pub fn side_cost_rate(model: SimCostModel, style: FillStyle) -> f64 {
 
 pub fn net_return_after_cost(gross_return: f64, model: SimCostModel) -> f64 {
     gross_return - model.round_trip_cost_rate()
+}
+
+pub fn estimate_maker_fill_probability(spread: f64, book_age_ms: i64, expected_net_return: f64) -> f64 {
+    let spread_factor = ((spread - 0.01) / 0.10).clamp(0.0, 1.0);
+    let freshness_factor = (1.0 - ((book_age_ms.max(0) as f64) / 2_500.0)).clamp(0.0, 1.0);
+    let edge_factor = (expected_net_return / 0.01).clamp(0.0, 1.5) / 1.5;
+    (0.10 + (0.45 * spread_factor) + (0.30 * freshness_factor) + (0.15 * edge_factor)).clamp(0.05, 0.95)
+}
+
+pub fn simulate_maker_entry_fill(
+    entry_price: f64,
+    spread: f64,
+    book_age_ms: i64,
+    expected_net_return: f64,
+    model: SimCostModel,
+    uniform_sample: f64,
+) -> MakerFillOutcome {
+    let fill_probability = estimate_maker_fill_probability(spread, book_age_ms, expected_net_return);
+    let sampled = uniform_sample.clamp(0.0, 1.0);
+    if sampled > fill_probability {
+        return MakerFillOutcome {
+            fill_probability,
+            filled: false,
+            execution_price: entry_price,
+            adverse_bps: 0.0,
+        };
+    }
+
+    let stale_factor = ((book_age_ms.max(0) as f64) / 2_500.0).clamp(0.0, 1.0);
+    let adverse_confidence = ((1.0 - fill_probability) * 0.65 + stale_factor * 0.35).clamp(0.0, 1.0);
+    let adverse_bps = (model.maker_adverse_bps_per_side * (0.4 + adverse_confidence)).clamp(0.0, 50.0);
+    let adverse_rate = adverse_bps / 10_000.0;
+    let spread_slip = spread.max(0.0) * adverse_confidence * 0.50;
+    let execution_price = (entry_price * (1.0 + adverse_rate) + spread_slip).clamp(0.001, 0.999);
+
+    MakerFillOutcome {
+        fill_probability,
+        filled: true,
+        execution_price,
+        adverse_bps,
+    }
 }
 
 pub fn realized_pnl(size_usd: f64, gross_return: f64, model: SimCostModel) -> f64 {
@@ -239,5 +288,34 @@ mod tests {
         // Edge cases
         assert_eq!(polymarket_taker_fee(0.0, rate), 0.0);
         assert_eq!(polymarket_taker_fee(1.0, rate), 0.0);
+    }
+
+    #[test]
+    fn maker_fill_probability_prefers_wider_fresh_books() {
+        let wide_fresh = estimate_maker_fill_probability(0.08, 200, 0.003);
+        let tight_stale = estimate_maker_fill_probability(0.01, 3_500, 0.003);
+        assert!(wide_fresh > tight_stale);
+    }
+
+    #[test]
+    fn maker_fill_simulation_returns_miss_when_sample_exceeds_probability() {
+        let model = SimCostModel::default();
+        let outcome = simulate_maker_entry_fill(0.42, 0.02, 200, 0.001, model, 0.99);
+        assert!(!outcome.filled);
+        assert!((outcome.execution_price - 0.42).abs() < 1e-9);
+    }
+
+    #[test]
+    fn maker_fill_simulation_applies_adverse_price_on_fill() {
+        let model = SimCostModel {
+            fee_bps_per_side: 10.0,
+            slippage_bps_per_side: 8.0,
+            maker_rebate_bps_per_side: 1.5,
+            maker_adverse_bps_per_side: 4.0,
+        };
+        let outcome = simulate_maker_entry_fill(0.40, 0.06, 1_500, 0.004, model, 0.0);
+        assert!(outcome.filled);
+        assert!(outcome.execution_price >= 0.40);
+        assert!(outcome.adverse_bps > 0.0);
     }
 }

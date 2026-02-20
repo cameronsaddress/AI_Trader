@@ -26,17 +26,30 @@ const format = winston.format.combine(
     ),
 );
 
+const logLevel = (
+    process.env.LOG_LEVEL
+    || (process.env.NODE_ENV === 'development' ? 'debug' : 'info')
+).toLowerCase();
+const maxSizeBytes = Math.max(1_000_000, Number(process.env.LOG_MAX_SIZE_BYTES || `${20 * 1024 * 1024}`));
+const maxFiles = Math.max(1, Number(process.env.LOG_MAX_FILES || '10'));
+
 const transports = [
     new winston.transports.Console(),
     new winston.transports.File({
         filename: 'logs/error.log',
         level: 'error',
+        maxsize: maxSizeBytes,
+        maxFiles,
     }),
-    new winston.transports.File({ filename: 'logs/all.log' }),
+    new winston.transports.File({
+        filename: 'logs/all.log',
+        maxsize: maxSizeBytes,
+        maxFiles,
+    }),
 ];
 
 export const logger = winston.createLogger({
-    level: process.env.NODE_ENV === 'development' ? 'debug' : 'warn',
+    level: logLevel,
     levels,
     format,
     transports,

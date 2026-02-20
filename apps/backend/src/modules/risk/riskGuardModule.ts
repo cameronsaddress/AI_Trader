@@ -15,6 +15,8 @@ export interface RiskGuardState {
 
 interface RiskGuardConfig {
     trailingStop: number;
+    trailingStopPct: number;
+    trailingStopPctAbsCap: number;
     consecutiveLossLimit: number;
     consecutiveLossCooldownMs: number;
     postLossCooldownMs: number;
@@ -39,6 +41,10 @@ interface RedisLike {
     del(key: string): Promise<unknown>;
     expire(key: string, seconds: number): Promise<unknown>;
     incrByFloat(key: string, increment: number): Promise<unknown>;
+    multi?: () => {
+        incrByFloat(key: string, increment: number): unknown;
+        exec(): Promise<unknown>;
+    };
 }
 
 interface RiskGuardModuleDeps {
@@ -47,6 +53,13 @@ interface RiskGuardModuleDeps {
     emitStrategyStatusUpdate: (status: Record<string, boolean>) => void;
     emitRiskGuardUpdate: (payload: { strategy: string } & RiskGuardState) => void;
     emitVaultUpdate: (payload: { swept?: number; vault: number; ceiling: number }) => void;
+    emitRiskGuardPause?: (payload: {
+        strategy: string;
+        reason: string;
+        paused_until: number;
+        pause_duration_ms: number;
+        timestamp: number;
+    }) => void;
     recordError: (scope: string, error: unknown, context?: Record<string, unknown>) => void;
     config: RiskGuardConfig;
 }
@@ -215,6 +228,27 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
             }
         }
 
+        if (!shouldPause && deps.config.trailingStopPct > 0) {
+            const drawdown = state.peakPnl - state.cumPnl;
+            const bankrollRaw = await deps.redis.get(deps.config.simBankrollKey);
+            let bankroll = Number(bankrollRaw);
+            if (!Number.isFinite(bankroll) || bankroll <= 0) {
+                const cashRaw = await deps.redis.get(deps.config.simLedgerCashKey);
+                bankroll = Number(cashRaw);
+            }
+            if (Number.isFinite(bankroll) && bankroll > 0) {
+                let pctThreshold = bankroll * deps.config.trailingStopPct;
+                if (deps.config.trailingStopPctAbsCap > 0) {
+                    pctThreshold = Math.min(pctThreshold, deps.config.trailingStopPctAbsCap);
+                }
+                if (drawdown >= pctThreshold) {
+                    shouldPause = true;
+                    pauseReason = `trailing_stop_pct: drawdown $${drawdown.toFixed(2)} >= ${(deps.config.trailingStopPct * 100).toFixed(1)}% equity ($${pctThreshold.toFixed(2)})`;
+                    pauseDurationMs = nextDayBoundaryMs() - now;
+                }
+            }
+        }
+
         if (!shouldPause && deps.config.dailyTarget > 0 && state.cumPnl >= deps.config.dailyTarget) {
             shouldPause = true;
             pauseReason = `daily_target: cumPnl $${state.cumPnl.toFixed(2)} >= target $${deps.config.dailyTarget}`;
@@ -250,6 +284,13 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
             deps.strategyStatus[strategyId] = false;
             deps.emitStrategyStatusUpdate(deps.strategyStatus);
             logger.info(`[RiskGuard] paused ${strategyId}: ${pauseReason} | resume at ${new Date(state.pausedUntil).toISOString()}`);
+            deps.emitRiskGuardPause?.({
+                strategy: strategyId,
+                reason: pauseReason,
+                paused_until: state.pausedUntil,
+                pause_duration_ms: pauseDurationMs,
+                timestamp: now,
+            });
 
             if (pauseDurationMs > 0 && pauseDurationMs < 86_400_000) {
                 clearResumeTimer(strategyId);
@@ -297,9 +338,17 @@ export function createRiskGuardModule(deps: RiskGuardModuleDeps) {
                 return;
             }
 
-            await deps.redis.incrByFloat(deps.config.simLedgerCashKey, -excess);
-            await deps.redis.incrByFloat(deps.config.simBankrollKey, -excess);
-            await deps.redis.incrByFloat(deps.config.vaultRedisKey, excess);
+            if (typeof deps.redis.multi !== 'function') {
+                throw new Error('vault sweep requires atomic Redis MULTI/EXEC support');
+            }
+            const tx = deps.redis.multi();
+            tx.incrByFloat(deps.config.simLedgerCashKey, -excess);
+            tx.incrByFloat(deps.config.simBankrollKey, -excess);
+            tx.incrByFloat(deps.config.vaultRedisKey, excess);
+            const txResult = await tx.exec();
+            if (txResult === null) {
+                throw new Error('vault sweep transaction aborted');
+            }
 
             const vault = parseFloat(await deps.redis.get(deps.config.vaultRedisKey) || '0');
             logger.info(`[Vault] swept $${excess.toFixed(2)} to vault (total locked: $${vault.toFixed(2)})`);

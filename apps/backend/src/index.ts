@@ -31,6 +31,7 @@ import { FeatureRegistryRecorder } from './services/FeatureRegistryRecorder';
 import { RejectedSignalRecorder } from './services/RejectedSignalRecorder';
 import { extractBearerToken } from './middleware/auth';
 import { connectRedis, redisClient, subscriber as redisSubscriber } from './config/redis';
+import { validateStartupConfigOrThrow } from './config/startupValidation';
 import { createRiskGuardModule } from './modules/risk/riskGuardModule';
 import { decideBootResumeAction, shouldResumeFromBootTimer } from './modules/risk/bootResumeDecider';
 import {
@@ -46,7 +47,10 @@ import {
 } from './modules/ledger/ledgerHealthModule';
 import {
     processArbitrageExecutionWorker,
+    type ArbExecutionWorkerResult,
     type RejectedSignalRecord,
+    type SettlementDlqEntry,
+    type OpsAlertPayload,
 } from './modules/execution/arbExecutionPipeline';
 import {
     clearExecutionHistory as clearExecutionHistoryStore,
@@ -59,34 +63,73 @@ import {
     type EntryFreshnessViolationCategory,
 } from './modules/execution/entryFreshnessSlo';
 import { scheduleNonOverlappingTask } from './modules/runtime/scheduler';
+import { OpsAlertService } from './services/OpsAlertService';
 import {
     buildModelGateCalibrationSamples,
     type ModelGateCalibrationSample,
 } from './modules/model/modelGateCalibration';
 import { validateArbitrageScanContract } from './modules/ingest/scanContract';
+import {
+    aggregateFundingBasisAsset,
+    computeFundingBasisSignal,
+    computePolymarketMicrostructureSignal,
+    directionalOverlayMultiplier,
+    extractPolymarketBookSnapshot,
+    type FundingBasisAssetSnapshot,
+    type FundingBasisVenueSnapshot,
+    type PolymarketBookSnapshot,
+} from './modules/alpha/marketSignalOverlay';
 import { logger } from './utils/logger';
 
 dotenv.config();
 
 const app = express();
 const httpServer = createServer(app);
+const allowPrivateIpCorsOrigins = process.env.CORS_ALLOW_PRIVATE_IP_ORIGINS === 'true';
+const configuredPrivateIpCorsOrigins = new Set(
+    (process.env.CORS_ALLOWED_PRIVATE_IP_ORIGINS || '')
+        .split(',')
+        .map((origin) => origin.trim())
+        .filter((origin) => /^http:\/\/\d+\.\d+\.\d+\.\d+:3112$/.test(origin)),
+);
+const configuredCorsOrigins = new Set(
+    [
+        'http://localhost:3112',
+        'http://localhost:5114',
+        process.env.FRONTEND_URL,
+        ...(process.env.CORS_ALLOWED_ORIGINS || '')
+            .split(',')
+            .map((origin) => origin.trim())
+            .filter((origin) => origin.length > 0),
+    ]
+        .filter((origin): origin is string => typeof origin === 'string' && origin.length > 0),
+);
+
+function isCorsOriginAllowed(requestOrigin: string | undefined): boolean {
+    if (!requestOrigin) {
+        return true;
+    }
+    if (configuredCorsOrigins.has(requestOrigin)) {
+        return true;
+    }
+    if (allowPrivateIpCorsOrigins && configuredPrivateIpCorsOrigins.has(requestOrigin)) {
+        return true;
+    }
+    return false;
+}
+
+function corsOriginHandler(requestOrigin: string | undefined, callback: (err: Error | null, allow?: boolean) => void): void {
+    if (isCorsOriginAllowed(requestOrigin)) {
+        callback(null, true);
+        return;
+    }
+    logger.warn(`[CORS] blocked origin=${requestOrigin}`);
+    callback(new Error('Not allowed by CORS'));
+}
 
 const io = new Server(httpServer, {
     cors: {
-        origin: (requestOrigin, callback) => {
-            const allowed = [
-                'http://localhost:3112',
-                'http://localhost:5114',
-                process.env.FRONTEND_URL,
-            ];
-
-            if (!requestOrigin || allowed.includes(requestOrigin) || requestOrigin.match(/^http:\/\/\d+\.\d+\.\d+\.\d+:3112$/)) {
-                callback(null, true);
-            } else {
-                logger.warn(`[CORS] blocked origin=${requestOrigin}`);
-                callback(new Error('Not allowed by CORS'));
-            }
-        },
+        origin: corsOriginHandler,
         methods: ['GET', 'POST'],
         credentials: true,
     },
@@ -94,26 +137,59 @@ const io = new Server(httpServer, {
 
 app.use(helmet());
 app.use(cors({
-    origin: (requestOrigin, callback) => {
-        const allowed = [
-            'http://localhost:3112',
-            'http://localhost:5114',
-            process.env.FRONTEND_URL,
-        ];
-
-        if (!requestOrigin || allowed.includes(requestOrigin) || requestOrigin.match(/^http:\/\/\d+\.\d+\.\d+\.\d+:3112$/)) {
-            callback(null, true);
-        } else {
-            callback(new Error('Not allowed by CORS'));
-        }
-    },
+    origin: corsOriginHandler,
     methods: ['GET', 'POST'],
     credentials: true,
 }));
 app.use(express.json());
+app.use('/api', (req, res, next) => {
+    if (req.method !== 'GET') {
+        next();
+        return;
+    }
+    requireReadApiAuth(req, res, next);
+});
 
-app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.get('/health', async (_req, res) => {
+    let redisOk = true;
+    try {
+        await redisClient.ping();
+    } catch {
+        redisOk = false;
+    }
+    const scanner = scannerHeartbeatSnapshot(Date.now());
+    const settlementReady = settlementService.getReadinessSnapshot();
+    res.json({
+        status: redisOk ? 'ok' : 'degraded',
+        ready: redisOk && scanner.alive && settlementReady.ready,
+        checks: {
+            redis: redisOk,
+            scanner_heartbeat: scanner.alive,
+            settlement_ready: settlementReady.ready,
+        },
+        timestamp: new Date().toISOString(),
+    });
+});
+
+app.get('/ready', async (_req, res) => {
+    let redisOk = true;
+    try {
+        await redisClient.ping();
+    } catch {
+        redisOk = false;
+    }
+    const scanner = scannerHeartbeatSnapshot(Date.now());
+    const settlementReadiness = settlementService.getReadinessSnapshot();
+    const ready = redisOk && scanner.alive && settlementReadiness.ready;
+    res.status(ready ? 200 : 503).json({
+        ready,
+        checks: {
+            redis: redisOk,
+            scanner_heartbeat: scanner.alive,
+            settlement: settlementReadiness,
+        },
+        timestamp: new Date().toISOString(),
+    });
 });
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -156,16 +232,20 @@ import {
     STRATEGY_ALLOCATOR_TARGET_SHARPE, DEFAULT_DISABLED_STRATEGIES,
     META_ALLOCATOR_ENABLED, META_ALLOCATOR_META_BLEND,
     META_ALLOCATOR_MIN_OVERLAY, META_ALLOCATOR_MAX_OVERLAY,
+    META_ALLOCATOR_AGGREGATE_CAP,
     META_ALLOCATOR_FAMILY_CONCENTRATION_SOFT_CAP, META_ALLOCATOR_COST_DRAG_PENALTY_BPS,
     VAULT_ENABLED, VAULT_BANKROLL_CEILING, VAULT_REDIS_KEY,
     RISK_GUARD_TRAILING_STOP, RISK_GUARD_CONSEC_LOSS_LIMIT,
+    RISK_GUARD_TRAILING_STOP_PCT,
+    RISK_GUARD_TRAILING_STOP_PCT_ABS_CAP,
     RISK_GUARD_CONSEC_LOSS_COOLDOWN_MS, RISK_GUARD_POST_LOSS_COOLDOWN_MS,
     RISK_GUARD_ANTI_MARTINGALE_AFTER, RISK_GUARD_ANTI_MARTINGALE_FACTOR,
     RISK_GUARD_DIRECTION_LIMIT, RISK_GUARD_PROFIT_TAPER_START,
     RISK_GUARD_PROFIT_TAPER_FLOOR, RISK_GUARD_DAILY_TARGET,
     RISK_GUARD_DAY_RESET_HOUR_UTC, RISK_GUARD_STRATEGIES,
     SIGNAL_WINDOW_MS, SIM_RESET_ON_BOOT, RESET_VALIDATION_TRADES_ON_SIM_RESET,
-    CONTROL_PLANE_TOKEN,
+    RESET_FEATURE_REGISTRY_ON_SIM_RESET,
+    CONTROL_PLANE_TOKEN, API_READ_AUTH_REQUIRED, READ_API_TOKEN,
     INTELLIGENCE_GATE_ENABLED, INTELLIGENCE_GATE_MAX_STALENESS_MS,
     INTELLIGENCE_GATE_MIN_MARGIN, INTELLIGENCE_GATE_CONFIRMATION_WINDOW_MS,
     INTELLIGENCE_GATE_REQUIRE_PEER_CONFIRMATION, INTELLIGENCE_GATE_STRONG_MARGIN,
@@ -174,7 +254,13 @@ import {
     EXECUTION_SHORTFALL_MIN_RETAIN_BPS, EXECUTION_SHORTFALL_MAX_SIZE_REDUCTION_PCT,
     EXECUTION_SHORTFALL_MIN_SIGNAL_NOTIONAL_USD,
     EXECUTION_NETTING_ENABLED, EXECUTION_NETTING_TTL_MS,
-    EXECUTION_NETTING_MARKET_CAP_USD, EXECUTION_NETTING_OPPOSING_BLOCK_RATIO,
+    EXECUTION_NETTING_MARKET_CAP_USD, EXECUTION_NETTING_UNDERLYING_CAP_USD,
+    EXECUTION_NETTING_OPPOSING_BLOCK_RATIO,
+    RISK_GUARD_INLINE_PRECHECK_ENABLED, RISK_GUARD_INLINE_PRECHECK_MAX_AGE_MS,
+    SETTLEMENT_DLQ_REDIS_KEY, SETTLEMENT_DLQ_REPLAY_INTERVAL_MS,
+    SETTLEMENT_DLQ_REPLAY_BATCH, SETTLEMENT_DLQ_MAX_ATTEMPTS,
+    COLLATERAL_RECONCILIATION_ENABLED, COLLATERAL_RECONCILIATION_INTERVAL_MS,
+    COLLATERAL_RECONCILIATION_TOLERANCE_USD,
     DATA_INTEGRITY_ALERT_COOLDOWN_MS, DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_WARN,
     DATA_INTEGRITY_ALERT_MIN_CONSECUTIVE_CRITICAL, DATA_INTEGRITY_ALERT_RING_LIMIT,
     STRATEGY_SAMPLE_RETENTION,
@@ -192,16 +278,33 @@ import {
     CROSS_HORIZON_ROUTER_MIN_MARGIN, CROSS_HORIZON_ROUTER_STRONG_MARGIN,
     CROSS_HORIZON_ROUTER_CONFLICT_MULT, CROSS_HORIZON_ROUTER_CONFIRM_MULT,
     CROSS_HORIZON_ROUTER_MAX_BOOST, CROSS_HORIZON_OVERLAY_KEY_PREFIX,
+    IV_RV_DIVERGENCE_OVERLAY_ENABLED, IV_RV_DIVERGENCE_HIGH_RATIO,
+    IV_RV_DIVERGENCE_LOW_RATIO, IV_RV_DIVERGENCE_MAX_BOOST, IV_RV_DIVERGENCE_MAX_PENALTY,
+    FUNDING_BASIS_OVERLAY_ENABLED, FUNDING_BASIS_REFRESH_MS,
+    FUNDING_BASIS_HTTP_TIMEOUT_MS, FUNDING_BASIS_SIGNAL_THRESHOLD_BPS,
+    FUNDING_BASIS_BASIS_WEIGHT, FUNDING_BASIS_MAX_BOOST,
+    FUNDING_BASIS_MAX_PENALTY, FUNDING_BASIS_STALE_MS,
+    POLY_MICROSTRUCTURE_OVERLAY_ENABLED, POLY_MICROSTRUCTURE_SIGNAL_TTL_MS,
+    POLY_MICROSTRUCTURE_MIN_SHIFT_BPS, POLY_MICROSTRUCTURE_MAX_SPREAD_BPS,
+    POLY_MICROSTRUCTURE_MAX_BOOST, POLY_MICROSTRUCTURE_MAX_PENALTY,
+    CROSS_STRATEGY_CONFIRM_OVERLAY_ENABLED, CROSS_STRATEGY_CONFIRM_MAX_AGE_MS,
+    CROSS_STRATEGY_CONFIRM_OBI_MAX_BOOST, CROSS_STRATEGY_CONFIRM_OBI_MAX_PENALTY,
+    CROSS_STRATEGY_CONFIRM_CEX_MAX_BOOST, CROSS_STRATEGY_CONFIRM_CEX_MAX_PENALTY,
     MODEL_PROBABILITY_GATE_ENABLED, MODEL_PROBABILITY_GATE_ENFORCE_PAPER,
     MODEL_PROBABILITY_GATE_ENFORCE_LIVE, LEGACY_BRAIN_LOOP_ENABLED, LEGACY_BRAIN_LOOP_UNSAFE_OK,
     MODEL_PROBABILITY_GATE_MIN_PROB, MODEL_PROBABILITY_GATE_MAX_STALENESS_MS,
+    MODEL_PROBABILITY_GATE_MIN_STRATEGY_LABELED_ROWS,
     MODEL_PROBABILITY_GATE_REQUIRE_MODEL, MODEL_PROBABILITY_GATE_DISABLE_ON_DRIFT,
     MODEL_PROBABILITY_GATE_DRIFT_DISABLE_MS,
     MODEL_PROBABILITY_GATE_TUNER_ENABLED, MODEL_PROBABILITY_GATE_TUNER_ADVISORY_ONLY,
     MODEL_PROBABILITY_GATE_TUNER_INTERVAL_MS, MODEL_PROBABILITY_GATE_TUNER_LOOKBACK_MS,
     MODEL_PROBABILITY_GATE_COUNTERFACTUAL_WINDOW_MS,
+    MODEL_GATE_MIN_ROWS_FOR_ENFORCEMENT, MODEL_GATE_MIN_CV_FOLDS_FOR_ENFORCEMENT,
+    MODEL_GATE_MIN_CV_FOLDS_FOR_PAPER_ENFORCEMENT,
+    MODEL_GATE_MIN_CV_AUC_FOR_ENFORCEMENT, MODEL_GATE_MAX_CV_BRIER_FOR_ENFORCEMENT,
+    MODEL_GATE_MAX_CV_LOGLOSS_FOR_ENFORCEMENT,
     MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES, MODEL_PROBABILITY_GATE_TUNER_STEP,
-    MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT,
+    MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT, MODEL_PROBABILITY_GATE_TUNER_MIN_FLOOR,
     MODEL_TRAINER_ENABLED, MODEL_TRAINER_INTERVAL_MS,
     MODEL_TRAINER_MIN_LABELED_ROWS, MODEL_TRAINER_MIN_NEW_LABELS, MODEL_TRAINER_MAX_ROWS,
     MODEL_TRAINER_SPLITS, MODEL_TRAINER_PURGE_ROWS, MODEL_TRAINER_EMBARGO_ROWS,
@@ -216,6 +319,32 @@ import {
 // Runtime state (not extractable — mutable per-process)
 const executionTraces = new Map<string, ExecutionTrace>();
 const rejectedSignalsByExecutionId = new Map<string, RejectedSignalRecord>();
+const rejectedPnlRollbackByExecutionId = new Set<string>();
+const EXECUTION_DECISION_KEY_PREFIX = (
+    process.env.EXECUTION_DECISION_KEY_PREFIX
+    || 'execution:decision:'
+).trim() || 'execution:decision:';
+const EXECUTION_DECISION_TTL_SECONDS = Math.max(
+    5,
+    Number(process.env.EXECUTION_DECISION_TTL_SECONDS || '30'),
+);
+const REJECTED_PNL_ROLLBACK_TRACK_LIMIT = Math.max(
+    5_000,
+    Number(process.env.REJECTED_PNL_ROLLBACK_TRACK_LIMIT || '20000'),
+);
+const EXECUTION_ENTRY_JITTER_ENABLED = process.env.EXECUTION_ENTRY_JITTER_ENABLED !== 'false';
+const EXECUTION_ENTRY_JITTER_DELAY_MIN_MS = Math.max(
+    0,
+    Number(process.env.EXECUTION_ENTRY_JITTER_DELAY_MIN_MS || '100'),
+);
+const EXECUTION_ENTRY_JITTER_DELAY_MAX_MS = Math.max(
+    EXECUTION_ENTRY_JITTER_DELAY_MIN_MS,
+    Number(process.env.EXECUTION_ENTRY_JITTER_DELAY_MAX_MS || '500'),
+);
+const EXECUTION_ENTRY_JITTER_SIZE_PCT = Math.min(
+    0.10,
+    Math.max(0, Number(process.env.EXECUTION_ENTRY_JITTER_SIZE_PCT || '0.02')),
+);
 const strategyExecutionHistory = new Map<string, Record<string, unknown>[]>();
 type ExecutionHistoryContext = {
     execution_id: string;
@@ -373,6 +502,13 @@ function silentCatchTelemetryPayload(limit = 80): Record<string, {
     );
 }
 
+const opsAlertService = new OpsAlertService();
+
+async function notifyOpsAlert(payload: OpsAlertPayload): Promise<void> {
+    io.emit('ops_alert', payload);
+    await opsAlertService.notify(payload);
+}
+
 // ── Risk Guard state ─────────────────────────────────────────────────
 const {
     processRiskGuard,
@@ -393,9 +529,26 @@ const {
     emitVaultUpdate: (payload) => {
         io.emit('vault_update', payload);
     },
+    emitRiskGuardPause: (payload) => {
+        io.emit('risk_guard_pause', payload);
+        fireAndForget(
+            'OpsAlert.RiskGuardPause',
+            notifyOpsAlert({
+                severity: 'WARNING',
+                scope: 'RISK_GUARD',
+                message: `risk guard paused ${payload.strategy}: ${payload.reason}`,
+                strategy: payload.strategy,
+                timestamp: payload.timestamp,
+                details: payload,
+            }),
+            { strategy: payload.strategy },
+        );
+    },
     recordError: recordSilentCatch,
     config: {
         trailingStop: RISK_GUARD_TRAILING_STOP,
+        trailingStopPct: RISK_GUARD_TRAILING_STOP_PCT,
+        trailingStopPctAbsCap: RISK_GUARD_TRAILING_STOP_PCT_ABS_CAP,
         consecutiveLossLimit: RISK_GUARD_CONSEC_LOSS_LIMIT,
         consecutiveLossCooldownMs: RISK_GUARD_CONSEC_LOSS_COOLDOWN_MS,
         postLossCooldownMs: RISK_GUARD_POST_LOSS_COOLDOWN_MS,
@@ -650,6 +803,13 @@ let mlPipelineStatus: MlPipelineStatus = {
     model_rows: 0,
     model_feature_count: 0,
     model_cv_folds: 0,
+    model_cv_auc: null,
+    model_cv_brier: null,
+    model_cv_logloss: null,
+    model_gate_enforce_ready_paper: false,
+    model_gate_enforce_reason_paper: 'model not eligible',
+    model_gate_enforce_ready: false,
+    model_gate_enforce_reason: 'model not eligible',
     model_reason: 'no training report',
     updated_at: 0,
 };
@@ -889,8 +1049,59 @@ type CrossHorizonRouterState = {
     updated_at: number;
     reason: string;
 };
+type FundingBasisAssetState = FundingBasisAssetSnapshot & {
+    signal_bias: number;
+    signal_strength: number;
+    crowding_bps: number;
+    signal_reason: string;
+    stale: boolean;
+};
+type FundingBasisState = {
+    enabled: boolean;
+    refresh_ms: number;
+    assets: Record<string, FundingBasisAssetState>;
+    updated_at: number;
+    reason: string;
+};
+type MicrostructureUnderlyingState = {
+    underlying: string;
+    direction: number;
+    strength: number;
+    mid_shift_bps: number;
+    spread_bps: number;
+    updated_at: number;
+    reason: string;
+    stale: boolean;
+    last_snapshot: PolymarketBookSnapshot | null;
+};
+type ModeLedgerSnapshot = {
+    mode: TradingMode;
+    cash: number;
+    reserved: number;
+    realized_pnl: number;
+    equity: number;
+    captured_at: number;
+    reserved_by_strategy: Record<string, number>;
+    reserved_by_family: Record<string, number>;
+    reserved_by_underlying: Record<string, number>;
+};
 type ExecutionNettingMarketState = {
     market_key: string;
+    net_directional_notional: number;
+    long_notional: number;
+    short_notional: number;
+    strategy_directional_notional: Record<string, number>;
+    updated_at: number;
+};
+type ExecutionNettingUnderlyingState = {
+    underlying: string;
+    net_directional_notional: number;
+    long_notional: number;
+    short_notional: number;
+    strategy_directional_notional: Record<string, number>;
+    updated_at: number;
+};
+type ExecutionNettingStateCore = {
     net_directional_notional: number;
     long_notional: number;
     short_notional: number;
@@ -910,7 +1121,7 @@ type ScanFeatureSchemaState = {
     last_alert_at: number;
     updated_at: number;
 };
-type ExecutionPreparationStage = 'SHORTFALL' | 'NETTING';
+type ExecutionPreparationStage = 'SHORTFALL' | 'NETTING' | 'UNDERLYING_NETTING';
 type ExecutionPreparationResult = {
     ok: boolean;
     payload: unknown;
@@ -986,7 +1197,33 @@ let crossHorizonRouterState: CrossHorizonRouterState = {
     updated_at: 0,
     reason: 'cross-horizon router not initialized',
 };
+const FUNDING_BASIS_ASSETS = Array.from(new Set(
+    STRATEGY_IDS
+        .map((strategyId) => strategyUnderlying(strategyId))
+        .filter((underlying) => ['BTC', 'ETH', 'SOL', 'XRP'].includes(underlying)),
+));
+let fundingBasisState: FundingBasisState = {
+    enabled: FUNDING_BASIS_OVERLAY_ENABLED,
+    refresh_ms: FUNDING_BASIS_REFRESH_MS,
+    assets: {},
+    updated_at: 0,
+    reason: 'funding/basis feed not initialized',
+};
+const polymarketMicrostructureByUnderlying = new Map<string, MicrostructureUnderlyingState>();
+const MODE_LEDGER_SNAPSHOT_PREFIX = (
+    process.env.MODE_LEDGER_SNAPSHOT_PREFIX
+    || 'system:mode_ledger_snapshot:v1:'
+).trim() || 'system:mode_ledger_snapshot:v1:';
+const MODE_LEDGER_DEFAULT_BANKROLL = Math.max(
+    0,
+    Number(process.env.MODE_LEDGER_DEFAULT_BANKROLL || String(DEFAULT_SIM_BANKROLL)),
+);
+const SHUTDOWN_DRAIN_MS = Math.max(
+    0,
+    Number(process.env.SHUTDOWN_DRAIN_MS || '4000'),
+);
 const executionNettingByMarket = new Map<string, ExecutionNettingMarketState>();
+const executionNettingByUnderlying = new Map<string, ExecutionNettingUnderlyingState>();
 const scanFeatureSchemaByStrategy: Record<string, ScanFeatureSchemaState> = {};
 const runtimeModules: Record<string, RuntimeModuleState> = Object.fromEntries(
     RUNTIME_MODULE_CATALOG.map((module) => [module.id, {
@@ -1054,7 +1291,27 @@ function isControlPlaneAuthorized(token: string | null): boolean {
     if (!isControlPlaneTokenConfigured()) {
         return false;
     }
-    return token === CONTROL_PLANE_TOKEN;
+    if (!token) {
+        return false;
+    }
+    return constantTimeStringEqual(token, CONTROL_PLANE_TOKEN);
+}
+
+function isReadApiTokenConfigured(): boolean {
+    return READ_API_TOKEN.length > 0;
+}
+
+function isReadApiAuthorized(token: string | null): boolean {
+    if (!token) {
+        return false;
+    }
+    if (isControlPlaneAuthorized(token)) {
+        return true;
+    }
+    if (!isReadApiTokenConfigured()) {
+        return false;
+    }
+    return constantTimeStringEqual(token, READ_API_TOKEN);
 }
 
 function getControlTokenFromRequest(req: Request): string | null {
@@ -1073,6 +1330,33 @@ function getControlTokenFromSocket(socket: {
     const authHeader = extractBearerToken(socket.handshake.headers?.authorization);
     const directHeader = extractBearerToken(socket.handshake.headers?.['x-control-plane-token']);
     return authToken || authHeader || directHeader;
+}
+
+function getReadTokenFromRequest(req: Request): string | null {
+    const authHeader = req.header('authorization');
+    const directHeader = req.header('x-read-api-token');
+    const legacyHeader = req.header('x-control-plane-token');
+    return (
+        extractBearerToken(authHeader)
+        || extractBearerToken(directHeader)
+        || extractBearerToken(legacyHeader)
+    );
+}
+
+function requireReadApiAuth(req: Request, res: Response, next: NextFunction): void {
+    if (!API_READ_AUTH_REQUIRED) {
+        next();
+        return;
+    }
+    if (!isControlPlaneTokenConfigured() && !isReadApiTokenConfigured()) {
+        res.status(503).json({ error: 'Read API auth token is not configured' });
+        return;
+    }
+    if (!isReadApiAuthorized(getReadTokenFromRequest(req))) {
+        res.status(401).json({ error: 'Unauthorized read API request' });
+        return;
+    }
+    next();
 }
 
 function requireControlPlaneAuth(req: Request, res: Response, next: NextFunction): void {
@@ -1474,6 +1758,18 @@ function asNumber(input: unknown): number | null {
     }
     const parsed = Number(input);
     return Number.isFinite(parsed) ? parsed : null;
+}
+
+function constantTimeStringEqual(left: string, right: string): boolean {
+    if (left.length === 0 || right.length === 0) {
+        return false;
+    }
+    const leftBuffer = Buffer.from(left, 'utf8');
+    const rightBuffer = Buffer.from(right, 'utf8');
+    if (leftBuffer.length !== rightBuffer.length) {
+        return false;
+    }
+    return timingSafeEqual(leftBuffer, rightBuffer);
 }
 
 function constantTimeHexEqual(left: string, right: string): boolean {
@@ -1946,6 +2242,7 @@ type ExecutionIntentSnapshot = {
     strategy: string | null;
     family: string;
     marketKey: string | null;
+    underlying: string;
     direction: number;
     notionalUsd: number;
     edgeBps: number | null;
@@ -2020,7 +2317,7 @@ function scaleExecutionPayloadNotional(
     payload: unknown,
     scale: number,
 ): { payload: unknown; notionalUsd: number } | null {
-    if (!(scale > 0 && scale < 1)) {
+    if (!(scale > 0 && Number.isFinite(scale)) || Math.abs(scale - 1) <= 1e-9) {
         return {
             payload,
             notionalUsd: executionSignalNotionalUsd(payload),
@@ -2082,6 +2379,64 @@ function scaleExecutionPayloadNotional(
     return {
         payload: cloned,
         notionalUsd: totalNotionalUsd,
+    };
+}
+
+function randomRange(min: number, max: number): number {
+    if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+        return min;
+    }
+    return min + (Math.random() * (max - min));
+}
+
+async function applyExecutionEntryJitter(
+    payload: unknown,
+    tradingMode: TradingMode,
+): Promise<{
+    payload: unknown;
+    applied: boolean;
+    details: Record<string, unknown> | null;
+}> {
+    if (!EXECUTION_ENTRY_JITTER_ENABLED || tradingMode !== 'LIVE') {
+        return {
+            payload,
+            applied: false,
+            details: null,
+        };
+    }
+
+    let mutatedPayload: unknown = payload;
+    let sizeFactor = 1;
+    if (EXECUTION_ENTRY_JITTER_SIZE_PCT > 0) {
+        sizeFactor = 1 + randomRange(-EXECUTION_ENTRY_JITTER_SIZE_PCT, EXECUTION_ENTRY_JITTER_SIZE_PCT);
+        const scaled = scaleExecutionPayloadNotional(mutatedPayload, sizeFactor);
+        if (scaled && scaled.notionalUsd > 0) {
+            mutatedPayload = scaled.payload;
+        } else {
+            sizeFactor = 1;
+        }
+    }
+
+    let delayMs = 0;
+    if (EXECUTION_ENTRY_JITTER_DELAY_MAX_MS > 0) {
+        delayMs = Math.round(randomRange(EXECUTION_ENTRY_JITTER_DELAY_MIN_MS, EXECUTION_ENTRY_JITTER_DELAY_MAX_MS));
+        if (delayMs > 0) {
+            await new Promise<void>((resolve) => {
+                setTimeout(resolve, delayMs);
+            });
+        }
+    }
+
+    const applied = delayMs > 0 || Math.abs(sizeFactor - 1) > 1e-6;
+    return {
+        payload: mutatedPayload,
+        applied,
+        details: applied
+            ? {
+                delay_ms: delayMs,
+                size_factor: Math.round(sizeFactor * 10_000) / 10_000,
+            }
+            : null,
     };
 }
 
@@ -2159,6 +2514,69 @@ function inferExecutionDirection(payload: unknown, strategyHint: string | null):
     return 0;
 }
 
+function inferUnderlyingFromText(raw: string | null): string | null {
+    if (!raw) {
+        return null;
+    }
+    const text = raw.trim().toUpperCase();
+    if (!text) {
+        return null;
+    }
+    if (text.includes('BTC') || text.includes('BITCOIN')) {
+        return 'BTC';
+    }
+    if (text.includes('ETH') || text.includes('ETHEREUM')) {
+        return 'ETH';
+    }
+    if (text.includes('SOL') || text.includes('SOLANA')) {
+        return 'SOL';
+    }
+    if (text.includes('XRP') || text.includes('RIPPLE')) {
+        return 'XRP';
+    }
+    return null;
+}
+
+function inferExecutionUnderlying(
+    payload: unknown,
+    strategyHint: string | null,
+    marketKeyHint: string | null,
+): string {
+    if (strategyHint) {
+        const strategyBase = strategyUnderlying(strategyHint);
+        if (strategyBase === 'BTC' || strategyBase === 'ETH' || strategyBase === 'SOL' || strategyBase === 'XRP') {
+            return strategyBase;
+        }
+    }
+
+    const record = asRecord(payload);
+    const details = record ? asRecord(record.details) : null;
+    const hints = [
+        marketKeyHint,
+        asString(record?.market_key),
+        asString(record?.market),
+        asString(details?.market_key),
+        asString(details?.question),
+        asString(details?.slug),
+        asString(details?.symbol),
+        asString(record?.symbol),
+    ];
+    for (const hint of hints) {
+        const inferred = inferUnderlyingFromText(hint);
+        if (inferred) {
+            return inferred;
+        }
+    }
+
+    if (strategyHint) {
+        const fallback = strategyUnderlying(strategyHint);
+        if (fallback === 'POLY_EVENT') {
+            return 'POLY_EVENT';
+        }
+    }
+    return 'UNKNOWN';
+}
+
 function extractExecutionEdgeTelemetry(payload: unknown): {
     edgeBps: number | null;
     requiredEdgeBps: number | null;
@@ -2210,6 +2628,7 @@ function buildExecutionIntentSnapshot(
     const strategy = strategyHint || extractExecutionStrategy(payload);
     const family = strategy ? strategyFamily(strategy) : 'GENERIC';
     const marketKey = marketKeyHint || extractExecutionMarketKey(payload);
+    const underlying = inferExecutionUnderlying(payload, strategy, marketKey);
     const direction = inferExecutionDirection(payload, strategy);
     const notionalUsd = executionSignalNotionalUsd(payload);
     const edgeTelemetry = extractExecutionEdgeTelemetry(payload);
@@ -2217,6 +2636,7 @@ function buildExecutionIntentSnapshot(
         strategy,
         family,
         marketKey,
+        underlying,
         direction,
         notionalUsd,
         edgeBps: edgeTelemetry.edgeBps,
@@ -2226,7 +2646,7 @@ function buildExecutionIntentSnapshot(
     };
 }
 
-function applyNettingDecay(state: ExecutionNettingMarketState, now = Date.now()): void {
+function applyNettingDecay(state: ExecutionNettingStateCore, now = Date.now()): void {
     const elapsed = Math.max(0, now - state.updated_at);
     if (elapsed <= 0 || EXECUTION_NETTING_TTL_MS <= 0) {
         return;
@@ -2249,6 +2669,7 @@ function applyNettingDecay(state: ExecutionNettingMarketState, now = Date.now())
 function pruneExecutionNettingState(now = Date.now()): void {
     if (!EXECUTION_NETTING_ENABLED) {
         executionNettingByMarket.clear();
+        executionNettingByUnderlying.clear();
         return;
     }
     for (const [marketKey, state] of executionNettingByMarket.entries()) {
@@ -2259,6 +2680,16 @@ function pruneExecutionNettingState(now = Date.now()): void {
         applyNettingDecay(state, now);
         if (Math.abs(state.net_directional_notional) < 1e-6 && Object.keys(state.strategy_directional_notional).length === 0) {
             executionNettingByMarket.delete(marketKey);
+        }
+    }
+    for (const [underlyingKey, state] of executionNettingByUnderlying.entries()) {
+        if (now - state.updated_at > EXECUTION_NETTING_TTL_MS) {
+            executionNettingByUnderlying.delete(underlyingKey);
+            continue;
+        }
+        applyNettingDecay(state, now);
+        if (Math.abs(state.net_directional_notional) < 1e-6 && Object.keys(state.strategy_directional_notional).length === 0) {
+            executionNettingByUnderlying.delete(underlyingKey);
         }
     }
 }
@@ -2440,6 +2871,120 @@ function evaluateExecutionNetting(
     };
 }
 
+function evaluateExecutionUnderlyingNetting(
+    payload: unknown,
+    intent: ExecutionIntentSnapshot,
+): ExecutionPreparationResult {
+    if (!EXECUTION_NETTING_ENABLED) {
+        return { ok: true, payload, adjusted: false };
+    }
+    if (intent.direction === 0 || intent.notionalUsd <= 0) {
+        return { ok: true, payload, adjusted: false };
+    }
+    if (!intent.underlying || intent.underlying === 'UNKNOWN' || intent.underlying === 'POLY_EVENT') {
+        return { ok: true, payload, adjusted: false };
+    }
+
+    pruneExecutionNettingState();
+    const state = executionNettingByUnderlying.get(intent.underlying);
+    if (!state) {
+        return { ok: true, payload, adjusted: false };
+    }
+
+    const now = Date.now();
+    applyNettingDecay(state, now);
+    const currentNet = state.net_directional_notional;
+    const sameDirection = currentNet === 0 || Math.sign(currentNet) === intent.direction;
+    let scale = 1;
+
+    if (!sameDirection) {
+        const opposingNotional = Math.abs(currentNet);
+        const blockThreshold = intent.notionalUsd * EXECUTION_NETTING_OPPOSING_BLOCK_RATIO;
+        if (opposingNotional >= blockThreshold) {
+            return {
+                ok: false,
+                payload,
+                adjusted: false,
+                stage: 'UNDERLYING_NETTING',
+                reason: `opposing ${intent.underlying} exposure ${opposingNotional.toFixed(2)} blocks new signal`,
+                details: {
+                    strategy: intent.strategy,
+                    market_key: intent.marketKey,
+                    underlying: intent.underlying,
+                    opposing_notional_usd: opposingNotional,
+                    candidate_notional_usd: intent.notionalUsd,
+                    block_ratio: EXECUTION_NETTING_OPPOSING_BLOCK_RATIO,
+                },
+            };
+        }
+        const reliefRatio = Math.min(1, opposingNotional / intent.notionalUsd);
+        scale = Math.min(scale, Math.max(0.25, 1 - reliefRatio));
+    } else {
+        const currentAbs = Math.abs(currentNet);
+        const headroom = Math.max(0, EXECUTION_NETTING_UNDERLYING_CAP_USD - currentAbs);
+        if (headroom <= 0) {
+            return {
+                ok: false,
+                payload,
+                adjusted: false,
+                stage: 'UNDERLYING_NETTING',
+                reason: `${intent.underlying} directional cap ${EXECUTION_NETTING_UNDERLYING_CAP_USD.toFixed(2)} reached`,
+                details: {
+                    strategy: intent.strategy,
+                    market_key: intent.marketKey,
+                    underlying: intent.underlying,
+                    current_net_notional_usd: currentAbs,
+                    candidate_notional_usd: intent.notionalUsd,
+                    cap_usd: EXECUTION_NETTING_UNDERLYING_CAP_USD,
+                },
+            };
+        }
+        if (intent.notionalUsd > headroom) {
+            scale = Math.min(scale, headroom / intent.notionalUsd);
+        }
+    }
+
+    if (!(scale > 0 && scale < 0.999)) {
+        return { ok: true, payload, adjusted: false };
+    }
+
+    const scaled = scaleExecutionPayloadNotional(payload, scale);
+    if (!scaled || scaled.notionalUsd < EXECUTION_SHORTFALL_MIN_SIGNAL_NOTIONAL_USD) {
+        return {
+            ok: false,
+            payload,
+            adjusted: false,
+            stage: 'UNDERLYING_NETTING',
+            reason: 'scaled underlying-netted notional too small',
+            details: {
+                strategy: intent.strategy,
+                market_key: intent.marketKey,
+                underlying: intent.underlying,
+                scale,
+                candidate_notional_usd: intent.notionalUsd,
+                min_notional_usd: EXECUTION_SHORTFALL_MIN_SIGNAL_NOTIONAL_USD,
+            },
+        };
+    }
+
+    return {
+        ok: true,
+        payload: scaled.payload,
+        adjusted: true,
+        stage: 'UNDERLYING_NETTING',
+        details: {
+            strategy: intent.strategy,
+            market_key: intent.marketKey,
+            underlying: intent.underlying,
+            scale,
+            notional_before: intent.notionalUsd,
+            notional_after: scaled.notionalUsd,
+            existing_net_notional_usd: currentNet,
+            cap_usd: EXECUTION_NETTING_UNDERLYING_CAP_USD,
+        },
+    };
+}
+
 function prepareExecutionPayloadForDispatch(
     payload: unknown,
     strategyHint: string | null,
@@ -2477,6 +3022,22 @@ function prepareExecutionPayloadForDispatch(
         prepDetails.netting = netting.details || {};
     }
 
+    const intentAfterMarketNetting = buildExecutionIntentSnapshot(workingPayload, initialIntent.strategy, initialIntent.marketKey);
+    const underlyingNetting = evaluateExecutionUnderlyingNetting(workingPayload, intentAfterMarketNetting);
+    if (!underlyingNetting.ok) {
+        underlyingNetting.details = {
+            ...(underlyingNetting.details || {}),
+            shortfall: prepDetails.shortfall || null,
+            market_netting: prepDetails.netting || null,
+        };
+        return underlyingNetting;
+    }
+    if (underlyingNetting.adjusted) {
+        adjusted = true;
+        workingPayload = underlyingNetting.payload;
+        prepDetails.underlying_netting = underlyingNetting.details || {};
+    }
+
     if (!adjusted) {
         return {
             ok: true,
@@ -2497,6 +3058,7 @@ function prepareExecutionPayloadForDispatch(
             notional_after: finalIntent.notionalUsd,
             shortfall: prepDetails.shortfall || null,
             netting: prepDetails.netting || null,
+            underlying_netting: prepDetails.underlying_netting || null,
         },
     };
 }
@@ -2538,6 +3100,31 @@ function upsertExecutionNettingStateFromAcceptedPayload(
     ) + (intent.direction * intent.notionalUsd);
     state.updated_at = now;
     executionNettingByMarket.set(intent.marketKey, state);
+
+    if (intent.underlying && intent.underlying !== 'UNKNOWN' && intent.underlying !== 'POLY_EVENT') {
+        const underlyingExisting = executionNettingByUnderlying.get(intent.underlying);
+        const underlyingState: ExecutionNettingUnderlyingState = underlyingExisting || {
+            underlying: intent.underlying,
+            net_directional_notional: 0,
+            long_notional: 0,
+            short_notional: 0,
+            strategy_directional_notional: {},
+            updated_at: now,
+        };
+        applyNettingDecay(underlyingState, now);
+        if (intent.direction > 0) {
+            underlyingState.long_notional += intent.notionalUsd;
+        } else {
+            underlyingState.short_notional += intent.notionalUsd;
+        }
+        underlyingState.net_directional_notional += intent.direction * intent.notionalUsd;
+        underlyingState.strategy_directional_notional[strategy] = (
+            underlyingState.strategy_directional_notional[strategy]
+            || 0
+        ) + (intent.direction * intent.notionalUsd);
+        underlyingState.updated_at = now;
+        executionNettingByUnderlying.set(intent.underlying, underlyingState);
+    }
 }
 
 function executionNettingSnapshot(limit = 30): Array<Record<string, unknown>> {
@@ -2547,6 +3134,26 @@ function executionNettingSnapshot(limit = 30): Array<Record<string, unknown>> {
         .slice(0, Math.max(1, limit))
         .map((state) => ({
             market_key: state.market_key,
+            net_directional_notional: Math.round(state.net_directional_notional * 100) / 100,
+            long_notional: Math.round(state.long_notional * 100) / 100,
+            short_notional: Math.round(state.short_notional * 100) / 100,
+            strategy_directional_notional: Object.fromEntries(
+                Object.entries(state.strategy_directional_notional).map(([strategy, notional]) => [
+                    strategy,
+                    Math.round(notional * 100) / 100,
+                ]),
+            ),
+            updated_at: state.updated_at,
+        }));
+}
+
+function executionUnderlyingNettingSnapshot(limit = 30): Array<Record<string, unknown>> {
+    pruneExecutionNettingState();
+    return [...executionNettingByUnderlying.values()]
+        .sort((a, b) => b.updated_at - a.updated_at)
+        .slice(0, Math.max(1, limit))
+        .map((state) => ({
+            underlying: state.underlying,
             net_directional_notional: Math.round(state.net_directional_notional * 100) / 100,
             long_notional: Math.round(state.long_notional * 100) / 100,
             short_notional: Math.round(state.short_notional * 100) / 100,
@@ -2821,6 +3428,66 @@ function scanDirectionSign(scan: StrategyScanState): number {
     return sign > 0 ? 1 : -1;
 }
 
+type DirectionalConfirmation = {
+    source: string;
+    direction: number;
+    strength: number;
+    age_ms: number;
+};
+
+const OBI_CONFIRMATION_STRATEGIES = new Set(['OBI_SCALPER']);
+const CEX_CONFIRMATION_STRATEGIES = new Set(['CEX_SNIPER', 'CEX_ARB']);
+
+function latestDirectionalConfirmation(
+    scans: StrategyScanState[],
+    strategies: Set<string>,
+    underlying: string,
+    now: number,
+    maxAgeMs: number,
+): DirectionalConfirmation | null {
+    if (underlying.length === 0 || maxAgeMs <= 0) {
+        return null;
+    }
+
+    let best: DirectionalConfirmation | null = null;
+    for (const scan of scans) {
+        const strategy = scan.strategy.trim().toUpperCase();
+        if (!strategies.has(strategy) || !scan.passes_threshold) {
+            continue;
+        }
+        if (strategyUnderlying(strategy) !== underlying) {
+            continue;
+        }
+        const ageMs = now - scan.timestamp;
+        if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > maxAgeMs) {
+            continue;
+        }
+        const direction = scanDirectionSign(scan);
+        if (direction === 0) {
+            continue;
+        }
+        const strength = Math.min(1, Math.max(0, Math.abs(computeNormalizedMargin(scan))));
+        const candidate: DirectionalConfirmation = {
+            source: strategy,
+            direction,
+            strength,
+            age_ms: ageMs,
+        };
+        if (!best) {
+            best = candidate;
+            continue;
+        }
+        if (candidate.strength > best.strength) {
+            best = candidate;
+            continue;
+        }
+        if (Math.abs(candidate.strength - best.strength) < 1e-6 && candidate.age_ms < best.age_ms) {
+            best = candidate;
+        }
+    }
+    return best;
+}
+
 function collectPeerSignals(strategy: string, marketKey: string | null, now: number, candidateDirection: number): {
     count: number;
     peers: string[];
@@ -3011,12 +3678,231 @@ async function emitSettlementEvents(events: Awaited<ReturnType<typeof settlement
     if (!events.length) {
         return;
     }
+    const settlementSnapshot = settlementService.getSnapshot();
+    const positionsById = new Map(
+        settlementSnapshot.positions.map((position) => [position.id, position]),
+    );
     touchRuntimeModule('SETTLEMENT_ENGINE', 'ONLINE', `processed ${events.length} settlement event(s)`);
     for (const event of events) {
+        if (event.type === 'REDEEMED') {
+            const details = asRecord(event.details);
+            const pnl = asNumber(details?.realizedPnlUsd);
+            const entryNotional = asNumber(details?.entryNotionalUsd);
+            if (pnl !== null && entryNotional !== null && entryNotional > 0) {
+                const linkedPosition = event.positionId
+                    ? positionsById.get(event.positionId)
+                    : undefined;
+                const strategy = linkedPosition?.strategy || 'ATOMIC_ARB';
+                const pnlPayload = {
+                    execution_id: event.positionId || event.conditionId || randomUUID(),
+                    strategy,
+                    variant: 'live_settlement',
+                    pnl,
+                    notional: entryNotional,
+                    timestamp: event.timestamp,
+                    mode: 'LIVE',
+                    reason: 'SETTLEMENT_REDEEM',
+                    market_key: event.conditionId || null,
+                    details: {
+                        condition_id: event.conditionId || null,
+                        position_id: event.positionId || null,
+                        tx_hash: asString(details?.txHash),
+                        proceeds_usd: asNumber(details?.proceedsUsd),
+                        entry_notional_usd: entryNotional,
+                        realized_pnl_usd: pnl,
+                    },
+                };
+                await redisClient.publish('strategy:pnl', JSON.stringify(pnlPayload));
+                touchRuntimeModule('PNL_LEDGER', 'ONLINE', `${strategy} live settlement pnl ${pnl.toFixed(2)}`);
+            }
+        }
         io.emit('settlement_event', event);
         io.emit('execution_log', settlementEventToExecutionLog(event));
     }
     io.emit('settlement_snapshot', settlementService.getSnapshot());
+    io.emit('live_ledger_update', settlementSnapshot.liveLedger);
+}
+
+type SettlementDlqStoredEntry = SettlementDlqEntry & {
+    attempts: number;
+    enqueued_at: number;
+    updated_at: number;
+};
+
+function parseSettlementDlqEntry(raw: string): SettlementDlqStoredEntry | null {
+    try {
+        const parsed = JSON.parse(raw) as SettlementDlqStoredEntry;
+        if (!parsed || typeof parsed !== 'object') {
+            return null;
+        }
+        if (!parsed.live_execution || typeof parsed.live_execution !== 'object') {
+            return null;
+        }
+        return {
+            ...parsed,
+            attempts: Math.max(0, Number(parsed.attempts || 0)),
+            enqueued_at: Math.max(0, Number(parsed.enqueued_at || Date.now())),
+            updated_at: Math.max(0, Number(parsed.updated_at || Date.now())),
+            timestamp: Math.max(0, Number(parsed.timestamp || Date.now())),
+        };
+    } catch {
+        return null;
+    }
+}
+
+async function enqueueSettlementDlq(entry: SettlementDlqEntry): Promise<void> {
+    const now = Date.now();
+    const stored: SettlementDlqStoredEntry = {
+        ...entry,
+        attempts: 0,
+        enqueued_at: now,
+        updated_at: now,
+    };
+    await redisClient.rPush(SETTLEMENT_DLQ_REDIS_KEY, JSON.stringify(stored));
+    io.emit('settlement_dlq_enqueued', stored);
+}
+
+async function runSettlementDlqReplayCycle(): Promise<void> {
+    let processed = 0;
+    for (let i = 0; i < SETTLEMENT_DLQ_REPLAY_BATCH; i += 1) {
+        const raw = await redisClient.lPop(SETTLEMENT_DLQ_REDIS_KEY);
+        if (!raw) {
+            break;
+        }
+        const entry = parseSettlementDlqEntry(raw);
+        if (!entry) {
+            continue;
+        }
+        processed += 1;
+        try {
+            const events = await settlementService.registerAtomicExecution(entry.live_execution);
+            await emitSettlementEvents(events);
+            io.emit('settlement_dlq_replayed', {
+                execution_id: entry.execution_id,
+                strategy: entry.strategy,
+                market_key: entry.market_key,
+                attempts: entry.attempts + 1,
+                timestamp: Date.now(),
+                events: events.length,
+            });
+        } catch (error) {
+            const attempts = entry.attempts + 1;
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            if (attempts >= SETTLEMENT_DLQ_MAX_ATTEMPTS) {
+                const dropped = {
+                    ...entry,
+                    attempts,
+                    updated_at: Date.now(),
+                    drop_reason: errorMsg,
+                };
+                io.emit('settlement_dlq_dropped', dropped);
+                fireAndForget(
+                    'OpsAlert.SettlementDlqDrop',
+                    notifyOpsAlert({
+                        severity: 'CRITICAL',
+                        scope: 'SETTLEMENT_DLQ',
+                        message: `settlement DLQ exhausted retries (${attempts}) for execution ${entry.execution_id}: ${errorMsg}`,
+                        execution_id: entry.execution_id,
+                        strategy: entry.strategy,
+                        market_key: entry.market_key,
+                        timestamp: Date.now(),
+                        details: dropped,
+                    }),
+                    { execution_id: entry.execution_id, strategy: entry.strategy || 'UNKNOWN' },
+                );
+                continue;
+            }
+            const retryEntry: SettlementDlqStoredEntry = {
+                ...entry,
+                attempts,
+                updated_at: Date.now(),
+                reason: `${entry.reason}; replay_error=${errorMsg}`.slice(0, 500),
+            };
+            await redisClient.rPush(SETTLEMENT_DLQ_REDIS_KEY, JSON.stringify(retryEntry));
+            io.emit('settlement_dlq_retry', {
+                execution_id: retryEntry.execution_id,
+                strategy: retryEntry.strategy,
+                market_key: retryEntry.market_key,
+                attempts: retryEntry.attempts,
+                reason: retryEntry.reason,
+                timestamp: retryEntry.updated_at,
+            });
+        }
+    }
+
+    if (processed > 0) {
+        const depth = Number(await redisClient.lLen(SETTLEMENT_DLQ_REDIS_KEY));
+        touchRuntimeModule('SETTLEMENT_ENGINE', 'ONLINE', `settlement DLQ replay processed ${processed}, depth ${depth}`);
+        io.emit('settlement_dlq_depth', {
+            key: SETTLEMENT_DLQ_REDIS_KEY,
+            depth,
+            processed,
+            timestamp: Date.now(),
+        });
+    }
+}
+
+async function runCollateralReconciliationCycle(): Promise<void> {
+    if (!COLLATERAL_RECONCILIATION_ENABLED) {
+        touchRuntimeModule('COLLATERAL_RECON', 'STANDBY', 'disabled by config');
+        return;
+    }
+    const result = await settlementService.reconcileCollateralBalance(
+        COLLATERAL_RECONCILIATION_TOLERANCE_USD,
+    );
+    io.emit('collateral_reconciliation_update', result);
+    const detail = result.ok
+        ? `delta ${result.deltaUsd === null ? 'n/a' : result.deltaUsd.toFixed(2)}`
+        : (result.issues[0] || 'collateral reconcile failed');
+    touchRuntimeModule('COLLATERAL_RECON', result.ok ? 'ONLINE' : 'DEGRADED', detail);
+    if (!result.ok) {
+        await notifyOpsAlert({
+            severity: 'CRITICAL',
+            scope: 'COLLATERAL_RECON',
+            message: `collateral reconciliation mismatch: ${detail}`,
+            timestamp: result.checkedAt,
+            details: result,
+        });
+    }
+}
+
+async function checkInlineRiskGuardBlock(strategyId: string): Promise<{
+    blocked: boolean;
+    reason?: string;
+    pausedUntil?: number;
+    cooldownUntil?: number;
+}> {
+    if (!RISK_GUARD_INLINE_PRECHECK_ENABLED) {
+        return { blocked: false };
+    }
+    const normalized = strategyId.trim().toUpperCase();
+    if (!normalized) {
+        return { blocked: false };
+    }
+    const now = Date.now();
+    const pausedUntilRaw = await redisClient.get(`risk_guard:paused_until:${normalized}`);
+    const pausedUntil = Number(pausedUntilRaw || '0');
+    if (Number.isFinite(pausedUntil) && pausedUntil > now) {
+        return {
+            blocked: true,
+            pausedUntil,
+            reason: `risk guard pause active until ${new Date(pausedUntil).toISOString()}`,
+        };
+    }
+    const cooldownUntilRaw = await redisClient.get(`risk_guard:cooldown:${normalized}`);
+    const cooldownUntil = Number(cooldownUntilRaw || '0');
+    if (Number.isFinite(cooldownUntil) && cooldownUntil > now) {
+        const remainingMs = cooldownUntil - now;
+        const suspicious = remainingMs > RISK_GUARD_INLINE_PRECHECK_MAX_AGE_MS;
+        return {
+            blocked: true,
+            cooldownUntil,
+            reason: suspicious
+                ? `risk guard post-loss cooldown active (${remainingMs}ms remaining; exceeds expected max ${RISK_GUARD_INLINE_PRECHECK_MAX_AGE_MS}ms)`
+                : `risk guard post-loss cooldown active (${remainingMs}ms remaining)`,
+        };
+    }
+    return { blocked: false };
 }
 
 function normalizeRiskConfig(input: Partial<RiskConfig>, preserveTimestamp = false): RiskConfig | null {
@@ -3205,11 +4091,199 @@ async function getTradingMode(): Promise<TradingMode> {
     return fallback;
 }
 
+function modeLedgerSnapshotKey(mode: TradingMode): string {
+    return `${MODE_LEDGER_SNAPSHOT_PREFIX}${mode.toLowerCase()}`;
+}
+
+function sanitizeReservedMap(input: unknown): Record<string, number> {
+    const parsed = asRecord(input);
+    if (!parsed) {
+        return {};
+    }
+    const entries = Object.entries(parsed)
+        .map(([key, value]) => [key.trim().toUpperCase(), asNumber(value)] as const)
+        .filter(([key, value]) => key.length > 0 && value !== null && Number.isFinite(value) && Math.abs(value) > 1e-9)
+        .slice(0, 10_000)
+        .map(([key, value]) => [key, Math.max(0, value as number)] as const);
+    return Object.fromEntries(entries);
+}
+
+function normalizeModeLedgerSnapshot(input: unknown, mode: TradingMode): ModeLedgerSnapshot | null {
+    const parsed = asRecord(input);
+    if (!parsed) {
+        return null;
+    }
+    const cash = asNumber(parsed.cash);
+    const reserved = asNumber(parsed.reserved);
+    const realizedPnl = asNumber(parsed.realized_pnl);
+    const equity = asNumber(parsed.equity);
+    if (cash === null || reserved === null || realizedPnl === null || equity === null) {
+        return null;
+    }
+    return {
+        mode,
+        cash: Math.max(0, cash),
+        reserved: Math.max(0, reserved),
+        realized_pnl: realizedPnl,
+        equity: Math.max(0, equity),
+        captured_at: asNumber(parsed.captured_at) ?? Date.now(),
+        reserved_by_strategy: sanitizeReservedMap(parsed.reserved_by_strategy),
+        reserved_by_family: sanitizeReservedMap(parsed.reserved_by_family),
+        reserved_by_underlying: sanitizeReservedMap(parsed.reserved_by_underlying),
+    };
+}
+
+function defaultModeLedgerSnapshot(mode: TradingMode): ModeLedgerSnapshot {
+    return {
+        mode,
+        cash: MODE_LEDGER_DEFAULT_BANKROLL,
+        reserved: 0,
+        realized_pnl: 0,
+        equity: MODE_LEDGER_DEFAULT_BANKROLL,
+        captured_at: Date.now(),
+        reserved_by_strategy: {},
+        reserved_by_family: {},
+        reserved_by_underlying: {},
+    };
+}
+
+async function scanReservedMapByPrefix(prefix: string): Promise<Record<string, number>> {
+    const entries: Record<string, number> = {};
+    for await (const key of redisClient.scanIterator({ MATCH: `${prefix}*`, COUNT: 200 })) {
+        if (typeof key !== 'string' || !key.startsWith(prefix)) {
+            continue;
+        }
+        const id = key.slice(prefix.length).trim().toUpperCase();
+        if (!id) {
+            continue;
+        }
+        const value = asNumber(await redisClient.get(key));
+        if (value === null || !Number.isFinite(value) || Math.abs(value) < 1e-9) {
+            continue;
+        }
+        entries[id] = Math.max(0, value);
+    }
+    return entries;
+}
+
+async function clearReservedMapByPrefix(prefix: string): Promise<void> {
+    const pending: string[] = [];
+    for await (const key of redisClient.scanIterator({ MATCH: `${prefix}*`, COUNT: 200 })) {
+        if (typeof key !== 'string') {
+            continue;
+        }
+        pending.push(key);
+        if (pending.length >= 250) {
+            await redisClient.del(pending);
+            pending.length = 0;
+        }
+    }
+    if (pending.length > 0) {
+        await redisClient.del(pending);
+    }
+}
+
+async function captureActiveModeLedgerSnapshot(mode: TradingMode): Promise<ModeLedgerSnapshot> {
+    const [ledger, strategyReserved, familyReserved, underlyingReserved] = await Promise.all([
+        getSimulationLedgerSnapshot(),
+        scanReservedMapByPrefix(SIM_LEDGER_RESERVED_BY_STRATEGY_PREFIX),
+        scanReservedMapByPrefix(SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX),
+        scanReservedMapByPrefix(SIM_LEDGER_RESERVED_BY_UNDERLYING_PREFIX),
+    ]);
+    return {
+        mode,
+        cash: Math.max(0, ledger.cash),
+        reserved: Math.max(0, ledger.reserved),
+        realized_pnl: ledger.realized_pnl,
+        equity: Math.max(0, ledger.equity),
+        captured_at: Date.now(),
+        reserved_by_strategy: strategyReserved,
+        reserved_by_family: familyReserved,
+        reserved_by_underlying: underlyingReserved,
+    };
+}
+
+async function persistModeLedgerSnapshot(snapshot: ModeLedgerSnapshot): Promise<void> {
+    await redisClient.set(
+        modeLedgerSnapshotKey(snapshot.mode),
+        JSON.stringify(snapshot),
+    );
+}
+
+async function loadModeLedgerSnapshot(mode: TradingMode): Promise<ModeLedgerSnapshot | null> {
+    const raw = await redisClient.get(modeLedgerSnapshotKey(mode));
+    if (!raw) {
+        return null;
+    }
+    try {
+        return normalizeModeLedgerSnapshot(JSON.parse(raw), mode);
+    } catch (error) {
+        recordSilentCatch('ModeLedger.Load', error, { mode });
+        return null;
+    }
+}
+
+async function applyModeLedgerSnapshot(snapshot: ModeLedgerSnapshot): Promise<void> {
+    await Promise.all([
+        clearReservedMapByPrefix(SIM_LEDGER_RESERVED_BY_STRATEGY_PREFIX),
+        clearReservedMapByPrefix(SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX),
+        clearReservedMapByPrefix(SIM_LEDGER_RESERVED_BY_UNDERLYING_PREFIX),
+    ]);
+
+    await Promise.all([
+        redisClient.set(SIM_LEDGER_CASH_KEY, snapshot.cash.toFixed(8)),
+        redisClient.set(SIM_LEDGER_RESERVED_KEY, snapshot.reserved.toFixed(8)),
+        redisClient.set(SIM_LEDGER_REALIZED_PNL_KEY, snapshot.realized_pnl.toFixed(8)),
+        redisClient.set(SIM_BANKROLL_KEY, snapshot.equity.toFixed(8)),
+    ]);
+
+    const strategyEntries = Object.entries(snapshot.reserved_by_strategy);
+    const familyEntries = Object.entries(snapshot.reserved_by_family);
+    const underlyingEntries = Object.entries(snapshot.reserved_by_underlying);
+    for (const [id, value] of strategyEntries) {
+        await redisClient.set(`${SIM_LEDGER_RESERVED_BY_STRATEGY_PREFIX}${id}`, value.toFixed(8));
+    }
+    for (const [id, value] of familyEntries) {
+        await redisClient.set(`${SIM_LEDGER_RESERVED_BY_FAMILY_PREFIX}${id}`, value.toFixed(8));
+    }
+    for (const [id, value] of underlyingEntries) {
+        await redisClient.set(`${SIM_LEDGER_RESERVED_BY_UNDERLYING_PREFIX}${id}`, value.toFixed(8));
+    }
+}
+
+async function persistActiveModeLedgerSnapshot(mode: TradingMode): Promise<void> {
+    const snapshot = await captureActiveModeLedgerSnapshot(mode);
+    await persistModeLedgerSnapshot(snapshot);
+}
+
+async function rotateModeLedgerState(previousMode: TradingMode, nextMode: TradingMode): Promise<void> {
+    if (previousMode === nextMode) {
+        return;
+    }
+
+    const previousSnapshot = await captureActiveModeLedgerSnapshot(previousMode);
+    await persistModeLedgerSnapshot(previousSnapshot);
+
+    const nextSnapshot = await loadModeLedgerSnapshot(nextMode) || defaultModeLedgerSnapshot(nextMode);
+    await applyModeLedgerSnapshot(nextSnapshot);
+    await persistModeLedgerSnapshot({
+        ...nextSnapshot,
+        captured_at: Date.now(),
+    });
+}
+
 async function setTradingMode(mode: TradingMode): Promise<void> {
+    const previousMode = await getTradingMode();
+    if (previousMode !== mode) {
+        await rotateModeLedgerState(previousMode, mode);
+        await resetRiskGuardStates();
+        await refreshLedgerHealth();
+    }
     const payload = {
         mode,
         timestamp: Date.now(),
         live_order_posting_enabled: isLiveOrderPostingEnabled(),
+        previous_mode: previousMode,
     };
 
     await redisClient.set('system:trading_mode', mode);
@@ -3273,6 +4347,9 @@ async function isLiveReady(): Promise<LiveReadinessResult> {
 
     if (!mlPipelineStatus.model_eligible) {
         failures.push(`ML model not eligible (${mlPipelineStatus.model_reason || 'no training report'})`);
+    }
+    if (!mlPipelineStatus.model_gate_enforce_ready) {
+        failures.push(`ML gate quality not ready (${mlPipelineStatus.model_gate_enforce_reason || 'insufficient model validation'})`);
     }
 
     if (!signalModelArtifact || !modelInferenceState.model_loaded) {
@@ -4203,6 +5280,132 @@ function recordEntryFreshnessViolation(record: RejectedSignalRecord): void {
         timestamp: now,
     });
     io.emit('entry_freshness_slo_update', entryFreshnessSloPayload());
+}
+
+function executionDecisionKey(executionId: string | null | undefined): string | null {
+    const normalized = (executionId || '').trim();
+    if (!normalized) {
+        return null;
+    }
+    return `${EXECUTION_DECISION_KEY_PREFIX}${normalized}`;
+}
+
+async function persistExecutionDecision(
+    executionId: string | null | undefined,
+    decision: 'ACCEPTED' | 'REJECTED',
+    context: {
+        stage?: RejectedSignalRecord['stage'] | 'NONE';
+        reason?: string;
+        source?: string;
+        strategy?: string | null;
+        market_key?: string | null;
+    } = {},
+): Promise<void> {
+    const key = executionDecisionKey(executionId);
+    if (!key) {
+        return;
+    }
+
+    await redisClient.set(key, decision, { EX: EXECUTION_DECISION_TTL_SECONDS });
+    io.emit('execution_decision', {
+        execution_id: executionId,
+        decision,
+        stage: context.stage || 'NONE',
+        reason: context.reason || '',
+        source: context.source || 'execution_pipeline',
+        strategy: context.strategy || null,
+        market_key: context.market_key || null,
+        timestamp: Date.now(),
+    });
+}
+
+async function rollbackRejectedPaperPnl(
+    executionId: string,
+    pnl: number,
+): Promise<{
+    applied: boolean;
+    cash: number;
+    reserved: number;
+    equity: number;
+    realized_pnl: number;
+    reason?: string;
+}> {
+    const normalizedExecutionId = executionId.trim();
+    if (!normalizedExecutionId) {
+        return {
+            applied: false,
+            cash: 0,
+            reserved: 0,
+            equity: 0,
+            realized_pnl: 0,
+            reason: 'missing_execution_id',
+        };
+    }
+    if (!Number.isFinite(pnl)) {
+        return {
+            applied: false,
+            cash: 0,
+            reserved: 0,
+            equity: 0,
+            realized_pnl: 0,
+            reason: 'invalid_pnl',
+        };
+    }
+    if (rejectedPnlRollbackByExecutionId.has(normalizedExecutionId)) {
+        return {
+            applied: false,
+            cash: 0,
+            reserved: 0,
+            equity: 0,
+            realized_pnl: 0,
+            reason: 'already_reverted',
+        };
+    }
+
+    rejectedPnlRollbackByExecutionId.add(normalizedExecutionId);
+    while (rejectedPnlRollbackByExecutionId.size > REJECTED_PNL_ROLLBACK_TRACK_LIMIT) {
+        const oldest = rejectedPnlRollbackByExecutionId.values().next().value;
+        if (!oldest || oldest === normalizedExecutionId) {
+            break;
+        }
+        rejectedPnlRollbackByExecutionId.delete(oldest);
+    }
+
+    try {
+        const script = `
+            local cash = tonumber(redis.call("INCRBYFLOAT", KEYS[1], ARGV[1]))
+            local realized = tonumber(redis.call("INCRBYFLOAT", KEYS[2], ARGV[1]))
+            local reserved = tonumber(redis.call("GET", KEYS[3]) or "0")
+            local equity = cash + reserved
+            redis.call("SET", KEYS[4], equity)
+            return {cash, reserved, equity, realized}
+        `;
+        const delta = (-pnl).toString();
+        const result = await redisClient.eval(script, {
+            keys: [
+                SIM_LEDGER_CASH_KEY,
+                SIM_LEDGER_REALIZED_PNL_KEY,
+                SIM_LEDGER_RESERVED_KEY,
+                SIM_BANKROLL_KEY,
+            ],
+            arguments: [delta],
+        }) as unknown[];
+        const cash = Number(result?.[0]);
+        const reserved = Number(result?.[1]);
+        const equity = Number(result?.[2]);
+        const realizedPnl = Number(result?.[3]);
+
+        return {
+            applied: true,
+            cash: Number.isFinite(cash) ? cash : 0,
+            reserved: Number.isFinite(reserved) ? reserved : 0,
+            equity: Number.isFinite(equity) ? equity : 0,
+            realized_pnl: Number.isFinite(realizedPnl) ? realizedPnl : 0,
+        };
+    } catch (error) {
+        rejectedPnlRollbackByExecutionId.delete(normalizedExecutionId);
+        throw error;
+    }
 }
 
 function recordRejectedSignal(record: RejectedSignalRecord): void {
@@ -5246,6 +6449,307 @@ function allowedFamiliesForRegime(regime: RegimeLabel): string[] {
     ];
 }
 
+function scanIvRvRatio(scan: StrategyScanState): number | null {
+    const meta = scan.meta_features;
+    if (!meta) {
+        return null;
+    }
+    const iv = asNumber(meta.sigma_implied_annualized);
+    const rv = asNumber(meta.sigma_realized_annualized);
+    if (iv === null || rv === null || iv <= 0 || rv <= 0) {
+        return null;
+    }
+    const ratio = iv / rv;
+    if (!Number.isFinite(ratio) || ratio <= 0) {
+        return null;
+    }
+    return ratio;
+}
+
+function fundingBasisPayload(now = Date.now()): FundingBasisState {
+    const assets: Record<string, FundingBasisAssetState> = {};
+    for (const [asset, state] of Object.entries(fundingBasisState.assets)) {
+        const stale = (now - state.updated_at) > FUNDING_BASIS_STALE_MS;
+        assets[asset] = {
+            ...state,
+            stale,
+        };
+    }
+    return {
+        ...fundingBasisState,
+        assets,
+    };
+}
+
+function polymarketMicrostructurePayload(now = Date.now()): {
+    enabled: boolean;
+    ttl_ms: number;
+    updated_at: number;
+    entries: Record<string, Omit<MicrostructureUnderlyingState, 'last_snapshot'>>;
+} {
+    const entries: Record<string, Omit<MicrostructureUnderlyingState, 'last_snapshot'>> = {};
+    let updatedAt = 0;
+    for (const [underlying, state] of polymarketMicrostructureByUnderlying.entries()) {
+        const stale = (now - state.updated_at) > POLY_MICROSTRUCTURE_SIGNAL_TTL_MS;
+        entries[underlying] = {
+            underlying: state.underlying,
+            direction: state.direction,
+            strength: state.strength,
+            mid_shift_bps: state.mid_shift_bps,
+            spread_bps: state.spread_bps,
+            updated_at: state.updated_at,
+            reason: state.reason,
+            stale,
+        };
+        updatedAt = Math.max(updatedAt, state.updated_at);
+    }
+    return {
+        enabled: POLY_MICROSTRUCTURE_OVERLAY_ENABLED,
+        ttl_ms: POLY_MICROSTRUCTURE_SIGNAL_TTL_MS,
+        updated_at: updatedAt,
+        entries,
+    };
+}
+
+async function fetchJsonWithTimeout(url: string, timeoutMs: number): Promise<unknown> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(url, {
+            method: 'GET',
+            headers: {
+                accept: 'application/json',
+            },
+            signal: controller.signal,
+        });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        return await response.json();
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+function firstApiDataRow(payload: unknown): Record<string, unknown> | null {
+    const record = asRecord(payload);
+    if (!record) {
+        return null;
+    }
+    const data = Array.isArray(record.data) ? record.data : null;
+    if (!data || data.length === 0) {
+        return null;
+    }
+    return asRecord(data[0]);
+}
+
+async function fetchOkxFundingBasis(asset: string): Promise<FundingBasisVenueSnapshot | null> {
+    const assetSymbol = asset.trim().toUpperCase();
+    if (!assetSymbol) {
+        return null;
+    }
+    const swapInst = `${assetSymbol}-USDT-SWAP`;
+    const indexInst = `${assetSymbol}-USDT`;
+    const [fundingRaw, markRaw, indexRaw] = await Promise.all([
+        fetchJsonWithTimeout(
+            `https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(swapInst)}`,
+            FUNDING_BASIS_HTTP_TIMEOUT_MS,
+        ),
+        fetchJsonWithTimeout(
+            `https://www.okx.com/api/v5/public/mark-price?instType=SWAP&instId=${encodeURIComponent(swapInst)}`,
+            FUNDING_BASIS_HTTP_TIMEOUT_MS,
+        ),
+        fetchJsonWithTimeout(
+            `https://www.okx.com/api/v5/market/index-tickers?instId=${encodeURIComponent(indexInst)}`,
+            FUNDING_BASIS_HTTP_TIMEOUT_MS,
+        ),
+    ]);
+    const fundingRow = firstApiDataRow(fundingRaw);
+    const markRow = firstApiDataRow(markRaw);
+    const indexRow = firstApiDataRow(indexRaw);
+    if (!fundingRow && !markRow && !indexRow) {
+        return null;
+    }
+    const fundingRate = asNumber(fundingRow?.fundingRate);
+    const markPrice = asNumber(markRow?.markPx);
+    const indexPrice = asNumber(indexRow?.idxPx);
+    const basisBps = markPrice !== null && indexPrice !== null && indexPrice > 0
+        ? ((markPrice - indexPrice) / indexPrice) * 10_000
+        : null;
+    const updatedAt = Math.max(
+        asNumber(fundingRow?.ts) ?? 0,
+        asNumber(markRow?.ts) ?? 0,
+        asNumber(indexRow?.ts) ?? 0,
+        Date.now(),
+    );
+    return {
+        venue: 'OKX',
+        funding_rate_8h: fundingRate,
+        basis_bps: basisBps,
+        updated_at: updatedAt,
+    };
+}
+
+async function fetchDeribitFundingBasis(asset: string): Promise<FundingBasisVenueSnapshot | null> {
+    const assetSymbol = asset.trim().toUpperCase();
+    if (!['BTC', 'ETH'].includes(assetSymbol)) {
+        return null;
+    }
+    const payload = await fetchJsonWithTimeout(
+        `https://www.deribit.com/api/v2/public/ticker?instrument_name=${encodeURIComponent(`${assetSymbol}-PERPETUAL`)}`,
+        FUNDING_BASIS_HTTP_TIMEOUT_MS,
+    );
+    const top = asRecord(payload);
+    const result = asRecord(top?.result);
+    if (!result) {
+        return null;
+    }
+    const fundingRate = asNumber(result.funding_8h) ?? asNumber(result.current_funding);
+    const markPrice = asNumber(result.mark_price);
+    const indexPrice = asNumber(result.index_price) ?? asNumber(result.estimated_delivery_price);
+    const basisBps = markPrice !== null && indexPrice !== null && indexPrice > 0
+        ? ((markPrice - indexPrice) / indexPrice) * 10_000
+        : null;
+    const updatedAt = asNumber(result.timestamp) ?? Date.now();
+    return {
+        venue: 'DERIBIT',
+        funding_rate_8h: fundingRate,
+        basis_bps: basisBps,
+        updated_at: updatedAt,
+    };
+}
+
+async function refreshFundingBasisOverlay(now = Date.now()): Promise<void> {
+    if (!FUNDING_BASIS_OVERLAY_ENABLED || FUNDING_BASIS_ASSETS.length === 0) {
+        fundingBasisState = {
+            enabled: FUNDING_BASIS_OVERLAY_ENABLED,
+            refresh_ms: FUNDING_BASIS_REFRESH_MS,
+            assets: {},
+            updated_at: now,
+            reason: !FUNDING_BASIS_OVERLAY_ENABLED
+                ? 'disabled by config'
+                : 'no configured assets',
+        };
+        io.emit('funding_basis_overlay_update', fundingBasisPayload(now));
+        touchRuntimeModule('FUNDING_BASIS_FEED', FUNDING_BASIS_OVERLAY_ENABLED ? 'DEGRADED' : 'STANDBY', fundingBasisState.reason);
+        return;
+    }
+
+    const nextAssets: Record<string, FundingBasisAssetState> = {};
+    let successAssets = 0;
+    for (const asset of FUNDING_BASIS_ASSETS) {
+        const results = await Promise.allSettled([
+            fetchOkxFundingBasis(asset),
+            fetchDeribitFundingBasis(asset),
+        ]);
+        const snapshots: FundingBasisVenueSnapshot[] = [];
+        for (const result of results) {
+            if (result.status === 'fulfilled') {
+                if (result.value) {
+                    snapshots.push(result.value);
+                }
+                continue;
+            }
+            recordSilentCatch('FundingBasis.Fetch', result.reason, { asset });
+        }
+        if (snapshots.length === 0) {
+            const previous = fundingBasisState.assets[asset];
+            if (previous) {
+                nextAssets[asset] = {
+                    ...previous,
+                    stale: (now - previous.updated_at) > FUNDING_BASIS_STALE_MS,
+                    signal_reason: `${previous.signal_reason}; using stale snapshot`,
+                };
+            }
+            continue;
+        }
+
+        const aggregated = aggregateFundingBasisAsset(asset, snapshots, now);
+        const signal = computeFundingBasisSignal(aggregated, {
+            crowding_threshold_bps: FUNDING_BASIS_SIGNAL_THRESHOLD_BPS,
+            basis_weight: FUNDING_BASIS_BASIS_WEIGHT,
+        });
+        nextAssets[asset] = {
+            ...aggregated,
+            signal_bias: signal.bias,
+            signal_strength: signal.strength,
+            crowding_bps: signal.crowding_bps,
+            signal_reason: signal.reason,
+            stale: false,
+        };
+        successAssets += 1;
+    }
+
+    fundingBasisState = {
+        enabled: true,
+        refresh_ms: FUNDING_BASIS_REFRESH_MS,
+        assets: nextAssets,
+        updated_at: now,
+        reason: successAssets > 0
+            ? `updated ${successAssets}/${FUNDING_BASIS_ASSETS.length} assets`
+            : `all ${FUNDING_BASIS_ASSETS.length} assets failed`,
+    };
+    io.emit('funding_basis_overlay_update', fundingBasisPayload(now));
+    touchRuntimeModule(
+        'FUNDING_BASIS_FEED',
+        successAssets > 0 ? 'ONLINE' : 'DEGRADED',
+        fundingBasisState.reason,
+    );
+}
+
+function ingestPolymarketMicrostructureScan(scan: StrategyScanState): void {
+    if (!POLY_MICROSTRUCTURE_OVERLAY_ENABLED) {
+        return;
+    }
+    const underlying = strategyUnderlying(scan.strategy);
+    if (!['BTC', 'ETH', 'SOL', 'XRP'].includes(underlying)) {
+        return;
+    }
+    const snapshot = extractPolymarketBookSnapshot(scan.meta_features, scan.timestamp);
+    if (!snapshot) {
+        return;
+    }
+    const previous = polymarketMicrostructureByUnderlying.get(underlying)?.last_snapshot || null;
+    const signal = computePolymarketMicrostructureSignal(previous, snapshot, {
+        min_shift_bps: POLY_MICROSTRUCTURE_MIN_SHIFT_BPS,
+        max_spread_bps: POLY_MICROSTRUCTURE_MAX_SPREAD_BPS,
+    });
+    const updatedAt = Date.now();
+    polymarketMicrostructureByUnderlying.set(underlying, {
+        underlying,
+        direction: signal.direction,
+        strength: signal.strength,
+        mid_shift_bps: signal.mid_shift_bps,
+        spread_bps: signal.spread_bps,
+        updated_at: updatedAt,
+        reason: signal.reason,
+        stale: false,
+        last_snapshot: snapshot,
+    });
+    touchRuntimeModule(
+        'POLY_MICROSTRUCTURE',
+        'ONLINE',
+        `${underlying} dir=${signal.direction} strength=${signal.strength.toFixed(2)} ${signal.reason}`,
+    );
+}
+
+function currentMicrostructureSignal(underlying: string, now = Date.now()): MicrostructureUnderlyingState | null {
+    const state = polymarketMicrostructureByUnderlying.get(underlying);
+    if (!state) {
+        return null;
+    }
+    if ((now - state.updated_at) > POLY_MICROSTRUCTURE_SIGNAL_TTL_MS) {
+        return {
+            ...state,
+            stale: true,
+        };
+    }
+    return {
+        ...state,
+        stale: false,
+    };
+}
+
 function buildMetaControllerState(now = Date.now()): MetaControllerState {
     const scans = getRecentStrategyScans(now);
     if (!META_CONTROLLER_ENABLED || scans.length === 0) {
@@ -5312,15 +6816,110 @@ function buildMetaControllerState(now = Date.now()): MetaControllerState {
         const family = strategyFamily(scan.strategy);
         const familyScore = familyScores[family] ?? 0;
         const allowed = allowedFamilies.includes(family);
-        const recommendedMultiplier = allowed
+        let recommendedMultiplier = allowed
             ? Math.min(1.35, Math.max(0.85, 1 + (familyScore * 0.55)))
             : Math.min(0.85, Math.max(0.45, 0.70 + (familyScore * 0.25)));
+        let rationale = allowed
+            ? `${family} allowed in ${regime}; score ${familyScore.toFixed(3)}`
+            : `${family} de-prioritized in ${regime}; score ${familyScore.toFixed(3)}`;
+        const underlying = strategyUnderlying(scan.strategy);
+
+        if (IV_RV_DIVERGENCE_OVERLAY_ENABLED && family === 'FAIR_VALUE') {
+            const ivRvRatio = scanIvRvRatio(scan);
+            if (ivRvRatio !== null) {
+                if (ivRvRatio >= IV_RV_DIVERGENCE_HIGH_RATIO) {
+                    const normalized = Math.min(1, (ivRvRatio - IV_RV_DIVERGENCE_HIGH_RATIO) / 0.8);
+                    const boost = 1 + ((IV_RV_DIVERGENCE_MAX_BOOST - 1) * normalized);
+                    recommendedMultiplier = Math.min(IV_RV_DIVERGENCE_MAX_BOOST, recommendedMultiplier * boost);
+                    rationale = `${rationale}; IV/RV=${ivRvRatio.toFixed(2)} (high-vol expectation boost)`;
+                } else if (ivRvRatio <= IV_RV_DIVERGENCE_LOW_RATIO) {
+                    const normalized = Math.min(1, (IV_RV_DIVERGENCE_LOW_RATIO - ivRvRatio) / 0.4);
+                    const taper = 1 - ((1 - IV_RV_DIVERGENCE_MAX_PENALTY) * normalized);
+                    recommendedMultiplier = Math.max(IV_RV_DIVERGENCE_MAX_PENALTY, recommendedMultiplier * taper);
+                    rationale = `${rationale}; IV/RV=${ivRvRatio.toFixed(2)} (low-vol taper)`;
+                }
+            }
+        }
+        const direction = scanDirectionSign(scan);
+        if (FUNDING_BASIS_OVERLAY_ENABLED && family === 'FAIR_VALUE' && direction !== 0) {
+            const fundingState = fundingBasisState.assets[underlying];
+            if (fundingState && (now - fundingState.updated_at) <= FUNDING_BASIS_STALE_MS) {
+                const fundingOverlay = directionalOverlayMultiplier(
+                    direction,
+                    fundingState.signal_bias,
+                    fundingState.signal_strength,
+                    FUNDING_BASIS_MAX_BOOST,
+                    FUNDING_BASIS_MAX_PENALTY,
+                );
+                if (Math.abs(fundingOverlay - 1) >= 1e-4) {
+                    recommendedMultiplier = Math.min(1.60, Math.max(0.35, recommendedMultiplier * fundingOverlay));
+                    rationale = `${rationale}; funding/basis=${fundingState.crowding_bps.toFixed(2)}bps x${fundingOverlay.toFixed(3)}`;
+                }
+            }
+        }
+        if (POLY_MICROSTRUCTURE_OVERLAY_ENABLED && family === 'FAIR_VALUE' && direction !== 0) {
+            const micro = currentMicrostructureSignal(underlying, now);
+            if (micro && !micro.stale && micro.direction !== 0) {
+                const microOverlay = directionalOverlayMultiplier(
+                    direction,
+                    micro.direction,
+                    micro.strength,
+                    POLY_MICROSTRUCTURE_MAX_BOOST,
+                    POLY_MICROSTRUCTURE_MAX_PENALTY,
+                );
+                if (Math.abs(microOverlay - 1) >= 1e-4) {
+                    recommendedMultiplier = Math.min(1.60, Math.max(0.35, recommendedMultiplier * microOverlay));
+                    rationale = `${rationale}; poly_micro=${micro.mid_shift_bps.toFixed(1)}bps x${microOverlay.toFixed(3)}`;
+                }
+            }
+        }
+        if (CROSS_STRATEGY_CONFIRM_OVERLAY_ENABLED && family === 'FAIR_VALUE' && direction !== 0) {
+            const obiConfirm = latestDirectionalConfirmation(
+                scans,
+                OBI_CONFIRMATION_STRATEGIES,
+                underlying,
+                now,
+                CROSS_STRATEGY_CONFIRM_MAX_AGE_MS,
+            );
+            if (obiConfirm) {
+                const obiOverlay = directionalOverlayMultiplier(
+                    direction,
+                    obiConfirm.direction,
+                    obiConfirm.strength,
+                    CROSS_STRATEGY_CONFIRM_OBI_MAX_BOOST,
+                    CROSS_STRATEGY_CONFIRM_OBI_MAX_PENALTY,
+                );
+                if (Math.abs(obiOverlay - 1) >= 1e-4) {
+                    recommendedMultiplier = Math.min(1.60, Math.max(0.35, recommendedMultiplier * obiOverlay));
+                    rationale = `${rationale}; obi=${obiConfirm.source}:${obiConfirm.direction > 0 ? 'UP' : 'DN'} x${obiOverlay.toFixed(3)}`;
+                }
+            }
+
+            const cexConfirm = latestDirectionalConfirmation(
+                scans,
+                CEX_CONFIRMATION_STRATEGIES,
+                underlying,
+                now,
+                CROSS_STRATEGY_CONFIRM_MAX_AGE_MS,
+            );
+            if (cexConfirm) {
+                const cexOverlay = directionalOverlayMultiplier(
+                    direction,
+                    cexConfirm.direction,
+                    cexConfirm.strength,
+                    CROSS_STRATEGY_CONFIRM_CEX_MAX_BOOST,
+                    CROSS_STRATEGY_CONFIRM_CEX_MAX_PENALTY,
+                );
+                if (Math.abs(cexOverlay - 1) >= 1e-4) {
+                    recommendedMultiplier = Math.min(1.60, Math.max(0.35, recommendedMultiplier * cexOverlay));
+                    rationale = `${rationale}; cex=${cexConfirm.source}:${cexConfirm.direction > 0 ? 'UP' : 'DN'} x${cexOverlay.toFixed(3)}`;
+                }
+            }
+        }
         strategyOverrides[scan.strategy] = {
             family,
             recommended_multiplier: recommendedMultiplier,
-            rationale: allowed
-                ? `${family} allowed in ${regime}; score ${familyScore.toFixed(3)}`
-                : `${family} de-prioritized in ${regime}; score ${familyScore.toFixed(3)}`,
+            rationale,
         };
     }
 
@@ -6052,20 +7651,21 @@ function parseCountMap(raw: unknown, maxEntries: number): Record<string, number>
 }
 
 function activeModelProbabilityGate(strategy?: string | null, marketKey?: string | null): number {
+    const floorGate = clampProbabilityGate(MODEL_PROBABILITY_GATE_TUNER_MIN_FLOOR);
     if (strategy && marketKey) {
         const scopedMarket = modelGateMarketScopeKey(strategy, marketKey);
         const marketGate = asNumber(modelGateCalibrationState.market_active_gates[scopedMarket]);
         if (marketGate !== null) {
-            return clampProbabilityGate(marketGate);
+            return Math.max(floorGate, clampProbabilityGate(marketGate));
         }
     }
     if (strategy) {
         const strategyGate = asNumber(modelGateCalibrationState.strategy_active_gates[strategy]);
         if (strategyGate !== null) {
-            return clampProbabilityGate(strategyGate);
+            return Math.max(floorGate, clampProbabilityGate(strategyGate));
         }
     }
-    return clampProbabilityGate(modelGateCalibrationState.active_gate);
+    return Math.max(floorGate, clampProbabilityGate(modelGateCalibrationState.active_gate));
 }
 
 function modelGateCalibrationPayload(): ModelGateCalibrationState {
@@ -6191,8 +7791,8 @@ async function loadModelGateCalibrationState(): Promise<void> {
         }
         const baselineGate = MODEL_PROBABILITY_GATE_MIN_PROB;
         const drift = MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT;
-        const minGate = clampProbabilityGate(baselineGate - drift);
-        const maxGate = clampProbabilityGate(baselineGate + drift);
+        const minGate = clampProbabilityGate(Math.max(MODEL_PROBABILITY_GATE_TUNER_MIN_FLOOR, baselineGate - drift));
+        const maxGate = clampProbabilityGate(Math.max(minGate, baselineGate + drift));
         const restoredActive = clampProbabilityGate(asNumber(parsed.active_gate) ?? baselineGate);
         const restoredRecommended = clampProbabilityGate(asNumber(parsed.recommended_gate) ?? restoredActive);
         const strategyActive = parseGateMap(parsed.strategy_active_gates, minGate, maxGate, STRATEGY_IDS.length * 2);
@@ -6224,8 +7824,8 @@ async function runModelProbabilityGateCalibration(now = Date.now()): Promise<voi
     const baselineGate = MODEL_PROBABILITY_GATE_MIN_PROB;
     const stepSize = MODEL_PROBABILITY_GATE_TUNER_STEP;
     const maxDrift = MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT;
-    const minGate = clampProbabilityGate(baselineGate - maxDrift);
-    const maxGate = clampProbabilityGate(baselineGate + maxDrift);
+    const minGate = clampProbabilityGate(Math.max(MODEL_PROBABILITY_GATE_TUNER_MIN_FLOOR, baselineGate - maxDrift));
+    const maxGate = clampProbabilityGate(Math.max(minGate, baselineGate + maxDrift));
     if (!MODEL_PROBABILITY_GATE_TUNER_ENABLED) {
         modelGateCalibrationState = {
             ...modelGateCalibrationState,
@@ -6582,16 +8182,25 @@ function isPaperModelBootstrapBypassActive(): boolean {
     if (!MODEL_PROBABILITY_GATE_REQUIRE_MODEL) {
         return false;
     }
-    if (mlPipelineStatus.model_eligible) {
-        return false;
+    if (!mlPipelineStatus.model_eligible) {
+        return true;
     }
-    if (signalModelArtifact && modelInferenceState.model_loaded) {
-        return false;
+    if (!mlPipelineStatus.model_gate_enforce_ready_paper) {
+        return true;
     }
-    return true;
+    if (!signalModelArtifact || !modelInferenceState.model_loaded) {
+        return true;
+    }
+    return false;
 }
 
 function paperModelBootstrapBypassReason(): string {
+    if (mlPipelineStatus.model_eligible && !mlPipelineStatus.model_gate_enforce_ready_paper) {
+        return `paper quality bypass: ${mlPipelineStatus.model_gate_enforce_reason_paper || 'model gate quality not ready'}`;
+    }
+    if (mlPipelineStatus.model_eligible && (!signalModelArtifact || !modelInferenceState.model_loaded)) {
+        return 'paper bootstrap bypass: model artifact not loaded';
+    }
     const labeledRows = Math.max(0, Math.floor(mlPipelineStatus.dataset_labeled_rows || 0));
     const minRows = MODEL_TRAINER_MIN_LABELED_ROWS;
     const modelReason = mlPipelineStatus.model_reason || 'model not eligible';
@@ -6793,6 +8402,28 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
             model_loaded: Boolean(signalModelArtifact),
         };
     }
+    if (
+        tradingMode === 'PAPER'
+        && strategy
+        && MODEL_PROBABILITY_GATE_MIN_STRATEGY_LABELED_ROWS > 0
+    ) {
+        const strategyLabelRows = Math.max(
+            0,
+            featureRegistryCountsByStrategy[strategy]?.labeled_rows ?? 0,
+        );
+        if (strategyLabelRows < MODEL_PROBABILITY_GATE_MIN_STRATEGY_LABELED_ROWS) {
+            return {
+                ok: true,
+                blocked: false,
+                reason: `paper strategy bootstrap bypass: ${strategy} labeled rows ${strategyLabelRows}/${MODEL_PROBABILITY_GATE_MIN_STRATEGY_LABELED_ROWS}`,
+                strategy,
+                market_key: marketKey,
+                probability: null,
+                gate: probabilityGate,
+                model_loaded: Boolean(signalModelArtifact),
+            };
+        }
+    }
     if (Date.now() < modelDriftState.gate_disabled_until) {
         return {
             ok: true,
@@ -6823,9 +8454,8 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
     const strategyRows = Object.values(modelInferenceState.latest)
         .filter((entry) => entry.strategy === strategy)
         .sort((a, b) => b.timestamp - a.timestamp);
-    const fallback = marketKey
-        ? (exact || null)
-        : (strategyRows[0] || null);
+    const fallback = exact || strategyRows[0] || null;
+    const usedStrategyFallback = Boolean(fallback && !exact && marketKey);
     if (!fallback) {
         return {
             ok: !requireModel,
@@ -6869,7 +8499,9 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
         return {
             ok: false,
             blocked: true,
-            reason: `probability ${fallback.probability_positive.toFixed(3)} below gate ${probabilityGate.toFixed(3)}`,
+            reason: usedStrategyFallback
+                ? `probability ${fallback.probability_positive.toFixed(3)} below gate ${probabilityGate.toFixed(3)} (fallback strategy row ${fallback.market_key})`
+                : `probability ${fallback.probability_positive.toFixed(3)} below gate ${probabilityGate.toFixed(3)}`,
             strategy,
             market_key: fallback.market_key,
             probability: fallback.probability_positive,
@@ -6880,7 +8512,9 @@ function evaluateModelProbabilityGate(payload: unknown, tradingMode: TradingMode
     return {
         ok: true,
         blocked: false,
-        reason: `probability ${fallback.probability_positive.toFixed(3)} >= gate ${probabilityGate.toFixed(3)}`,
+        reason: usedStrategyFallback
+            ? `probability ${fallback.probability_positive.toFixed(3)} >= gate ${probabilityGate.toFixed(3)} (fallback strategy row ${fallback.market_key})`
+            : `probability ${fallback.probability_positive.toFixed(3)} >= gate ${probabilityGate.toFixed(3)}`,
         strategy,
         market_key: fallback.market_key,
         probability: fallback.probability_positive,
@@ -7190,8 +8824,70 @@ async function refreshMlPipelineStatus(): Promise<void> {
     const modelRows = asNumber(modelReport?.rows) ?? 0;
     const modelFeatureCount = asNumber(modelReport?.feature_count) ?? 0;
     const modelCvFolds = asNumber(modelReport?.cv_folds) ?? 0;
+    const cvResultsRaw = Array.isArray(modelReport?.cv_results) ? modelReport.cv_results : [];
+    const cvResults = cvResultsRaw
+        .map((row) => asRecord(row))
+        .filter((row): row is Record<string, unknown> => Boolean(row));
+    const bestCv = cvResults.reduce<Record<string, unknown> | null>((best, row) => {
+        const score = asNumber(row.objective);
+        if (score === null) {
+            return best;
+        }
+        if (!best) {
+            return row;
+        }
+        const bestScore = asNumber(best.objective);
+        if (bestScore === null) {
+            return row;
+        }
+        return score < bestScore ? row : best;
+    }, null);
+    const modelCvAuc = asNumber(modelReport?.cv_auc) ?? asNumber(bestCv?.avg_auc) ?? null;
+    const modelCvBrier = asNumber(modelReport?.cv_brier) ?? asNumber(bestCv?.avg_brier) ?? null;
+    const modelCvLogloss = asNumber(modelReport?.cv_logloss) ?? asNumber(bestCv?.avg_logloss) ?? null;
+    const buildModelGateEnforceReasons = (minCvFolds: number): string[] => {
+        const reasons: string[] = [];
+        if (!modelEligible) {
+            reasons.push(modelReport ? 'model report not eligible' : `missing report at ${SIGNAL_MODEL_REPORT_PATH}`);
+        }
+        if (modelRows < MODEL_GATE_MIN_ROWS_FOR_ENFORCEMENT) {
+            reasons.push(`rows ${modelRows}/${MODEL_GATE_MIN_ROWS_FOR_ENFORCEMENT}`);
+        }
+        if (modelCvFolds < minCvFolds) {
+            reasons.push(`folds ${modelCvFolds}/${minCvFolds}`);
+        }
+        if (modelCvAuc === null) {
+            reasons.push('cv auc unavailable');
+        } else if (modelCvAuc < MODEL_GATE_MIN_CV_AUC_FOR_ENFORCEMENT) {
+            reasons.push(`cv auc ${modelCvAuc.toFixed(3)} < ${MODEL_GATE_MIN_CV_AUC_FOR_ENFORCEMENT.toFixed(3)}`);
+        }
+        if (modelCvBrier === null) {
+            reasons.push('cv brier unavailable');
+        } else if (modelCvBrier > MODEL_GATE_MAX_CV_BRIER_FOR_ENFORCEMENT) {
+            reasons.push(`cv brier ${modelCvBrier.toFixed(3)} > ${MODEL_GATE_MAX_CV_BRIER_FOR_ENFORCEMENT.toFixed(3)}`);
+        }
+        if (modelCvLogloss === null) {
+            reasons.push('cv logloss unavailable');
+        } else if (modelCvLogloss > MODEL_GATE_MAX_CV_LOGLOSS_FOR_ENFORCEMENT) {
+            reasons.push(`cv logloss ${modelCvLogloss.toFixed(3)} > ${MODEL_GATE_MAX_CV_LOGLOSS_FOR_ENFORCEMENT.toFixed(3)}`);
+        }
+        return reasons;
+    };
+    const enforceReasonsPaper = buildModelGateEnforceReasons(MODEL_GATE_MIN_CV_FOLDS_FOR_PAPER_ENFORCEMENT);
+    const enforceReasonsLive = buildModelGateEnforceReasons(MODEL_GATE_MIN_CV_FOLDS_FOR_ENFORCEMENT);
+    const modelGateEnforceReadyPaper = enforceReasonsPaper.length === 0;
+    const modelGateEnforceReasonPaper = modelGateEnforceReadyPaper ? null : enforceReasonsPaper.join('; ');
+    const modelGateEnforceReady = enforceReasonsLive.length === 0;
+    const modelGateEnforceReason = modelGateEnforceReady ? null : enforceReasonsLive.join('; ');
     const modelReason = asString(modelReport?.reason)
         || (!modelReport ? `missing report at ${SIGNAL_MODEL_REPORT_PATH}` : null);
+    const tradingMode = await getTradingMode();
+    const modelGateReadyForMode = tradingMode === 'LIVE'
+        ? modelGateEnforceReady
+        : modelGateEnforceReadyPaper;
+    const modelGateReasonForMode = tradingMode === 'LIVE'
+        ? modelGateEnforceReason
+        : modelGateEnforceReasonPaper;
 
     mlPipelineStatus = {
         feature_event_log_path: featureRegistryRecorder.getPath(),
@@ -7206,6 +8902,13 @@ async function refreshMlPipelineStatus(): Promise<void> {
         model_rows: modelRows,
         model_feature_count: modelFeatureCount,
         model_cv_folds: modelCvFolds,
+        model_cv_auc: modelCvAuc,
+        model_cv_brier: modelCvBrier,
+        model_cv_logloss: modelCvLogloss,
+        model_gate_enforce_ready_paper: modelGateEnforceReadyPaper,
+        model_gate_enforce_reason_paper: modelGateEnforceReasonPaper,
+        model_gate_enforce_ready: modelGateEnforceReady,
+        model_gate_enforce_reason: modelGateEnforceReason,
         model_reason: modelReason,
         updated_at: now,
     };
@@ -7217,9 +8920,15 @@ async function refreshMlPipelineStatus(): Promise<void> {
     );
     touchRuntimeModule(
         'ML_TRAINER',
-        modelEligible ? 'ONLINE' : datasetLabeledRows >= MODEL_TRAINER_MIN_LABELED_ROWS ? 'DEGRADED' : 'STANDBY',
+        modelEligible && modelGateReadyForMode
+            ? 'ONLINE'
+            : modelEligible
+                ? 'DEGRADED'
+                : datasetLabeledRows >= MODEL_TRAINER_MIN_LABELED_ROWS ? 'DEGRADED' : 'STANDBY',
         modelEligible
-            ? `eligible report rows=${modelRows} folds=${modelCvFolds}`
+            ? modelGateReadyForMode
+                ? `eligible report rows=${modelRows} folds=${modelCvFolds} auc=${modelCvAuc === null ? 'n/a' : modelCvAuc.toFixed(3)}`
+                : `report eligible but gate quality not ready (${modelGateReasonForMode || 'unknown'})`
             : `waiting labels ${datasetLabeledRows}/${MODEL_TRAINER_MIN_LABELED_ROWS}${modelReason ? ` (${modelReason})` : ''}`,
     );
     touchRuntimeModule(
@@ -7492,7 +9201,11 @@ function computePortfolioMetaAllocatorOverlay(strategyId: string, state: Strateg
         return META_ALLOCATOR_MIN_OVERLAY;
     }
 
-    return Math.min(META_ALLOCATOR_MAX_OVERLAY, Math.max(META_ALLOCATOR_MIN_OVERLAY, overlay));
+    const boundedMaxOverlay = Math.max(
+        META_ALLOCATOR_MIN_OVERLAY,
+        Math.min(META_ALLOCATOR_MAX_OVERLAY, META_ALLOCATOR_AGGREGATE_CAP),
+    );
+    return Math.min(boundedMaxOverlay, Math.max(META_ALLOCATOR_MIN_OVERLAY, overlay));
 }
 
 function computeEffectiveStrategyMultiplier(strategyId: string, state: StrategyPerformance): {
@@ -7767,7 +9480,9 @@ async function resetSimulationState(
     };
 
     await clearReservedMaps();
-    await featureRegistryRecorder.reset('simulation_reset');
+    if (RESET_FEATURE_REGISTRY_ON_SIM_RESET) {
+        await featureRegistryRecorder.reset('simulation_reset');
+    }
     await redisClient.set(SIM_BANKROLL_KEY, bankroll.toFixed(2));
     await redisClient.set(SIM_LEDGER_CASH_KEY, bankroll.toFixed(8));
     await redisClient.set(SIM_LEDGER_RESERVED_KEY, '0');
@@ -7785,11 +9500,17 @@ async function resetSimulationState(
     clearEntryFreshnessSloState();
     clearDataIntegrityState();
     clearGovernanceState();
-    clearFeatureRegistry();
+    if (RESET_FEATURE_REGISTRY_ON_SIM_RESET) {
+        if (RESET_FEATURE_REGISTRY_ON_SIM_RESET) {
+            clearFeatureRegistry();
+        }
+    }
     clearModelInferenceState();
     clearModelDriftState();
     clearScanFeatureSchemaState();
     executionNettingByMarket.clear();
+    executionNettingByUnderlying.clear();
+    rejectedPnlRollbackByExecutionId.clear();
     await resetRiskGuardStates();
     // Preserve any operator-enabled/disabled strategy toggles by default.
     // For deterministic benchmark runs, callers can force defaults.
@@ -7810,6 +9531,8 @@ async function resetSimulationState(
     await refreshLedgerHealth();
     await refreshMetaController();
     await refreshMlPipelineStatus();
+    const activeMode = await getTradingMode();
+    await persistActiveModeLedgerSnapshot(activeMode);
     await redisClient.publish('system:simulation_reset', JSON.stringify(payload));
     touchRuntimeModule('PNL_LEDGER', 'ONLINE', `simulation reset to ${bankroll.toFixed(2)}`);
 }
@@ -7877,6 +9600,20 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                 timestamp: ingressRejectPayload.timestamp,
                 payload: asRecord(ingressRejectPayload),
             });
+            fireAndForget(
+                'ExecutionDecision.IngressRejected',
+                persistExecutionDecision(executionId, 'REJECTED', {
+                    stage: 'INTELLIGENCE_GATE',
+                    reason: ingressRejectPayload.reason,
+                    source: 'ingress_guard',
+                    strategy: ingressRejectPayload.strategy,
+                    market_key: ingressRejectPayload.market_key,
+                }),
+                {
+                    execution_id: executionId,
+                    strategy: ingressRejectPayload.strategy,
+                },
+            );
             touchRuntimeModule('TRADING_MODE_GUARD', 'DEGRADED', `execution ingress rejected: ${ingress.reason}`);
             return;
         }
@@ -7946,6 +9683,20 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                         timestamp: haltPayload.timestamp,
                         payload: asRecord(haltPayload),
                     });
+                    fireAndForget(
+                        'ExecutionDecision.HaltRejected',
+                        persistExecutionDecision(executionId, 'REJECTED', {
+                            stage: 'LIVE_EXECUTION',
+                            reason: haltPayload.reason,
+                            source: 'execution_halt',
+                            strategy: haltPayload.strategy,
+                            market_key: haltPayload.market_key,
+                        }),
+                        {
+                            execution_id: executionId,
+                            strategy: haltPayload.strategy,
+                        },
+                    );
                     touchRuntimeModule('TRADING_MODE_GUARD', 'DEGRADED', `execution halted: ${reason}`);
                     return;
                 }
@@ -7983,8 +9734,79 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                         timestamp: disabledPayload.timestamp,
                         payload: asRecord(disabledPayload),
                     });
+                    fireAndForget(
+                        'ExecutionDecision.StrategyDisabled',
+                        persistExecutionDecision(executionId, 'REJECTED', {
+                            stage: 'INTELLIGENCE_GATE',
+                            reason: disabledPayload.reason,
+                            source: 'strategy_guard',
+                            strategy: disabledPayload.strategy,
+                            market_key: disabledPayload.market_key,
+                        }),
+                        {
+                            execution_id: executionId,
+                            strategy: disabledPayload.strategy,
+                        },
+                    );
                     touchRuntimeModule('INTELLIGENCE_GATE', 'DEGRADED', `${parsedStrategy} disabled`);
                     return;
+                }
+
+                if (parsedStrategy) {
+                    const inlineRiskGuard = await checkInlineRiskGuardBlock(parsedStrategy);
+                    if (inlineRiskGuard.blocked) {
+                        const mode = await getTradingMode();
+                        const riskPayload = {
+                            execution_id: executionId,
+                            timestamp: Date.now(),
+                            strategy: parsedStrategy,
+                            market_key: parsedMarketKey,
+                            reason: `[RISK_GUARD_INLINE] ${inlineRiskGuard.reason || 'risk guard blocked execution'}`,
+                            paused_until: inlineRiskGuard.pausedUntil || null,
+                            cooldown_until: inlineRiskGuard.cooldownUntil || null,
+                            mode,
+                        };
+                        pushExecutionTraceEvent(executionId, 'INTELLIGENCE_GATE', riskPayload, {
+                            strategy: parsedStrategy,
+                            market_key: parsedMarketKey,
+                        });
+                        io.emit('execution_log', {
+                            execution_id: executionId,
+                            timestamp: riskPayload.timestamp,
+                            side: 'RISK_GUARD_BLOCK',
+                            market: asString(asRecord(parsed)?.market) || 'Polymarket',
+                            price: riskPayload.reason,
+                            size: riskPayload.strategy,
+                            mode,
+                            details: riskPayload,
+                        });
+                        recordRejectedSignal({
+                            stage: 'INTELLIGENCE_GATE',
+                            execution_id: executionId,
+                            strategy: riskPayload.strategy,
+                            market_key: riskPayload.market_key,
+                            reason: riskPayload.reason,
+                            mode,
+                            timestamp: riskPayload.timestamp,
+                            payload: asRecord(riskPayload),
+                        });
+                        fireAndForget(
+                            'ExecutionDecision.RiskGuardInline',
+                            persistExecutionDecision(executionId, 'REJECTED', {
+                                stage: 'INTELLIGENCE_GATE',
+                                reason: riskPayload.reason,
+                                source: 'risk_guard_inline',
+                                strategy: riskPayload.strategy,
+                                market_key: riskPayload.market_key,
+                            }),
+                            {
+                                execution_id: executionId,
+                                strategy: riskPayload.strategy,
+                            },
+                        );
+                        touchRuntimeModule('INTELLIGENCE_GATE', 'DEGRADED', `${parsedStrategy} blocked by inline risk guard`);
+                        return;
+                    }
                 }
 
                 const preparation = prepareExecutionPayloadForDispatch(parsed, parsedStrategy, parsedMarketKey);
@@ -8027,6 +9849,20 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                         timestamp: prepBlockPayload.timestamp,
                         payload: asRecord(prepBlockPayload),
                     });
+                    fireAndForget(
+                        'ExecutionDecision.PreparationRejected',
+                        persistExecutionDecision(executionId, 'REJECTED', {
+                            stage: 'INTELLIGENCE_GATE',
+                            reason: prepBlockPayload.reason,
+                            source: 'preparation_guard',
+                            strategy: prepBlockPayload.strategy,
+                            market_key: prepBlockPayload.market_key,
+                        }),
+                        {
+                            execution_id: executionId,
+                            strategy: prepBlockPayload.strategy,
+                        },
+                    );
                     touchRuntimeModule('EXECUTION_PREFLIGHT', 'DEGRADED', `${stage} blocked ${strategy}`);
                     return;
                 }
@@ -8063,9 +9899,37 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                         `execution prep adjusted ${dispatchStrategy || 'UNKNOWN'}`,
                     );
                 }
-                await processArbitrageExecutionWorker(
+                const dispatchMode = await getTradingMode();
+                const jittered = await applyExecutionEntryJitter(dispatchPayload, dispatchMode);
+                const effectiveDispatchPayload = jittered.payload;
+                if (jittered.applied && jittered.details) {
+                    const jitterPayload = {
+                        execution_id: executionId,
+                        timestamp: Date.now(),
+                        strategy: dispatchStrategy || 'UNKNOWN',
+                        market_key: dispatchMarketKey,
+                        reason: '[EXECUTION_JITTER] live-entry jitter applied',
+                        mode: dispatchMode,
+                        details: jittered.details,
+                    };
+                    pushExecutionTraceEvent(executionId, 'INTELLIGENCE_GATE', jitterPayload, {
+                        strategy: dispatchStrategy,
+                        market_key: dispatchMarketKey,
+                    });
+                    io.emit('execution_log', {
+                        execution_id: executionId,
+                        timestamp: jitterPayload.timestamp,
+                        side: 'EXECUTION_JITTER',
+                        market: asString(asRecord(effectiveDispatchPayload)?.market) || 'Polymarket',
+                        price: jitterPayload.reason,
+                        size: jitterPayload.strategy,
+                        mode: dispatchMode,
+                        details: jitterPayload,
+                    });
+                }
+                const workerResult: ArbExecutionWorkerResult = await processArbitrageExecutionWorker(
                     {
-                        parsed: dispatchPayload,
+                        parsed: effectiveDispatchPayload,
                         executionId,
                         parsedStrategy: dispatchStrategy,
                         parsedMarketKey: dispatchMarketKey,
@@ -8088,6 +9952,8 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                         },
                         registerAtomicExecution: settlementService.registerAtomicExecution.bind(settlementService),
                         emitSettlementEvents,
+                        enqueueSettlementDlq,
+                        notifyOps: notifyOpsAlert,
                         pushExecutionTraceEvent,
                         touchRuntimeModule,
                         emit: (event, payload) => {
@@ -8102,6 +9968,22 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                         recordRejectedSignal,
                     },
                 );
+                fireAndForget(
+                    'ExecutionDecision.WorkerResult',
+                    persistExecutionDecision(executionId, workerResult.decision, {
+                        stage: workerResult.stage,
+                        reason: workerResult.reason,
+                        source: 'execution_worker',
+                        strategy: dispatchStrategy || parsedStrategy || 'UNKNOWN',
+                        market_key: dispatchMarketKey || parsedMarketKey || 'UNKNOWN',
+                    }),
+                    {
+                        execution_id: executionId,
+                        strategy: dispatchStrategy || parsedStrategy || 'UNKNOWN',
+                        decision: workerResult.decision,
+                        stage: workerResult.stage,
+                    },
+                );
             } catch (workerError) {
                 recordSilentCatch('RedisSub.ArbExecutionWorker', workerError, {
                     channel: 'arbitrage:execution',
@@ -8109,6 +9991,21 @@ redisSubscriber.subscribe('arbitrage:execution', (message) => {
                     strategy: parsedStrategy || 'UNKNOWN',
                     market_key: parsedMarketKey || 'UNKNOWN',
                 });
+                fireAndForget(
+                    'ExecutionDecision.WorkerError',
+                    persistExecutionDecision(executionId, 'REJECTED', {
+                        stage: 'INTELLIGENCE_GATE',
+                        reason: `worker error: ${String(workerError)}`,
+                        source: 'execution_worker_error',
+                        strategy: parsedStrategy || 'UNKNOWN',
+                        market_key: parsedMarketKey || 'UNKNOWN',
+                    }),
+                    {
+                        execution_id: executionId,
+                        strategy: parsedStrategy || 'UNKNOWN',
+                        market_key: parsedMarketKey || 'UNKNOWN',
+                    },
+                );
             }
         })();
     } catch (error) {
@@ -8126,17 +10023,19 @@ redisSubscriber.subscribe('strategy:pnl', (message) => {
         const pnlStrategy = asString(asRecord(parsed)?.strategy) || null;
         const pnlMarketKey = extractExecutionMarketKey(parsed);
         pushExecutionTraceEvent(executionId, 'PNL', parsed, { strategy: pnlStrategy, market_key: pnlMarketKey });
-        io.emit('strategy_pnl', parsed);
         const mode = normalizeTradingMode(parsed?.mode) || 'PAPER';
         const sample = mode === 'PAPER' ? parseTradeSample(parsed) : null;
-        const rejection = sample?.execution_id ? rejectedSignalsByExecutionId.get(sample.execution_id) || null : null;
+        const overlapExecutionId = sample?.execution_id || executionId;
+        const rejection = mode === 'PAPER'
+            ? rejectedSignalsByExecutionId.get(overlapExecutionId) || null
+            : null;
         if (mode === 'PAPER' && rejection) {
             const overlapPayload = {
-                execution_id: sample?.execution_id || executionId,
+                execution_id: overlapExecutionId,
                 timestamp: Date.now(),
                 strategy: sample?.strategy || pnlStrategy || 'UNKNOWN',
                 market_key: sample?.market_key || pnlMarketKey,
-                reason: 'paper pnl matched rejected execution id; recording for ledger parity',
+                reason: 'paper pnl matched rejected execution id; dropping pnl event and reverting ledger impact',
                 rejected_stage: rejection.stage,
                 rejected_reason: rejection.reason,
                 rejected_timestamp: rejection.timestamp,
@@ -8146,16 +10045,42 @@ redisSubscriber.subscribe('strategy:pnl', (message) => {
             io.emit('execution_log', {
                 execution_id: overlapPayload.execution_id,
                 timestamp: overlapPayload.timestamp,
-                side: 'PNL_REJECTION_OVERLAP',
+                side: 'PNL_REJECTION_DROP',
                 market: asString(asRecord(parsed)?.market) || 'Polymarket',
                 price: overlapPayload.reason,
                 size: overlapPayload.strategy,
                 mode,
                 details: overlapPayload,
             });
-            touchRuntimeModule('PNL_LEDGER', 'ONLINE', `${overlapPayload.strategy} pnl recorded with rejection overlap (${rejection.stage})`);
+            const pnl = asNumber(asRecord(parsed)?.pnl);
+            if (pnl !== null) {
+                fireAndForget(
+                    'RejectedPnl.Rollback',
+                    (async () => {
+                        const rollback = await rollbackRejectedPaperPnl(overlapExecutionId, pnl);
+                        const rollbackPayload = {
+                            execution_id: overlapExecutionId,
+                            strategy: overlapPayload.strategy,
+                            market_key: overlapPayload.market_key,
+                            pnl,
+                            ...rollback,
+                            timestamp: Date.now(),
+                        };
+                        io.emit('strategy_pnl_rejection_rollback', rollbackPayload);
+                        await refreshLedgerHealth();
+                    })(),
+                    {
+                        execution_id: overlapExecutionId,
+                        strategy: overlapPayload.strategy,
+                        stage: rejection.stage,
+                    },
+                );
+            }
+            touchRuntimeModule('PNL_LEDGER', 'DEGRADED', `${overlapPayload.strategy} pnl dropped due to rejection overlap (${rejection.stage})`);
+            return;
         }
 
+        io.emit('strategy_pnl', parsed);
         strategyTradeRecorder.record(parsed);
         touchRuntimeModule('PNL_LEDGER', 'ONLINE', `${pnlStrategy || 'UNKNOWN'} pnl event recorded`);
 
@@ -8295,6 +10220,7 @@ redisSubscriber.subscribe('arbitrage:scan', (message) => {
             comparable_group: comparableGroup,
             meta_features: Object.keys(metaFeatures).length > 0 ? metaFeatures : undefined,
         };
+        ingestPolymarketMicrostructureScan(scanState);
         latestStrategyScans.set(strategy, scanState);
         latestStrategyScansByMarket.set(buildStrategyMarketKey(strategy, marketKey), scanState);
         pruneIntelligenceState();
@@ -8483,7 +10409,9 @@ redisSubscriber.subscribe('system:simulation_reset', (msg) => {
         clearEntryFreshnessSloState();
         clearDataIntegrityState();
         clearGovernanceState();
-        clearFeatureRegistry();
+        if (RESET_FEATURE_REGISTRY_ON_SIM_RESET) {
+            clearFeatureRegistry();
+        }
         clearModelInferenceState();
         clearModelDriftState();
         clearScanFeatureSchemaState();
@@ -8591,6 +10519,8 @@ io.on('connection', async (socket) => {
     socket.emit('pnl_parity_update', pnlParityState);
     socket.emit('meta_controller_update', metaControllerPayload());
     socket.emit('cross_horizon_router_update', crossHorizonRouterState);
+    socket.emit('funding_basis_overlay_update', fundingBasisPayload());
+    socket.emit('polymarket_microstructure_update', polymarketMicrostructurePayload());
     socket.emit('ml_pipeline_status_update', mlPipelineStatus);
     socket.emit('model_inference_snapshot', modelInferencePayload());
     socket.emit('model_drift_update', modelDriftPayload());
@@ -8902,11 +10832,15 @@ app.get('/api/arb/stats', async (_req, res) => {
         model_drift: modelDriftPayload(),
         model_gate_calibration: modelGateCalibrationPayload(),
         cross_horizon_router: crossHorizonRouterState,
+        funding_basis_overlay: fundingBasisPayload(),
+        polymarket_microstructure: polymarketMicrostructurePayload(),
         execution_netting: {
             enabled: EXECUTION_NETTING_ENABLED,
             ttl_ms: EXECUTION_NETTING_TTL_MS,
             market_cap_usd: EXECUTION_NETTING_MARKET_CAP_USD,
+            underlying_cap_usd: EXECUTION_NETTING_UNDERLYING_CAP_USD,
             entries: executionNettingSnapshot(),
+            underlying_entries: executionUnderlyingNettingSnapshot(),
         },
         strategy_allocator: Object.fromEntries(
             STRATEGY_IDS.map((strategyId) => {
@@ -9049,12 +10983,22 @@ app.get('/api/arb/intelligence', (_req, res) => {
             mean_normalized_margin: Math.round(group.mean_normalized_margin * 1000) / 1000,
         })),
         cross_horizon_router: crossHorizonRouterState,
+        funding_basis_overlay: fundingBasisPayload(now),
+        polymarket_microstructure: polymarketMicrostructurePayload(now),
         scan_feature_schema: scanFeatureSchemaPayload(),
     });
 });
 
 app.get('/api/arb/cross-horizon-router', (_req, res) => {
     res.json(crossHorizonRouterState);
+});
+
+app.get('/api/arb/funding-basis-overlay', (_req, res) => {
+    res.json(fundingBasisPayload());
+});
+
+app.get('/api/arb/polymarket-microstructure', (_req, res) => {
+    res.json(polymarketMicrostructurePayload());
 });
 
 app.get('/api/arb/data-integrity', (_req, res) => {
@@ -9416,6 +11360,7 @@ app.post('/api/arb/rejected-signals/reset', requireControlPlaneAuth, async (_req
     await rejectedSignalRecorder.reset();
     rejectedSignalHistory.splice(0, rejectedSignalHistory.length);
     rejectedSignalsByExecutionId.clear();
+    rejectedPnlRollbackByExecutionId.clear();
     io.emit('rejected_signal_snapshot', rejectedSignalSnapshot());
     res.json({
         ok: true,
@@ -9670,6 +11615,36 @@ registerScheduledTask('Settlement', settlementService.getPollIntervalMs(), async
     } catch (error) {
         recordSilentCatch('Settlement.Cycle', error);
         touchRuntimeModule('SETTLEMENT_ENGINE', 'DEGRADED', `settlement cycle error: ${String(error)}`);
+        fireAndForget(
+            'OpsAlert.SettlementCycle',
+            notifyOpsAlert({
+                severity: 'CRITICAL',
+                scope: 'SETTLEMENT_ENGINE',
+                message: `settlement cycle failed: ${String(error)}`,
+                timestamp: Date.now(),
+                details: {
+                    error: String(error),
+                },
+            }),
+        );
+    }
+});
+
+registerScheduledTask('SettlementDLQ', SETTLEMENT_DLQ_REPLAY_INTERVAL_MS, async () => {
+    try {
+        await runSettlementDlqReplayCycle();
+    } catch (error) {
+        recordSilentCatch('Settlement.DLQReplay', error);
+        touchRuntimeModule('SETTLEMENT_ENGINE', 'DEGRADED', `settlement DLQ replay error: ${String(error)}`);
+    }
+});
+
+registerScheduledTask('CollateralReconciliation', COLLATERAL_RECONCILIATION_INTERVAL_MS, async () => {
+    try {
+        await runCollateralReconciliationCycle();
+    } catch (error) {
+        recordSilentCatch('Settlement.CollateralReconcile', error);
+        touchRuntimeModule('COLLATERAL_RECON', 'DEGRADED', `collateral reconcile error: ${String(error)}`);
     }
 });
 
@@ -9706,6 +11681,33 @@ registerScheduledTask('MetaController', 3_000, async () => {
 
 registerScheduledTask('CrossHorizonRouter', CROSS_HORIZON_ROUTER_INTERVAL_MS, async () => {
     requestCrossHorizonRefresh();
+});
+
+registerScheduledTask('FundingBasisOverlay', FUNDING_BASIS_REFRESH_MS, async () => {
+    try {
+        await refreshFundingBasisOverlay();
+        requestMetaControllerRefresh();
+    } catch (error) {
+        recordSilentCatch('FundingBasisOverlay.Refresh', error);
+        touchRuntimeModule('FUNDING_BASIS_FEED', 'DEGRADED', `funding/basis refresh error: ${String(error)}`);
+    }
+});
+
+registerScheduledTask('PolymarketMicrostructure', 5_000, async () => {
+    const now = Date.now();
+    const payload = polymarketMicrostructurePayload(now);
+    const entries = Object.values(payload.entries);
+    const fresh = entries.filter((entry) => !entry.stale).length;
+    const health = !POLY_MICROSTRUCTURE_OVERLAY_ENABLED
+        ? 'STANDBY'
+        : entries.length === 0 || fresh > 0
+            ? 'ONLINE'
+            : 'DEGRADED';
+    const detail = !POLY_MICROSTRUCTURE_OVERLAY_ENABLED
+        ? 'disabled by config'
+        : `${fresh}/${entries.length} fresh underlying signals`;
+    touchRuntimeModule('POLY_MICROSTRUCTURE', health, detail);
+    io.emit('polymarket_microstructure_update', payload);
 });
 
 registerScheduledTask('MLPipeline', 10_000, async () => {
@@ -9747,6 +11749,7 @@ registerScheduledTask('ModelGateCalibration', MODEL_PROBABILITY_GATE_TUNER_INTER
 
 // Start Services
 async function bootstrap() {
+    validateStartupConfigOrThrow();
     await connectRedis();
     await strategyTradeRecorder.init();
     await featureRegistryRecorder.init();
@@ -9786,6 +11789,18 @@ async function bootstrap() {
     await getRiskConfig();
     await redisClient.setNX('system:trading_mode', 'PAPER');
     await enforceBootTradingModeSafety();
+    const bootMode = await getTradingMode();
+    const bootModeSnapshot = await loadModeLedgerSnapshot(bootMode);
+    if (bootModeSnapshot) {
+        await applyModeLedgerSnapshot(bootModeSnapshot);
+    } else {
+        await persistActiveModeLedgerSnapshot(bootMode);
+    }
+    const alternateMode: TradingMode = bootMode === 'LIVE' ? 'PAPER' : 'LIVE';
+    const alternateSnapshot = await loadModeLedgerSnapshot(alternateMode);
+    if (!alternateSnapshot) {
+        await persistModeLedgerSnapshot(defaultModeLedgerSnapshot(alternateMode));
+    }
     await applyDefaultStrategyStates(false);
     await bootstrapStrategyMultipliers();
     await loadRiskGuardStates();
@@ -9794,6 +11809,8 @@ async function bootstrap() {
     await runStrategyGovernanceCycle();
     await refreshLedgerHealth();
     await refreshPnlParityWatchdog();
+    await runCollateralReconciliationCycle();
+    await refreshFundingBasisOverlay();
     await refreshMetaController();
     await runCrossHorizonRefreshSafely();
     await refreshMlPipelineStatus();
@@ -9850,6 +11867,12 @@ const shutdown = async (signal: string) => {
     stopAllScheduledTasks();
     for (const strategyId of [...riskGuardBootResumeTimers.keys()]) {
         clearRiskGuardBootResumeTimer(strategyId);
+    }
+    if (SHUTDOWN_DRAIN_MS > 0) {
+        logger.info(`[System] draining in-flight tasks for ${SHUTDOWN_DRAIN_MS}ms before transport shutdown`);
+        await new Promise<void>((resolve) => {
+            setTimeout(() => resolve(), SHUTDOWN_DRAIN_MS);
+        });
     }
     await marketDataService.stop().catch((error) => {
         recordSilentCatch('Shutdown.MarketDataStop', error, { signal });

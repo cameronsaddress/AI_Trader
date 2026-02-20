@@ -1,6 +1,6 @@
 import React from 'react';
 import { DashboardLayout } from '../components/layout/DashboardLayout';
-import { apiUrl } from '../lib/api';
+import { apiFetch } from '../lib/api';
 
 type StrategyPageProps = {
     title: string;
@@ -252,8 +252,8 @@ export const StrategyPage: React.FC<StrategyPageProps> = ({ title, description, 
             activeController = controller;
             try {
                 const [statsRes, intelligenceRes] = await Promise.all([
-                    fetch(apiUrl('/api/arb/stats'), { signal: controller.signal }),
-                    fetch(apiUrl('/api/arb/intelligence'), { signal: controller.signal }),
+                    apiFetch('/api/arb/stats', { signal: controller.signal }),
+                    apiFetch('/api/arb/intelligence', { signal: controller.signal }),
                 ]);
                 if (!statsRes.ok || !intelligenceRes.ok) {
                     throw new Error(`HTTP ${statsRes.status}/${intelligenceRes.status}`);
@@ -282,8 +282,8 @@ export const StrategyPage: React.FC<StrategyPageProps> = ({ title, description, 
 
                 const executionRequests = strategyIds.map(async (strategyId) => {
                     const normalized = strategyId.toUpperCase();
-                    const response = await fetch(
-                        apiUrl(`/api/arb/strategy-executions?strategy=${encodeURIComponent(normalized)}&limit=100`),
+                    const response = await apiFetch(
+                        `/api/arb/strategy-executions?strategy=${encodeURIComponent(normalized)}&limit=100`,
                         { signal: controller.signal },
                     );
                     if (!response.ok) {
@@ -293,8 +293,8 @@ export const StrategyPage: React.FC<StrategyPageProps> = ({ title, description, 
                 });
                 const tradeRequests = strategyIds.map(async (strategyId) => {
                     const normalized = strategyId.toUpperCase();
-                    const response = await fetch(
-                        apiUrl(`/api/arb/strategy-trades?strategy=${encodeURIComponent(normalized)}&limit=100`),
+                    const response = await apiFetch(
+                        `/api/arb/strategy-trades?strategy=${encodeURIComponent(normalized)}&limit=100`,
                         { signal: controller.signal },
                     );
                     if (!response.ok) {

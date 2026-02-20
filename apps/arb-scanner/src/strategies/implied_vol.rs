@@ -186,7 +186,7 @@ pub fn spawn_deribit_iv_feed(
     currency: &'static str,
     spot: Arc<RwLock<(f64, i64)>>,
     sink: Arc<RwLock<Option<ImpliedVolSnapshot>>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let refresh_ms = env_u64("DERIBIT_IV_REFRESH_MS", 12_000, 1_000, 120_000);
         let timeout_ms = env_u64("DERIBIT_IV_HTTP_TIMEOUT_MS", 4_000, 500, 20_000);
@@ -229,5 +229,5 @@ pub fn spawn_deribit_iv_feed(
             }
             sleep(Duration::from_millis(refresh_ms)).await;
         }
-    });
+    })
 }

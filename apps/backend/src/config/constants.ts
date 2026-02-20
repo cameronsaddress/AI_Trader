@@ -125,6 +125,10 @@ export const META_ALLOCATOR_MAX_OVERLAY = Math.max(
     META_ALLOCATOR_MIN_OVERLAY,
     Number(process.env.META_ALLOCATOR_MAX_OVERLAY || '1.45'),
 );
+export const META_ALLOCATOR_AGGREGATE_CAP = Math.max(
+    1.0,
+    Number(process.env.META_ALLOCATOR_AGGREGATE_CAP || '3.0'),
+);
 export const META_ALLOCATOR_FAMILY_CONCENTRATION_SOFT_CAP = Math.min(
     0.95,
     Math.max(0.15, Number(process.env.META_ALLOCATOR_FAMILY_CONCENTRATION_SOFT_CAP || '0.45')),
@@ -147,6 +151,14 @@ export const VAULT_REDIS_KEY = 'sim_ledger:vault';
 
 // ── Risk Guard ──────────────────────────────────────────────────────
 export const RISK_GUARD_TRAILING_STOP = Math.max(0, Number(process.env.RISK_GUARD_TRAILING_STOP || '100'));
+export const RISK_GUARD_TRAILING_STOP_PCT = Math.min(
+    0.50,
+    Math.max(0, Number(process.env.RISK_GUARD_TRAILING_STOP_PCT || '0.06')),
+);
+export const RISK_GUARD_TRAILING_STOP_PCT_ABS_CAP = Math.max(
+    0,
+    Number(process.env.RISK_GUARD_TRAILING_STOP_PCT_ABS_CAP || '200'),
+);
 export const RISK_GUARD_CONSEC_LOSS_LIMIT = Math.max(2, Number(process.env.RISK_GUARD_CONSEC_LOSS_LIMIT || '4'));
 export const RISK_GUARD_CONSEC_LOSS_COOLDOWN_MS = Math.max(60_000, Number(process.env.RISK_GUARD_CONSEC_LOSS_COOLDOWN_MS || '1800000'));
 export const RISK_GUARD_POST_LOSS_COOLDOWN_MS = Math.max(0, Number(process.env.RISK_GUARD_POST_LOSS_COOLDOWN_MS || '300000'));
@@ -166,7 +178,10 @@ export const RISK_GUARD_STRATEGIES = new Set(
 export const SIGNAL_WINDOW_MS = 30_000;
 export const SIM_RESET_ON_BOOT = process.env.SIM_RESET_ON_BOOT === 'true';
 export const RESET_VALIDATION_TRADES_ON_SIM_RESET = process.env.RESET_VALIDATION_TRADES_ON_SIM_RESET !== 'false';
+export const RESET_FEATURE_REGISTRY_ON_SIM_RESET = process.env.RESET_FEATURE_REGISTRY_ON_SIM_RESET === 'true';
 export const CONTROL_PLANE_TOKEN = (process.env.CONTROL_PLANE_TOKEN || '').trim();
+export const API_READ_AUTH_REQUIRED = process.env.API_READ_AUTH_REQUIRED !== 'false';
+export const READ_API_TOKEN = (process.env.READ_API_TOKEN || '').trim();
 export const INTELLIGENCE_GATE_ENABLED = process.env.INTELLIGENCE_GATE_ENABLED !== 'false';
 export const INTELLIGENCE_GATE_MAX_STALENESS_MS = Math.max(500, Number(process.env.INTELLIGENCE_GATE_MAX_STALENESS_MS || '3000'));
 export const INTELLIGENCE_GATE_MIN_MARGIN = Number(process.env.INTELLIGENCE_GATE_MIN_MARGIN || '0');
@@ -213,9 +228,43 @@ export const EXECUTION_NETTING_MARKET_CAP_USD = Math.max(
     50,
     Number(process.env.EXECUTION_NETTING_MARKET_CAP_USD || '1200'),
 );
+export const EXECUTION_NETTING_UNDERLYING_CAP_USD = Math.max(
+    EXECUTION_NETTING_MARKET_CAP_USD,
+    Number(process.env.EXECUTION_NETTING_UNDERLYING_CAP_USD || '2200'),
+);
 export const EXECUTION_NETTING_OPPOSING_BLOCK_RATIO = Math.min(
     2.5,
     Math.max(0.25, Number(process.env.EXECUTION_NETTING_OPPOSING_BLOCK_RATIO || '0.85')),
+);
+export const RISK_GUARD_INLINE_PRECHECK_ENABLED = process.env.RISK_GUARD_INLINE_PRECHECK_ENABLED !== 'false';
+export const RISK_GUARD_INLINE_PRECHECK_MAX_AGE_MS = Math.max(
+    30_000,
+    Number(process.env.RISK_GUARD_INLINE_PRECHECK_MAX_AGE_MS || '300000'),
+);
+export const SETTLEMENT_DLQ_REDIS_KEY = (
+    process.env.SETTLEMENT_DLQ_REDIS_KEY
+    || 'system:settlement:dlq:v1'
+).trim() || 'system:settlement:dlq:v1';
+export const SETTLEMENT_DLQ_REPLAY_INTERVAL_MS = Math.max(
+    5_000,
+    Number(process.env.SETTLEMENT_DLQ_REPLAY_INTERVAL_MS || '30000'),
+);
+export const SETTLEMENT_DLQ_REPLAY_BATCH = Math.max(
+    1,
+    Number(process.env.SETTLEMENT_DLQ_REPLAY_BATCH || '25'),
+);
+export const SETTLEMENT_DLQ_MAX_ATTEMPTS = Math.max(
+    1,
+    Number(process.env.SETTLEMENT_DLQ_MAX_ATTEMPTS || '8'),
+);
+export const COLLATERAL_RECONCILIATION_ENABLED = process.env.COLLATERAL_RECONCILIATION_ENABLED !== 'false';
+export const COLLATERAL_RECONCILIATION_INTERVAL_MS = Math.max(
+    5_000,
+    Number(process.env.COLLATERAL_RECONCILIATION_INTERVAL_MS || '60000'),
+);
+export const COLLATERAL_RECONCILIATION_TOLERANCE_USD = Math.max(
+    0.10,
+    Number(process.env.COLLATERAL_RECONCILIATION_TOLERANCE_USD || '2.0'),
 );
 
 // ── Data Integrity ──────────────────────────────────────────────────
@@ -313,6 +362,94 @@ export const CROSS_HORIZON_OVERLAY_KEY_PREFIX = (
     process.env.CROSS_HORIZON_OVERLAY_KEY_PREFIX
     || 'strategy:risk_overlay:cross_horizon:'
 ).trim() || 'strategy:risk_overlay:cross_horizon:';
+export const IV_RV_DIVERGENCE_OVERLAY_ENABLED = process.env.IV_RV_DIVERGENCE_OVERLAY_ENABLED !== 'false';
+export const IV_RV_DIVERGENCE_HIGH_RATIO = Math.max(
+    1.01,
+    Number(process.env.IV_RV_DIVERGENCE_HIGH_RATIO || '1.35'),
+);
+export const IV_RV_DIVERGENCE_LOW_RATIO = Math.min(
+    0.99,
+    Math.max(0.05, Number(process.env.IV_RV_DIVERGENCE_LOW_RATIO || '0.78')),
+);
+export const IV_RV_DIVERGENCE_MAX_BOOST = Math.max(
+    1.0,
+    Number(process.env.IV_RV_DIVERGENCE_MAX_BOOST || '1.15'),
+);
+export const IV_RV_DIVERGENCE_MAX_PENALTY = Math.min(
+    1.0,
+    Math.max(0.20, Number(process.env.IV_RV_DIVERGENCE_MAX_PENALTY || '0.85')),
+);
+export const FUNDING_BASIS_OVERLAY_ENABLED = process.env.FUNDING_BASIS_OVERLAY_ENABLED !== 'false';
+export const FUNDING_BASIS_REFRESH_MS = Math.max(
+    5_000,
+    Number(process.env.FUNDING_BASIS_REFRESH_MS || '30000'),
+);
+export const FUNDING_BASIS_HTTP_TIMEOUT_MS = Math.max(
+    500,
+    Number(process.env.FUNDING_BASIS_HTTP_TIMEOUT_MS || '3500'),
+);
+export const FUNDING_BASIS_SIGNAL_THRESHOLD_BPS = Math.max(
+    0.50,
+    Number(process.env.FUNDING_BASIS_SIGNAL_THRESHOLD_BPS || '6.0'),
+);
+export const FUNDING_BASIS_BASIS_WEIGHT = Math.min(
+    2.0,
+    Math.max(0, Number(process.env.FUNDING_BASIS_BASIS_WEIGHT || '0.60')),
+);
+export const FUNDING_BASIS_MAX_BOOST = Math.max(
+    1.0,
+    Number(process.env.FUNDING_BASIS_MAX_BOOST || '1.12'),
+);
+export const FUNDING_BASIS_MAX_PENALTY = Math.min(
+    1.0,
+    Math.max(0.20, Number(process.env.FUNDING_BASIS_MAX_PENALTY || '0.88')),
+);
+export const FUNDING_BASIS_STALE_MS = Math.max(
+    FUNDING_BASIS_REFRESH_MS * 2,
+    Number(process.env.FUNDING_BASIS_STALE_MS || '180000'),
+);
+export const POLY_MICROSTRUCTURE_OVERLAY_ENABLED = process.env.POLY_MICROSTRUCTURE_OVERLAY_ENABLED !== 'false';
+export const POLY_MICROSTRUCTURE_SIGNAL_TTL_MS = Math.max(
+    2_000,
+    Number(process.env.POLY_MICROSTRUCTURE_SIGNAL_TTL_MS || '20000'),
+);
+export const POLY_MICROSTRUCTURE_MIN_SHIFT_BPS = Math.max(
+    1,
+    Number(process.env.POLY_MICROSTRUCTURE_MIN_SHIFT_BPS || '30'),
+);
+export const POLY_MICROSTRUCTURE_MAX_SPREAD_BPS = Math.max(
+    10,
+    Number(process.env.POLY_MICROSTRUCTURE_MAX_SPREAD_BPS || '450'),
+);
+export const POLY_MICROSTRUCTURE_MAX_BOOST = Math.max(
+    1.0,
+    Number(process.env.POLY_MICROSTRUCTURE_MAX_BOOST || '1.10'),
+);
+export const POLY_MICROSTRUCTURE_MAX_PENALTY = Math.min(
+    1.0,
+    Math.max(0.20, Number(process.env.POLY_MICROSTRUCTURE_MAX_PENALTY || '0.88')),
+);
+export const CROSS_STRATEGY_CONFIRM_OVERLAY_ENABLED = process.env.CROSS_STRATEGY_CONFIRM_OVERLAY_ENABLED !== 'false';
+export const CROSS_STRATEGY_CONFIRM_MAX_AGE_MS = Math.max(
+    1_000,
+    Number(process.env.CROSS_STRATEGY_CONFIRM_MAX_AGE_MS || '15000'),
+);
+export const CROSS_STRATEGY_CONFIRM_OBI_MAX_BOOST = Math.max(
+    1.0,
+    Number(process.env.CROSS_STRATEGY_CONFIRM_OBI_MAX_BOOST || '1.08'),
+);
+export const CROSS_STRATEGY_CONFIRM_OBI_MAX_PENALTY = Math.min(
+    1.0,
+    Math.max(0.20, Number(process.env.CROSS_STRATEGY_CONFIRM_OBI_MAX_PENALTY || '0.92')),
+);
+export const CROSS_STRATEGY_CONFIRM_CEX_MAX_BOOST = Math.max(
+    1.0,
+    Number(process.env.CROSS_STRATEGY_CONFIRM_CEX_MAX_BOOST || '1.06'),
+);
+export const CROSS_STRATEGY_CONFIRM_CEX_MAX_PENALTY = Math.min(
+    1.0,
+    Math.max(0.20, Number(process.env.CROSS_STRATEGY_CONFIRM_CEX_MAX_PENALTY || '0.94')),
+);
 
 // ── Model Probability Gate ──────────────────────────────────────────
 export const MODEL_PROBABILITY_GATE_ENABLED = process.env.MODEL_PROBABILITY_GATE_ENABLED !== 'false';
@@ -327,6 +464,10 @@ export const MODEL_PROBABILITY_GATE_MIN_PROB = Math.min(
 export const MODEL_PROBABILITY_GATE_MAX_STALENESS_MS = Math.max(
     500,
     Number(process.env.MODEL_PROBABILITY_GATE_MAX_STALENESS_MS || '5000'),
+);
+export const MODEL_PROBABILITY_GATE_MIN_STRATEGY_LABELED_ROWS = Math.max(
+    0,
+    Number(process.env.MODEL_PROBABILITY_GATE_MIN_STRATEGY_LABELED_ROWS || '1'),
 );
 export const MODEL_PROBABILITY_GATE_REQUIRE_MODEL = process.env.MODEL_PROBABILITY_GATE_REQUIRE_MODEL === 'true';
 export const MODEL_PROBABILITY_GATE_DISABLE_ON_DRIFT = process.env.MODEL_PROBABILITY_GATE_DISABLE_ON_DRIFT !== 'false';
@@ -348,6 +489,33 @@ export const MODEL_PROBABILITY_GATE_COUNTERFACTUAL_WINDOW_MS = Math.max(
     30_000,
     Number(process.env.MODEL_PROBABILITY_GATE_COUNTERFACTUAL_WINDOW_MS || '600000'),
 );
+export const MODEL_GATE_MIN_ROWS_FOR_ENFORCEMENT = Math.max(
+    20,
+    Number(process.env.MODEL_GATE_MIN_ROWS_FOR_ENFORCEMENT || process.env.MODEL_TRAINER_MIN_LABELED_ROWS || '80'),
+);
+export const MODEL_GATE_MIN_CV_FOLDS_FOR_ENFORCEMENT = Math.max(
+    2,
+    Number(process.env.MODEL_GATE_MIN_CV_FOLDS_FOR_ENFORCEMENT || '3'),
+);
+export const MODEL_GATE_MIN_CV_FOLDS_FOR_PAPER_ENFORCEMENT = Math.max(
+    2,
+    Math.min(
+        MODEL_GATE_MIN_CV_FOLDS_FOR_ENFORCEMENT,
+        Number(process.env.MODEL_GATE_MIN_CV_FOLDS_FOR_PAPER_ENFORCEMENT || '2'),
+    ),
+);
+export const MODEL_GATE_MIN_CV_AUC_FOR_ENFORCEMENT = Math.min(
+    0.80,
+    Math.max(0.50, Number(process.env.MODEL_GATE_MIN_CV_AUC_FOR_ENFORCEMENT || '0.52')),
+);
+export const MODEL_GATE_MAX_CV_BRIER_FOR_ENFORCEMENT = Math.min(
+    0.50,
+    Math.max(0.10, Number(process.env.MODEL_GATE_MAX_CV_BRIER_FOR_ENFORCEMENT || '0.28')),
+);
+export const MODEL_GATE_MAX_CV_LOGLOSS_FOR_ENFORCEMENT = Math.min(
+    2.50,
+    Math.max(0.10, Number(process.env.MODEL_GATE_MAX_CV_LOGLOSS_FOR_ENFORCEMENT || '0.80')),
+);
 export const MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES = Math.max(
     20,
     Number(process.env.MODEL_PROBABILITY_GATE_TUNER_MIN_SAMPLES || '60'),
@@ -358,7 +526,11 @@ export const MODEL_PROBABILITY_GATE_TUNER_STEP = Math.min(
 );
 export const MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT = Math.min(
     0.25,
-    Math.max(0.01, Number(process.env.MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT || '0.08')),
+    Math.max(0.01, Number(process.env.MODEL_PROBABILITY_GATE_TUNER_MAX_DRIFT || '0.03')),
+);
+export const MODEL_PROBABILITY_GATE_TUNER_MIN_FLOOR = Math.min(
+    0.95,
+    Math.max(0.52, Number(process.env.MODEL_PROBABILITY_GATE_TUNER_MIN_FLOOR || '0.52')),
 );
 
 // ── ML Trainer ──────────────────────────────────────────────────────
@@ -454,6 +626,13 @@ export const RUNTIME_MODULE_CATALOG: Array<Omit<RuntimeModuleState, 'heartbeat_m
         expected_interval_ms: 60_000,
     },
     {
+        id: 'COLLATERAL_RECON',
+        label: 'Collateral Reconciliation',
+        phase: 'PHASE_1',
+        health: 'STANDBY',
+        expected_interval_ms: COLLATERAL_RECONCILIATION_INTERVAL_MS,
+    },
+    {
         id: 'EXECUTION_PREFLIGHT',
         label: 'Execution Preflight',
         phase: 'PHASE_1',
@@ -509,6 +688,20 @@ export const RUNTIME_MODULE_CATALOG: Array<Omit<RuntimeModuleState, 'heartbeat_m
         phase: 'PHASE_3',
         health: 'STANDBY',
         expected_interval_ms: CROSS_HORIZON_ROUTER_INTERVAL_MS,
+    },
+    {
+        id: 'FUNDING_BASIS_FEED',
+        label: 'Funding/Basis Feed',
+        phase: 'PHASE_3',
+        health: 'STANDBY',
+        expected_interval_ms: FUNDING_BASIS_REFRESH_MS,
+    },
+    {
+        id: 'POLY_MICROSTRUCTURE',
+        label: 'Polymarket Microstructure',
+        phase: 'PHASE_3',
+        health: 'STANDBY',
+        expected_interval_ms: 0,
     },
     {
         id: 'REGIME_ENGINE',

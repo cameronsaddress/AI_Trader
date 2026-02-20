@@ -8,13 +8,14 @@ use statrs::distribution::{ContinuousCDF, Normal};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
 use uuid::Uuid;
 
 use crate::engine::{PolymarketClient, WS_URL};
 use crate::strategies::control::{
+    await_execution_decision,
     build_scan_payload,
     clear_strategy_open_positions,
     compute_strategy_bet_size,
@@ -33,12 +34,13 @@ use crate::strategies::control::{
     release_sim_notional_for_strategy,
     settle_sim_position_for_strategy,
     read_trading_mode,
+    ExecutionDecision,
     TradingMode,
     restore_strategy_open_positions,
 };
 use crate::strategies::implied_vol::{blend_sigma, spawn_deribit_iv_feed, ImpliedVolSnapshot};
 use crate::strategies::market_data::{update_book_from_market_ws, BinaryBook};
-use crate::strategies::simulation::{realized_pnl, SimCostModel};
+use crate::strategies::simulation::{polymarket_taker_fee, realized_pnl, SimCostModel};
 use crate::strategies::vol_regime::{detect_regime, regime_exit_multipliers};
 use crate::strategies::Strategy;
 
@@ -70,6 +72,36 @@ const DEFAULT_MAX_CONSECUTIVE_LOSSES: u32 = 3;
 const DEFAULT_MAX_POSITION_FRACTION: f64 = 0.20;
 const RESOLUTION_GRACE_SECS: i64 = 180;
 const RESOLUTION_CHECK_COOLDOWN_MS: i64 = 2_000;
+
+fn ws_read_timeout_ms() -> u64 {
+    std::env::var("SCANNER_WS_READ_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 5_000 && *v <= 180_000)
+        .unwrap_or(45_000)
+}
+
+fn next_backoff_secs(current: u64) -> u64 {
+    (current * 2).clamp(1, 30)
+}
+
+fn spawn_supervised_feed_task<F>(name: &'static str, mut spawn_once: F)
+where
+    F: FnMut() -> tokio::task::JoinHandle<()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut restart_backoff_secs = 1_u64;
+        loop {
+            let handle = spawn_once();
+            match handle.await {
+                Ok(()) => warn!("{} feed task exited; restarting", name),
+                Err(error) => error!("{} feed task crashed: {}; restarting", name, error),
+            }
+            sleep(Duration::from_secs(restart_backoff_secs)).await;
+            restart_backoff_secs = next_backoff_secs(restart_backoff_secs);
+        }
+    });
+}
 
 fn env_i64(name: &str, fallback: i64, min: i64, max: i64) -> i64 {
     std::env::var(name)
@@ -239,6 +271,105 @@ fn parse_coinbase_ticker_price(payload: &str, product_id: &str) -> Option<(f64, 
 fn parse_coinbase_message_sequence(payload: &str) -> Option<u64> {
     let parsed = serde_json::from_str::<Value>(payload).ok()?;
     parse_sequence(parsed.get("sequence_num")).or_else(|| parse_sequence(parsed.get("sequence")))
+}
+
+fn spawn_coinbase_ticker_feed(
+    spot_writer: Arc<RwLock<(f64, i64)>>,
+    spot_history_writer: Arc<RwLock<VecDeque<(i64, f64)>>>,
+    asset_pair: String,
+    coinbase_ws_url: String,
+    coinbase_subscriptions: Vec<Value>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut backoff_secs = 1_u64;
+        loop {
+            match connect_async(coinbase_ws_url.as_str()).await {
+                Ok((mut ws_stream, _)) => {
+                    info!(
+                        "Coinbase WS connected for {} pricing via {}",
+                        asset_pair,
+                        coinbase_ws_url
+                    );
+                    backoff_secs = 1;
+                    let mut last_sequence: Option<u64> = None;
+                    for subscribe_msg in &coinbase_subscriptions {
+                        if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.to_string())).await {
+                            error!("Coinbase subscribe failed: {}", e);
+                        }
+                    }
+
+                    loop {
+                        let next = timeout(Duration::from_millis(ws_read_timeout_ms()), ws_stream.next()).await;
+                        let Some(msg) = (match next {
+                            Ok(value) => value,
+                            Err(_) => {
+                                warn!(
+                                    "{} Coinbase ticker feed timed out after {}ms; reconnecting",
+                                    asset_pair,
+                                    ws_read_timeout_ms(),
+                                );
+                                None
+                            }
+                        }) else {
+                            break;
+                        };
+                        match msg {
+                            Ok(Message::Text(text)) => {
+                                if let Some(seq) = parse_coinbase_message_sequence(&text) {
+                                    if let Some(prev) = last_sequence {
+                                        if seq <= prev {
+                                            continue;
+                                        }
+                                        let expected = prev.saturating_add(1);
+                                        if seq > expected {
+                                            warn!(
+                                                "Coinbase ticker sequence gap detected for {} (expected {}, got {}); reconnecting",
+                                                asset_pair,
+                                                expected,
+                                                seq
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    last_sequence = Some(seq);
+                                }
+
+                                if let Some((price, _sequence)) = parse_coinbase_ticker_price(&text, &asset_pair) {
+                                    let mut w = spot_writer.write().await;
+                                    *w = (price, Utc::now().timestamp_millis());
+                                    let now_ms = Utc::now().timestamp_millis();
+                                    let mut history = spot_history_writer.write().await;
+                                    history.push_back((now_ms, price));
+                                    while let Some((ts, _)) = history.front() {
+                                        if now_ms - *ts > SPOT_HISTORY_WINDOW_MS {
+                                            history.pop_front();
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Message::Ping(payload)) => {
+                                let _ = ws_stream.send(Message::Pong(payload)).await;
+                            }
+                            Ok(Message::Close(_)) => break,
+                            Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => continue,
+                            Ok(_) => continue,
+                            Err(e) => {
+                                error!("{} Coinbase ticker message error: {}", asset_pair, e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Coinbase WS reconnecting after error: {}", e);
+                }
+            }
+            sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = next_backoff_secs(backoff_secs);
+        }
+    })
 }
 
 fn is_transient_ws_error_message(message: &str) -> bool {
@@ -526,86 +657,30 @@ impl Strategy for MarketNeutralStrategy {
         let coinbase_ws_url = coinbase_ws_url();
         let coinbase_subscriptions = coinbase_ticker_subscriptions(&coinbase_ws_url, &asset_pair);
 
-        tokio::spawn(async move {
-            loop {
-                match connect_async(coinbase_ws_url.as_str()).await {
-                    Ok((mut ws_stream, _)) => {
-                        info!(
-                            "Coinbase WS connected for {} pricing via {}",
-                            asset_pair,
-                            coinbase_ws_url
-                        );
-                        let mut last_sequence: Option<u64> = None;
-                        for subscribe_msg in &coinbase_subscriptions {
-                            if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.to_string())).await {
-                                error!("Coinbase subscribe failed: {}", e);
-                            }
-                        }
-
-                        while let Some(msg) = ws_stream.next().await {
-                            match msg {
-                                Ok(Message::Text(text)) => {
-                                    if let Some(seq) = parse_coinbase_message_sequence(&text) {
-                                        if let Some(prev) = last_sequence {
-                                            if seq <= prev {
-                                                continue;
-                                            }
-                                            let expected = prev.saturating_add(1);
-                                            if seq > expected {
-                                                warn!(
-                                                    "Coinbase ticker sequence gap detected for {} (expected {}, got {}); reconnecting",
-                                                    asset_pair,
-                                                    expected,
-                                                    seq
-                                                );
-                                                break;
-                                            }
-                                        }
-                                        last_sequence = Some(seq);
-                                    }
-
-                                    if let Some((price, _sequence)) = parse_coinbase_ticker_price(&text, &asset_pair) {
-                                        let mut w = spot_writer.write().await;
-                                        *w = (price, Utc::now().timestamp_millis());
-                                        let now_ms = Utc::now().timestamp_millis();
-                                        let mut history = spot_history_writer.write().await;
-                                        history.push_back((now_ms, price));
-                                        while let Some((ts, _)) = history.front() {
-                                            if now_ms - *ts > SPOT_HISTORY_WINDOW_MS {
-                                                history.pop_front();
-                                            } else {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(Message::Ping(payload)) => {
-                                    let _ = ws_stream.send(Message::Pong(payload)).await;
-                                }
-                                Ok(Message::Close(_)) => break,
-                                Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => continue,
-                                Ok(_) => continue,
-                                Err(e) => {
-                                    error!("{} Coinbase ticker message error: {}", asset_pair, e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Coinbase WS reconnecting after error: {}", e);
-                        sleep(Duration::from_secs(3)).await;
-                    }
-                }
-            }
+        spawn_supervised_feed_task("MARKET_NEUTRAL_COINBASE", move || {
+            spawn_coinbase_ticker_feed(
+                spot_writer.clone(),
+                spot_history_writer.clone(),
+                asset_pair.clone(),
+                coinbase_ws_url.clone(),
+                coinbase_subscriptions.clone(),
+            )
         });
 
         match self.asset.to_uppercase().as_str() {
             "BTC" => {
-                spawn_deribit_iv_feed("BTC", self.latest_spot_price.clone(), self.implied_vol.clone());
+                let iv_spot = self.latest_spot_price.clone();
+                let iv_sink = self.implied_vol.clone();
+                spawn_supervised_feed_task("MARKET_NEUTRAL_DERIBIT_BTC", move || {
+                    spawn_deribit_iv_feed("BTC", iv_spot.clone(), iv_sink.clone())
+                });
             }
             "ETH" => {
-                spawn_deribit_iv_feed("ETH", self.latest_spot_price.clone(), self.implied_vol.clone());
+                let iv_spot = self.latest_spot_price.clone();
+                let iv_sink = self.implied_vol.clone();
+                spawn_supervised_feed_task("MARKET_NEUTRAL_DERIBIT_ETH", move || {
+                    spawn_deribit_iv_feed("ETH", iv_spot.clone(), iv_sink.clone())
+                });
             }
             _ => {}
         }
@@ -976,6 +1051,15 @@ impl Strategy for MarketNeutralStrategy {
                         let adaptive_entry_edge = (params.entry_edge_threshold
                             + ((sigma - ASSUMED_VOLATILITY).max(0.0) * 0.02))
                             .clamp(params.entry_edge_threshold, params.max_entry_edge_threshold);
+                        let fee_curve_rate = env_f64(
+                            &format!("{}_FEE_CURVE_BASE_RATE", self.env_prefix()),
+                            0.02,
+                            0.0,
+                            0.10,
+                        );
+                        let slippage_rate = cost_model.slippage_bps_per_side / 10_000.0;
+                        let taker_fee_rate = polymarket_taker_fee(book.yes.best_ask, fee_curve_rate);
+                        let dynamic_round_trip_cost_rate = (taker_fee_rate + slippage_rate) * 2.0;
                         let divergence_uncertainty_bps = env_f64(
                             &format!("{}_DIVERGENCE_UNCERTAINTY_BPS", self.env_prefix()),
                             12.0,
@@ -983,7 +1067,7 @@ impl Strategy for MarketNeutralStrategy {
                             300.0,
                         );
                         let uncertainty_buffer = divergence_uncertainty_bps / 10_000.0;
-                        let required_edge = adaptive_entry_edge + cost_model.round_trip_cost_rate() + uncertainty_buffer;
+                        let required_edge = adaptive_entry_edge + dynamic_round_trip_cost_rate + uncertainty_buffer;
                         let divergence_floor = env_f64(
                             &format!("{}_DIVERGENCE_MIN_FLOOR", self.env_prefix()),
                             0.02,
@@ -1133,7 +1217,10 @@ impl Strategy for MarketNeutralStrategy {
                                 "spread_ok": spread_ok,
                                 "spread_efficiency_ok": spread_efficiency_ok,
                                 "risk_budget_ok": risk_budget_ok,
-                                "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
+                                "round_trip_cost_rate": dynamic_round_trip_cost_rate,
+                                "taker_fee_rate": taker_fee_rate,
+                                "slippage_rate": slippage_rate,
+                                "fee_curve_base_rate": fee_curve_rate,
                             }),
                         );
                         publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
@@ -1252,6 +1339,7 @@ impl Strategy for MarketNeutralStrategy {
                         };
                         let adjusted_tp = params.take_profit_pct * tp_mult;
                         let adjusted_sl = params.stop_loss_pct * sl_mult;
+                        let tp_executable_threshold = adjusted_tp + cost_model.round_trip_cost_rate();
 
                         let mut close_event: Option<(Position, f64, f64, f64, i64, &'static str)> = None;
                         let mut entry_signal_price: Option<f64> = None;
@@ -1266,7 +1354,7 @@ impl Strategy for MarketNeutralStrategy {
                                     let mark_return = (mark_price - pos.entry_price) / pos.entry_price;
                                     let executable_return = (executable_exit_price - pos.entry_price) / pos.entry_price;
                                     let hold_ms = now_ms - pos.timestamp_ms;
-                                    let close_reason = if mark_return >= adjusted_tp {
+                                    let close_reason = if executable_return >= tp_executable_threshold {
                                         Some("TAKE_PROFIT")
                                     } else if hold_ms >= MIN_HOLD_MS && executable_return <= adjusted_sl {
                                         Some("STOP_LOSS")
@@ -1350,73 +1438,78 @@ impl Strategy for MarketNeutralStrategy {
                                 continue;
                             }
 
+                            let execution_id = Uuid::new_v4().to_string();
+                            let projected_trades_this_window = trades_this_window.saturating_add(1);
+                            let exec_msg = serde_json::json!({
+                                "execution_id": execution_id.clone(),
+                                "strategy": strategy_id.clone(),
+                                "market": format!("Long {}", self.asset),
+                                "side": "ENTRY",
+                                "price": entry_price,
+                                "size": size,
+                                "timestamp": now_ms,
+                                "mode": "PAPER",
+                                "details": {
+                                    "strategy": strategy_id.clone(),
+                                    "condition_id": target_market.market_id.clone(),
+                                    "fair_value": fair_yes,
+                                    "edge": edge,
+                                    "adaptive_entry_edge": adaptive_entry_edge,
+                                    "required_edge": required_edge,
+                                    "required_divergence": required_divergence,
+                                    "divergence_ok": divergence_ok,
+                                    "spot": spot,
+                                    "spot_age_ms": spot_age_ms,
+                                    "book_age_ms": book_age_ms,
+                                    "freshness_ok": freshness_ok,
+                                    "sigma_annualized": sigma,
+                                    "sigma_realized_annualized": realized_sigma.unwrap_or(-1.0),
+                                    "sigma_implied_annualized": implied_sigma.unwrap_or(-1.0),
+                                    "sigma_iv_fresh": iv_is_fresh,
+                                    "sigma_iv_age_ms": iv_age_ms,
+                                    "parity_deviation": parity_deviation,
+                                    "edge_to_spread_ratio": edge_to_spread_ratio,
+                                    "trades_this_window": projected_trades_this_window,
+                                    "slug": self.current_window_slug(),
+                                }
+                            });
+                            publish_execution_event(&mut conn, exec_msg).await;
+                            let decision = await_execution_decision(&mut conn, &execution_id).await;
+                            if decision != ExecutionDecision::Accepted {
+                                warn!(
+                                    "{} strategy: entry blocked by backend decision {:?} execution_id={}",
+                                    strategy_id, decision, execution_id
+                                );
+                                publish_heartbeat(&mut conn, &heartbeat_id).await;
+                                continue;
+                            }
+
                             if !reserve_sim_notional_for_strategy(&mut conn, &strategy_id, size).await {
                                 publish_heartbeat(&mut conn, &heartbeat_id).await;
                                 continue;
                             }
+
+                            let position = Position {
+                                execution_id: execution_id.clone(),
+                                market_id: target_market.market_id.clone(),
+                                yes_token: target_market.yes_token.clone(),
+                                entry_price,
+                                size,
+                                timestamp_ms: now_ms,
+                            };
                             let mut accepted = false;
-                            let mut execution_id: Option<String> = None;
-                            let mut persisted_position: Option<Position> = None;
                             {
                                 let mut pos_lock = self.open_position.write().await;
                                 if pos_lock.is_none() {
-                                    let id = Uuid::new_v4().to_string();
-                                    let position = Position {
-                                        execution_id: id.clone(),
-                                        market_id: target_market.market_id.clone(),
-                                        yes_token: target_market.yes_token.clone(),
-                                        entry_price,
-                                        size,
-                                        timestamp_ms: now_ms,
-                                    };
                                     *pos_lock = Some(position.clone());
                                     accepted = true;
-                                    execution_id = Some(id);
-                                    persisted_position = Some(position);
                                 }
-                            }
-                            if let Some(position) = persisted_position.as_ref() {
-                                persist_strategy_open_positions(&mut conn, &strategy_id, position).await;
                             }
 
                             if accepted {
+                                persist_strategy_open_positions(&mut conn, &strategy_id, &position).await;
                                 last_entry_ms = now_ms;
-                                trades_this_window = trades_this_window.saturating_add(1);
-                                let exec_id = execution_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-                                let exec_msg = serde_json::json!({
-                                    "execution_id": exec_id,
-                                    "strategy": strategy_id.clone(),
-                                    "market": format!("Long {}", self.asset),
-                                    "side": "ENTRY",
-                                    "price": entry_price,
-                                    "size": size,
-                                    "timestamp": now_ms,
-                                    "mode": "PAPER",
-                                    "details": {
-                                        "strategy": strategy_id.clone(),
-                                        "condition_id": target_market.market_id.clone(),
-                                        "fair_value": fair_yes,
-                                        "edge": edge,
-                                        "adaptive_entry_edge": adaptive_entry_edge,
-                                        "required_edge": required_edge,
-                                        "required_divergence": required_divergence,
-                                        "divergence_ok": divergence_ok,
-                                        "spot": spot,
-                                        "spot_age_ms": spot_age_ms,
-                                        "book_age_ms": book_age_ms,
-                                        "freshness_ok": freshness_ok,
-                                        "sigma_annualized": sigma,
-                                        "sigma_realized_annualized": realized_sigma.unwrap_or(-1.0),
-                                        "sigma_implied_annualized": implied_sigma.unwrap_or(-1.0),
-                                        "sigma_iv_fresh": iv_is_fresh,
-                                        "sigma_iv_age_ms": iv_age_ms,
-                                        "parity_deviation": parity_deviation,
-                                        "edge_to_spread_ratio": edge_to_spread_ratio,
-                                        "trades_this_window": trades_this_window,
-                                        "slug": self.current_window_slug(),
-                                    }
-                                });
-                                publish_execution_event(&mut conn, exec_msg).await;
+                                trades_this_window = projected_trades_this_window;
                             } else {
                                 let _ = release_sim_notional_for_strategy(&mut conn, &strategy_id, size).await;
                             }

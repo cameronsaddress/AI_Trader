@@ -27,6 +27,8 @@ type SettlementInternals = {
         status: string;
         redeemAttempts: number;
         nextRedeemAttemptAt: number;
+        marketNotFoundCount?: number;
+        marketNotFoundUntil?: number;
         closed?: boolean;
         winnerTokenId?: string;
         redeemableShares?: number;
@@ -35,7 +37,7 @@ type SettlementInternals = {
         lastError?: string;
         note?: string;
     }>;
-    fetchMarketState: (conditionId: string) => Promise<{ closed: boolean; winnerTokenId: string | null }>;
+    fetchMarketState: (conditionId: string) => Promise<{ closed: boolean; winnerTokenId: string | null; invalid: boolean; notFound: boolean }>;
     fetchRedeemableShares: (conditionId: string) => Promise<number>;
     persist: () => Promise<void>;
 };
@@ -68,7 +70,7 @@ describe('PolymarketSettlementService.runCycle persistence', () => {
         const position = makePosition({ status: 'TRACKED' });
         internals.positions.set(position.id, position);
 
-        internals.fetchMarketState = async () => ({ closed: false, winnerTokenId: null });
+        internals.fetchMarketState = async () => ({ closed: false, winnerTokenId: null, invalid: false, notFound: false });
         internals.fetchRedeemableShares = async () => 0;
 
         let persistCalls = 0;
@@ -89,7 +91,7 @@ describe('PolymarketSettlementService.runCycle persistence', () => {
         const position = makePosition({ status: 'AWAITING_RESOLUTION' });
         internals.positions.set(position.id, position);
 
-        internals.fetchMarketState = async () => ({ closed: false, winnerTokenId: null });
+        internals.fetchMarketState = async () => ({ closed: false, winnerTokenId: null, invalid: false, notFound: false });
         internals.fetchRedeemableShares = async () => 0;
 
         let persistCalls = 0;
@@ -101,6 +103,35 @@ describe('PolymarketSettlementService.runCycle persistence', () => {
 
         expect(position.status).toBe('AWAITING_RESOLUTION');
         expect(persistCalls).toBe(0);
+    });
+
+    it('quarantines not-found condition IDs and avoids re-fetching until cooldown', async () => {
+        const redis = new MockRedis();
+        const service = new PolymarketSettlementService(redis);
+        const internals = service as unknown as SettlementInternals;
+        const position = makePosition({ status: 'TRACKED' });
+        internals.positions.set(position.id, position);
+
+        let fetchCalls = 0;
+        internals.fetchMarketState = async () => {
+            fetchCalls += 1;
+            return { closed: false, winnerTokenId: null, invalid: false, notFound: true };
+        };
+        internals.fetchRedeemableShares = async () => 0;
+
+        let persistCalls = 0;
+        internals.persist = async () => {
+            persistCalls += 1;
+        };
+
+        await service.runCycle('PAPER', false);
+        await service.runCycle('PAPER', false);
+
+        expect(fetchCalls).toBe(1);
+        expect(persistCalls).toBe(1);
+        expect(position.status).toBe('MANUAL_ACTION_REQUIRED');
+        expect(position.marketNotFoundCount).toBe(1);
+        expect((position.marketNotFoundUntil ?? 0) > Date.now()).toBe(true);
     });
 });
 

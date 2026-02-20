@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useSocket } from '../context/SocketContext';
 import { ExecutionLayout } from '../components/layout/ExecutionLayout';
-import { apiUrl } from '../lib/api';
+import { apiFetch } from '../lib/api';
 import { SequencedAbortController } from '../lib/SequencedAbortController';
 import type {
   TradingModeEvent,
@@ -588,8 +588,8 @@ export const Btc5mEnginePage: React.FC = () => {
     setExecutionTraceError(null);
     setExecutionTraceLoading(true);
     try {
-      const response = await fetch(
-        apiUrl(`/api/arb/execution-trace/${encodeURIComponent(executionId)}`),
+      const response = await apiFetch(
+        `/api/arb/execution-trace/${encodeURIComponent(executionId)}`,
         { signal: request.signal },
       );
       if (!response.ok) {
@@ -1046,7 +1046,7 @@ export const Btc5mEnginePage: React.FC = () => {
       const controller = new AbortController();
       activeController = controller;
       try {
-        const res = await fetch(apiUrl('/api/arb/stats'), { signal: controller.signal });
+        const res = await apiFetch('/api/arb/stats', { signal: controller.signal });
         if (!res.ok) return;
         const json = await res.json() as {
           trading_mode?: TradingMode;
@@ -1126,8 +1126,8 @@ export const Btc5mEnginePage: React.FC = () => {
     const controller = new AbortController();
     const loadTradeHistory = async () => {
       try {
-        const res = await fetch(
-          apiUrl(`/api/arb/strategy-trades?strategy=${encodeURIComponent(STRATEGY_ID)}&limit=600`),
+        const res = await apiFetch(
+          `/api/arb/strategy-trades?strategy=${encodeURIComponent(STRATEGY_ID)}&limit=600`,
           { signal: controller.signal },
         );
         if (!res.ok) return;

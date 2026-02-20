@@ -71,9 +71,9 @@ async function checkModeToggle() {
     const ensurePaper = await api('/api/system/trading-mode', { method: 'POST', body: { mode: 'PAPER' } });
     const noConfirm = await api('/api/system/trading-mode', { method: 'POST', body: { mode: 'LIVE' } });
     const confirmLive = await api('/api/system/trading-mode', { method: 'POST', body: { mode: 'LIVE', confirmation: 'LIVE' } });
-    const modeAfterLive = await api('/api/system/trading-mode', { auth: false });
+    const modeAfterLive = await api('/api/system/trading-mode', { auth: true });
     const backPaper = await api('/api/system/trading-mode', { method: 'POST', body: { mode: 'PAPER' } });
-    const modeAfterPaper = await api('/api/system/trading-mode', { auth: false });
+    const modeAfterPaper = await api('/api/system/trading-mode', { auth: true });
 
     const passed = ensurePaper.ok
         && noConfirm.status === 400
@@ -198,7 +198,7 @@ async function checkAtomicSettlementFlow() {
         },
     });
     const process = await api('/api/arb/settlements/process', { method: 'POST', body: {} });
-    const snapshot = await api('/api/arb/settlements', { auth: false });
+    const snapshot = await api('/api/arb/settlements', { auth: true });
     const reset = await api('/api/arb/settlements/reset', { method: 'POST', body: {} });
 
     const trackedAfterSim = Array.isArray(simulated.json?.snapshot?.positions)

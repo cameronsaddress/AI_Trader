@@ -44,6 +44,13 @@ export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             }
             return sessionToken;
         }
+        const legacyToken = window.localStorage.getItem(STORAGE_KEY)?.trim();
+        if (legacyToken) {
+            window.localStorage.removeItem(STORAGE_KEY);
+            window.sessionStorage.setItem(STORAGE_KEY, legacyToken);
+            window.sessionStorage.setItem(TOKEN_SET_AT_KEY, String(Date.now()));
+            return legacyToken;
+        }
         return null;
     });
 

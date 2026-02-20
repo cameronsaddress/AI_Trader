@@ -4,7 +4,7 @@
     "main": "dist/index.js",
     "scripts": {
         "build": "tsc",
-        "dev": "nodemon --exec ts-node src/index.ts",
+        "dev": "nodemon --watch src --ext ts,json --ignore \"logs/**\" --ignore \"../../reports/**\" --exec \"ts-node src/index.ts\"",
         "start": "node dist/index.js",
         "test": "jest --config ../../jest.config.cjs",
         "lint": "eslint src/**/*.ts"

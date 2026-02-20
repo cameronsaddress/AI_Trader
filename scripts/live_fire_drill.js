@@ -191,7 +191,7 @@ async function runExecutionStage({
         };
     }
 
-    const modeStatus = await api('/api/system/trading-mode', { auth: false });
+    const modeStatus = await api('/api/system/trading-mode', { auth: true });
     const liveOrderPostingEnabled = Boolean(modeStatus.json?.live_order_posting_enabled);
     if (requireRealLivePosts && !liveOrderPostingEnabled) {
         await setTradingMode('PAPER');
@@ -356,7 +356,7 @@ async function runSettlementStage() {
     }
 
     const processed = await api('/api/arb/settlements/process', { method: 'POST', body: {} });
-    const snapshot = await api('/api/arb/settlements', { auth: false });
+    const snapshot = await api('/api/arb/settlements', { auth: true });
     const positions = Array.isArray(snapshot.json?.positions) ? snapshot.json.positions : [];
     const progressed = positions.filter((position) => position?.status && position.status !== 'TRACKED').length;
     const completionRate = positions.length > 0 ? progressed / positions.length : 0;

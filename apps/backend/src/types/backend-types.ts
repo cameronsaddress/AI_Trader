@@ -335,6 +335,13 @@ export type MlPipelineStatus = {
     model_rows: number;
     model_feature_count: number;
     model_cv_folds: number;
+    model_cv_auc: number | null;
+    model_cv_brier: number | null;
+    model_cv_logloss: number | null;
+    model_gate_enforce_ready_paper: boolean;
+    model_gate_enforce_reason_paper: string | null;
+    model_gate_enforce_ready: boolean;
+    model_gate_enforce_reason: string | null;
     model_reason: string | null;
     updated_at: number;
 };

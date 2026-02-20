@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
 use uuid::Uuid;
@@ -58,6 +58,36 @@ const MAX_ABS_SETTLEMENT_RETURN: f64 = 0.20;
 const MAX_POSITION_FRACTION: f64 = 0.05;
 const ENTRY_EXPIRY_CUTOFF_MS: i64 = 30_000;
 const REGIME_HISTORY_MAX_POINTS: usize = 320;
+
+fn ws_read_timeout_ms() -> u64 {
+    std::env::var("SCANNER_WS_READ_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 5_000 && *v <= 180_000)
+        .unwrap_or(45_000)
+}
+
+fn next_backoff_secs(current: u64) -> u64 {
+    (current * 2).clamp(1, 30)
+}
+
+fn spawn_supervised_feed_task<F>(name: &'static str, mut spawn_once: F)
+where
+    F: FnMut() -> tokio::task::JoinHandle<()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut restart_backoff_secs = 1_u64;
+        loop {
+            let handle = spawn_once();
+            match handle.await {
+                Ok(()) => warn!("{} feed task exited; restarting", name),
+                Err(error) => error!("{} feed task crashed: {}; restarting", name, error),
+            }
+            sleep(Duration::from_secs(restart_backoff_secs)).await;
+            restart_backoff_secs = next_backoff_secs(restart_backoff_secs);
+        }
+    });
+}
 
 fn coinbase_ws_url() -> String {
     std::env::var("COINBASE_WS_URL").unwrap_or_else(|_| COINBASE_ADVANCED_WS_URL.to_string())
@@ -341,6 +371,77 @@ fn apply_coinbase_book_message(
     Ok(updated)
 }
 
+fn spawn_coinbase_level2_feed(
+    book_writer: Arc<RwLock<LocalOrderBook>>,
+    coinbase_ws_url: String,
+    coinbase_subscriptions: Vec<Value>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut backoff_secs = 1_u64;
+        loop {
+            match connect_async(coinbase_ws_url.as_str()).await {
+                Ok((mut ws, _)) => {
+                    info!("OBI connected to Coinbase order book feed: {}", coinbase_ws_url);
+                    backoff_secs = 1;
+                    let mut last_sequence: Option<u64> = None;
+                    for sub_msg in &coinbase_subscriptions {
+                        if let Err(e) = ws.send(Message::Text(sub_msg.to_string())).await {
+                            error!("Coinbase level2 subscribe failed: {}", e);
+                        }
+                    }
+
+                    loop {
+                        let next = timeout(Duration::from_millis(ws_read_timeout_ms()), ws.next()).await;
+                        let Some(msg) = (match next {
+                            Ok(value) => value,
+                            Err(_) => {
+                                warn!(
+                                    "OBI Coinbase level2 feed timed out after {}ms; reconnecting",
+                                    ws_read_timeout_ms(),
+                                );
+                                None
+                            }
+                        }) else {
+                            break;
+                        };
+                        match msg {
+                            Ok(Message::Text(text)) => {
+                                let mut b = book_writer.write().await;
+                                match apply_coinbase_book_message(&mut b, &text, &mut last_sequence) {
+                                    Ok(_) => {}
+                                    Err((expected, got)) => {
+                                        warn!(
+                                            "OBI Coinbase sequence gap detected (expected {}, got {}); reconnecting local order book",
+                                            expected,
+                                            got
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(Message::Ping(payload)) => {
+                                let _ = ws.send(Message::Pong(payload)).await;
+                            }
+                            Ok(Message::Close(_)) => break,
+                            Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => continue,
+                            Ok(_) => continue,
+                            Err(e) => {
+                                error!("OBI Coinbase message error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("OBI Coinbase reconnecting after error: {}", e);
+                }
+            }
+            sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = next_backoff_secs(backoff_secs);
+        }
+    })
+}
+
 pub struct ObiScalperStrategy {
     client: PolymarketClient,
     book: Arc<RwLock<LocalOrderBook>>,
@@ -373,54 +474,12 @@ impl Strategy for ObiScalperStrategy {
         let coinbase_subscriptions = coinbase_level2_subscriptions(&coinbase_ws_url);
 
         let book_writer = self.book.clone();
-        tokio::spawn(async move {
-            loop {
-                match connect_async(coinbase_ws_url.as_str()).await {
-                    Ok((mut ws, _)) => {
-                        info!("OBI connected to Coinbase order book feed: {}", coinbase_ws_url);
-                        let mut last_sequence: Option<u64> = None;
-                        for sub_msg in &coinbase_subscriptions {
-                            if let Err(e) = ws.send(Message::Text(sub_msg.to_string())).await {
-                                error!("Coinbase level2 subscribe failed: {}", e);
-                            }
-                        }
-
-                        while let Some(msg) = ws.next().await {
-                            match msg {
-                                Ok(Message::Text(text)) => {
-                                    let mut b = book_writer.write().await;
-                                    match apply_coinbase_book_message(&mut b, &text, &mut last_sequence) {
-                                        Ok(_) => {}
-                                        Err((expected, got)) => {
-                                            warn!(
-                                                "OBI Coinbase sequence gap detected (expected {}, got {}); reconnecting local order book",
-                                                expected,
-                                                got
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                                Ok(Message::Ping(payload)) => {
-                                    // Keep connection healthy when server sends pings.
-                                    let _ = ws.send(Message::Pong(payload)).await;
-                                }
-                                Ok(Message::Close(_)) => break,
-                                Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => continue,
-                                Ok(_) => continue,
-                                Err(e) => {
-                                    error!("OBI Coinbase message error: {}", e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("OBI Coinbase reconnecting after error: {}", e);
-                        sleep(Duration::from_secs(3)).await;
-                    }
-                }
-            }
+        spawn_supervised_feed_task("OBI_SCALPER_COINBASE", move || {
+            spawn_coinbase_level2_feed(
+                book_writer.clone(),
+                coinbase_ws_url.clone(),
+                coinbase_subscriptions.clone(),
+            )
         });
 
         let mut last_signal_ms = 0_i64;

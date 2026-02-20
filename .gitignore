@@ -23,6 +23,7 @@ logs/
 apps/*/logs/
 apps/**/logs/
 reports/
+backups/
 
 # Local debug screenshots
 screenshot*.png

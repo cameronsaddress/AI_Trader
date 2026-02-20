@@ -34,7 +34,8 @@ use crate::strategies::control::{
 };
 use crate::strategies::market_data::{update_books_from_market_ws, BinaryBook, TokenBinding};
 use crate::strategies::simulation::{
-    adaptive_slippage, polymarket_taker_fee, realized_pnl_with_fill, FillStyle, SimCostModel,
+    adaptive_slippage, estimate_maker_fill_probability, polymarket_taker_fee, realized_pnl_with_fill,
+    simulate_maker_entry_fill, FillStyle, SimCostModel,
 };
 use crate::strategies::vol_regime::{detect_regime, regime_exit_multipliers};
 use crate::strategies::Strategy;
@@ -707,6 +708,11 @@ impl Strategy for MakerMmStrategy {
                                     } else {
                                         market.no_token.clone()
                                     };
+                                    let modeled_fill_probability = estimate_maker_fill_probability(
+                                        spread,
+                                        book_age_ms,
+                                        expected_net_return,
+                                    );
                                     let execution_id = Uuid::new_v4().to_string();
                                     let preview_msg = serde_json::json!({
                                         "execution_id": execution_id,
@@ -724,6 +730,7 @@ impl Strategy for MakerMmStrategy {
                                             "expected_net_return": expected_net_return,
                                             "threshold": threshold,
                                             "book_age_ms": book_age_ms,
+                                            "modeled_fill_probability": modeled_fill_probability,
                                             "maker_intent": true,
                                             "preflight": {
                                                 "venue": "POLYMARKET",
@@ -770,39 +777,80 @@ impl Strategy for MakerMmStrategy {
                             0.10,
                         ).await.min(max_position_notional());
 
-                        if size > 0.0 && reserve_sim_notional_for_strategy(&mut conn, MAKER_MM_STRATEGY_ID, size).await {
-                            let execution_id = Uuid::new_v4().to_string();
-                            open_positions.push(Position {
-                                execution_id: execution_id.clone(),
-                                market_id: market.market_id.clone(),
-                                question: market.question.clone(),
-                                side,
+                        if size > 0.0 {
+                            let fill_outcome = simulate_maker_entry_fill(
                                 entry_price,
-                                size,
-                                timestamp_ms: now_ms,
-                            });
-                            persist_strategy_open_positions(&mut conn, MAKER_MM_STRATEGY_ID, &open_positions).await;
-                            last_entry_ms = now_ms;
-                            let exec_msg = serde_json::json!({
-                                "execution_id": execution_id,
-                                "market": "Maker MM",
-                                "side": "ENTRY",
-                                "price": entry_price,
-                                "size": size,
-                                "timestamp": now_ms,
-                                "mode": "PAPER",
-                                "details": {
-                                    "condition_id": market.market_id.clone(),
-                                    "question": market.question.clone(),
-                                    "token_side": Self::side_label(side),
-                                    "expected_net_return": expected_net_return,
-                                    "threshold": threshold,
-                                    "spread": spread,
-                                    "book_age_ms": book_age_ms,
-                                    "fill_model": "MAKER_ENTRY",
-                                }
-                            });
-                            publish_execution_event(&mut conn, exec_msg).await;
+                                spread,
+                                book_age_ms,
+                                expected_net_return,
+                                cost_model,
+                                rand::random::<f64>(),
+                            );
+                            if !fill_outcome.filled {
+                                last_entry_ms = now_ms;
+                                let missed_msg = serde_json::json!({
+                                    "execution_id": Uuid::new_v4().to_string(),
+                                    "market": "Maker MM",
+                                    "side": "ENTRY_MISS",
+                                    "price": entry_price,
+                                    "size": size,
+                                    "timestamp": now_ms,
+                                    "mode": "PAPER",
+                                    "details": {
+                                        "condition_id": market.market_id.clone(),
+                                        "question": market.question.clone(),
+                                        "token_side": Self::side_label(side),
+                                        "expected_net_return": expected_net_return,
+                                        "threshold": threshold,
+                                        "spread": spread,
+                                        "book_age_ms": book_age_ms,
+                                        "modeled_fill_probability": fill_outcome.fill_probability,
+                                        "fill_model": "MAKER_QUEUE_SIM",
+                                        "reason": "NO_PASSIVE_FILL",
+                                    }
+                                });
+                                publish_execution_event(&mut conn, missed_msg).await;
+                                publish_heartbeat(&mut conn, "maker_mm").await;
+                                continue;
+                            }
+                            if reserve_sim_notional_for_strategy(&mut conn, MAKER_MM_STRATEGY_ID, size).await {
+                                let filled_entry_price = fill_outcome.execution_price;
+                                let execution_id = Uuid::new_v4().to_string();
+                                open_positions.push(Position {
+                                    execution_id: execution_id.clone(),
+                                    market_id: market.market_id.clone(),
+                                    question: market.question.clone(),
+                                    side,
+                                    entry_price: filled_entry_price,
+                                    size,
+                                    timestamp_ms: now_ms,
+                                });
+                                persist_strategy_open_positions(&mut conn, MAKER_MM_STRATEGY_ID, &open_positions).await;
+                                last_entry_ms = now_ms;
+                                let exec_msg = serde_json::json!({
+                                    "execution_id": execution_id,
+                                    "market": "Maker MM",
+                                    "side": "ENTRY",
+                                    "price": filled_entry_price,
+                                    "size": size,
+                                    "timestamp": now_ms,
+                                    "mode": "PAPER",
+                                    "details": {
+                                        "condition_id": market.market_id.clone(),
+                                        "question": market.question.clone(),
+                                        "token_side": Self::side_label(side),
+                                        "expected_net_return": expected_net_return,
+                                        "threshold": threshold,
+                                        "spread": spread,
+                                        "book_age_ms": book_age_ms,
+                                        "modeled_fill_probability": fill_outcome.fill_probability,
+                                        "modeled_adverse_bps": fill_outcome.adverse_bps,
+                                        "quoted_entry_price": entry_price,
+                                        "fill_model": "MAKER_QUEUE_SIM",
+                                    }
+                                });
+                                publish_execution_event(&mut conn, exec_msg).await;
+                            }
                         }
 
                         publish_heartbeat(&mut conn, "maker_mm").await;

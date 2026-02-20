@@ -20,7 +20,18 @@ describe('evaluateEntryFreshnessInvariant', () => {
         expect(result.applicable).toBe(true);
         expect(result.ok).toBe(false);
         expect(result.reason).toContain('exceeds');
+        expect(result.reason).toContain('spot_age_ms');
         expect(result.max_observed_age_ms).toBe(4_100);
+    });
+
+    it('allows slower IV telemetry while enforcing tight spot/book freshness', () => {
+        const result = evaluateEntryFreshnessInvariant(
+            { side: 'ENTRY', details: { spot_age_ms: 900, sigma_iv_age_ms: 8_500 } },
+            { ok: true },
+            3_000,
+        );
+        expect(result.applicable).toBe(true);
+        expect(result.ok).toBe(true);
     });
 
     it('fails when intelligence gate rejects entry due to staleness', () => {
@@ -34,15 +45,16 @@ describe('evaluateEntryFreshnessInvariant', () => {
         expect(result.reason).toContain('freshness gate rejected entry');
     });
 
-    it('fails entry without explicit age fields when gate is healthy', () => {
+    it('falls back to gate health when explicit age fields are missing', () => {
         const result = evaluateEntryFreshnessInvariant(
             { side: 'ENTRY', details: { expected_profit: 1.2 } },
             { ok: true },
             3_000,
         );
         expect(result.applicable).toBe(true);
-        expect(result.ok).toBe(false);
-        expect(result.reason).toContain('missing entry freshness telemetry');
+        expect(result.ok).toBe(true);
+        expect(result.reason).toContain('accepted via gate fallback');
+        expect(result.checked_fields).toContain('fallback=gate');
     });
 
     it('passes entry when at least one age field is fresh', () => {

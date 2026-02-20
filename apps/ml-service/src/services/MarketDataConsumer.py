@@ -36,11 +36,13 @@ class MarketDataConsumer:
         self.pubsub = None
         self.ticker_channel = os.getenv("ML_TICKER_CHANNEL", "market_data:ticker")
         self.scan_channel = os.getenv("ML_SCAN_CHANNEL", "arbitrage:scan")
-        self.microstructure_max_age_ms = int(float(os.getenv("ML_MICROSTRUCTURE_MAX_AGE_MS", "15000")))
+        self.microstructure_max_age_ms = int(float(os.getenv("ML_MICROSTRUCTURE_MAX_AGE_MS", "5000")))
+        self.microstructure_max_age_ms = max(500, min(120_000, self.microstructure_max_age_ms))
         self.running = False
         self.feature_engineers: dict[str, FeatureEngineer] = {}
         self.signal_models: dict[str, EnsembleSignalModel] = {}
         self.microstructure_by_symbol: dict[str, dict[str, float]] = {}
+        self.prev_features_by_symbol: dict[str, dict[str, float]] = {}
         self.exception_counts: dict[str, int] = {}
         self.last_exception_scope: str | None = None
         self.last_exception_message: str | None = None
@@ -252,6 +254,61 @@ class MarketDataConsumer:
             if parsed is not None:
                 features[feature_name] = parsed
 
+        # Promote key scanner outputs into the ML feature stream.
+        # These are high-signal inputs for binary outcome modeling.
+        spot = self._safe_number(meta.get("spot"))
+        if spot is None:
+            prices = scan.get("prices")
+            if isinstance(prices, list) and prices:
+                spot = self._safe_number(prices[0])
+
+        strike = self._safe_number(meta.get("window_start_spot"))
+        if strike is None:
+            strike = self._safe_number(meta.get("strike"))
+
+        if spot is not None and strike is not None and strike > 0.0:
+            features["micro_spot_strike_delta"] = (spot - strike) / strike
+
+        time_remaining_secs = self._safe_number(meta.get("seconds_to_expiry"))
+        if time_remaining_secs is None:
+            expiry_ts = self._safe_number(meta.get("expiry_ts"))
+            timestamp_ms = self._normalize_timestamp_ms(scan.get("timestamp"))
+            if expiry_ts is not None:
+                expiry_ms = self._normalize_epoch_ms(expiry_ts)
+                time_remaining_secs = max(0.0, (expiry_ms - float(timestamp_ms)) / 1000.0)
+
+        window_span_secs = self._safe_number(meta.get("window_seconds"))
+        if window_span_secs is None:
+            start_ts = self._safe_number(meta.get("window_start_ts"))
+            expiry_ts = self._safe_number(meta.get("expiry_ts"))
+            if start_ts is not None and expiry_ts is not None and expiry_ts > start_ts:
+                window_span_secs = expiry_ts - start_ts
+        if window_span_secs is None or window_span_secs <= 0.0:
+            strategy = str(scan.get("strategy") or "").upper()
+            if strategy.endswith("_15M"):
+                window_span_secs = 900.0
+            elif strategy.endswith("_1M"):
+                window_span_secs = 60.0
+            else:
+                window_span_secs = 300.0
+        if time_remaining_secs is not None:
+            norm = time_remaining_secs / max(window_span_secs, 1.0)
+            features["micro_time_remaining_norm"] = max(0.0, min(1.0, norm))
+
+        fair_yes = self._safe_number(meta.get("fair_yes"))
+        if fair_yes is None:
+            fair_yes = self._safe_number(scan.get("sum"))
+        if fair_yes is not None:
+            features["micro_fair_yes_centered"] = max(-1.0, min(1.0, (fair_yes - 0.5) * 2.0))
+
+        iv_annualized = self._safe_number(meta.get("sigma_implied_annualized"))
+        if iv_annualized is None:
+            iv_annualized = self._safe_number(meta.get("iv_annualized"))
+        if iv_annualized is None:
+            iv_annualized = self._safe_number(meta.get("sigma_annualized"))
+        if iv_annualized is not None:
+            features["micro_iv_annualized"] = max(0.0, min(3.0, iv_annualized))
+
         if spread is not None:
             features["micro_spread"] = spread
         if book_age_ms is not None:
@@ -271,6 +328,10 @@ class MarketDataConsumer:
             "micro_flow_acceleration": 0.0,
             "micro_dynamic_cost_rate": 0.0,
             "micro_momentum_sigma": 0.0,
+            "micro_spot_strike_delta": 0.0,
+            "micro_time_remaining_norm": 0.5,
+            "micro_fair_yes_centered": 0.0,
+            "micro_iv_annualized": 0.0,
             "micro_data_fresh": 0.0,
             "micro_data_age_ms": -1.0,
         }
@@ -343,8 +404,15 @@ class MarketDataConsumer:
             if symbol not in self.signal_models:
                 self.signal_models[symbol] = EnsembleSignalModel(symbol=symbol)
 
-            features = self.feature_engineers[symbol].update(timestamp_ms, price)
-            if features:
+            current_features = self.feature_engineers[symbol].update(timestamp_ms, price)
+            if current_features:
+                lagged_features = self.prev_features_by_symbol.get(symbol)
+                self.prev_features_by_symbol[symbol] = current_features
+                if lagged_features is None:
+                    # Avoid same-tick leakage: first sample only primes lagged feature state.
+                    return
+
+                features = dict(lagged_features)
                 features.update(self._current_microstructure_features(symbol, timestamp_ms))
                 model_signal = self.signal_models[symbol].update(timestamp_ms, features)
                 features.update(model_signal)

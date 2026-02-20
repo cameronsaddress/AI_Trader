@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{Datelike, Timelike, Utc};
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, Stream, StreamExt};
 use log::{error, info, warn};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -9,13 +9,14 @@ use statrs::distribution::{ContinuousCDF, Normal};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
 use uuid::Uuid;
 
 use crate::engine::{MarketTarget, PolymarketClient, WS_URL};
 use crate::strategies::control::{
+    await_execution_decision,
     build_scan_payload,
     check_drawdown_breached,
     compute_strategy_bet_size,
@@ -33,11 +34,12 @@ use crate::strategies::control::{
     release_sim_notional_for_strategy,
     settle_sim_position_for_strategy,
     strategy_variant,
+    ExecutionDecision,
     TradingMode,
 };
 use crate::strategies::implied_vol::{blend_sigma, spawn_deribit_iv_feed, ImpliedVolSnapshot};
 use crate::strategies::market_data::{update_book_from_market_ws, BinaryBook};
-use crate::strategies::simulation::{SimCostModel, polymarket_taker_fee};
+use crate::strategies::simulation::{simulate_maker_entry_fill, SimCostModel, polymarket_taker_fee};
 use crate::strategies::Strategy;
 
 const COINBASE_ADVANCED_WS_URL: &str = "wss://advanced-trade-ws.coinbase.com";
@@ -50,6 +52,7 @@ const KRAKEN_PUBLIC_WS_URL: &str = "wss://ws.kraken.com";
 const BITFINEX_PUBLIC_WS_URL: &str = "wss://api-pub.bitfinex.com/ws/2";
 const WINDOW_SECONDS: i64 = 300;
 const SPOT_HISTORY_WINDOW_MS: i64 = 30 * 60 * 1000;
+const SPOT_HISTORY_MAX_POINTS: usize = 250_000;
 const VOL_WINDOW_MS: i64 = 5 * 60 * 1000;
 const VOL_MIN_SAMPLES: usize = 12;
 const SPOT_STALE_MS: i64 = 2_500;
@@ -121,6 +124,18 @@ const DEFAULT_MIN_EXPECTED_NET_RETURN: f64 = 0.004; // 40 bps expected net retur
 const DEFAULT_MAX_ENTRY_SPREAD: f64 = 0.08; // 8c wide markets are ignored
 const DEFAULT_MAX_POSITION_FRACTION: f64 = 0.35;
 const DEFAULT_MAX_DRAWDOWN_PCT: f64 = -5.0;
+const DEFAULT_TAKE_PROFIT_MIN_RETURN: f64 = 0.35;
+const DEFAULT_TAKE_PROFIT_MIN_BID: f64 = 0.82;
+const DEFAULT_TAKE_PROFIT_MIN_HOLD_MS: i64 = 30_000;
+const DEFAULT_THETA_SNIPER_WINDOW_SECS: i64 = 60;
+const DEFAULT_THETA_SNIPER_MIN_DIVERGENCE_BPS: f64 = 1200.0;
+const DEFAULT_THETA_SNIPER_MAX_BOOK_AGE_MS: i64 = 500;
+const DEFAULT_THETA_SNIPER_SIZE_MULT: f64 = 0.50;
+const DEFAULT_THETA_SNIPER_EXTRA_EDGE_BPS: f64 = 40.0;
+const DEFAULT_MIN_TOP5_ASK_DEPTH_USD: f64 = 60.0;
+const DEFAULT_MAKER_ENTRY_MAX_EDGE_BPS: f64 = 80.0;
+const DEFAULT_MAKER_ENTRY_MIN_TIME_REMAINING_SECS: i64 = 120;
+const DEFAULT_MAKER_ENTRY_MIN_FILL_PROB: f64 = 0.18;
 // Risk-free rate for Black-Scholes fair-value pricing.
 // Negligible over a 5-minute window but kept explicit for correctness.
 const RISK_FREE_RATE: f64 = 0.045;
@@ -199,14 +214,85 @@ fn parse_coinbase_message_sequence(payload: &str) -> Option<u64> {
     parse_sequence(parsed.get("sequence_num")).or_else(|| parse_sequence(parsed.get("sequence")))
 }
 
-fn parse_coinbase_ticker_price(payload: &str) -> Option<f64> {
+#[derive(Debug, Clone, Copy)]
+struct CexVenueQuote {
+    price: f64,
+    pressure: f64,
+    activity: f64,
+    timestamp_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CexFeedSample {
+    mid: f64,
+    pressure: f64,
+    activity: f64,
+}
+
+impl CexFeedSample {
+    fn new(mid: f64, pressure: f64, activity: f64) -> Option<Self> {
+        if !mid.is_finite() || mid <= 0.0 {
+            return None;
+        }
+        let safe_pressure = pressure.clamp(-1.0, 1.0);
+        let safe_activity = if activity.is_finite() {
+            activity.max(0.0)
+        } else {
+            0.0
+        };
+        Some(Self {
+            mid,
+            pressure: safe_pressure,
+            activity: safe_activity,
+        })
+    }
+}
+
+fn size_pressure(bid_size: Option<f64>, ask_size: Option<f64>) -> f64 {
+    let b = bid_size.unwrap_or(0.0).max(0.0);
+    let a = ask_size.unwrap_or(0.0).max(0.0);
+    let denom = b + a;
+    if denom <= 0.0 {
+        0.0
+    } else {
+        ((b - a) / denom).clamp(-1.0, 1.0)
+    }
+}
+
+fn composite_activity(primary: Option<f64>, fallback: Option<f64>) -> f64 {
+    let p = primary.unwrap_or(0.0).max(0.0);
+    let f = fallback.unwrap_or(0.0).max(0.0);
+    if p > 0.0 {
+        p
+    } else {
+        f
+    }
+}
+
+fn parse_coinbase_ticker_sample(payload: &str) -> Option<CexFeedSample> {
     let parsed = serde_json::from_str::<Value>(payload).ok()?;
 
     // Legacy Coinbase Exchange feed shape.
     if parsed.get("type").and_then(|v| v.as_str()) == Some("ticker")
         && parsed.get("product_id").and_then(|v| v.as_str()) == Some(COINBASE_PRODUCT_ID)
     {
-        return parse_number(parsed.get("price"));
+        let mid = parse_number(parsed.get("price"))
+            .or_else(|| {
+                let bid = parse_number(parsed.get("best_bid"));
+                let ask = parse_number(parsed.get("best_ask"));
+                match (bid, ask) {
+                    (Some(b), Some(a)) if b > 0.0 && a > 0.0 => Some((a + b) / 2.0),
+                    _ => None,
+                }
+            })?;
+        let bid_size = parse_number(parsed.get("best_bid_size"));
+        let ask_size = parse_number(parsed.get("best_ask_size"));
+        let pressure = size_pressure(bid_size, ask_size);
+        let activity = composite_activity(
+            parse_number(parsed.get("last_size")),
+            bid_size.zip(ask_size).map(|(b, a)| b + a),
+        );
+        return CexFeedSample::new(mid, pressure, activity);
     }
 
     // Coinbase Advanced Trade shape.
@@ -224,14 +310,34 @@ fn parse_coinbase_ticker_price(payload: &str) -> Option<f64> {
                 continue;
             }
 
-            if let Some(price) = parse_number(ticker.get("price")) {
-                return Some(price);
-            }
-
             let bid = parse_number(ticker.get("best_bid"));
             let ask = parse_number(ticker.get("best_ask"));
+            let mid = if let Some(price) = parse_number(ticker.get("price")) {
+                Some(price)
+            } else {
+                match (bid, ask) {
+                    (Some(best_bid), Some(best_ask)) if best_bid > 0.0 && best_ask > 0.0 => {
+                        Some((best_bid + best_ask) / 2.0)
+                    }
+                    _ => None,
+                }
+            };
+            let bid_size = parse_number(ticker.get("best_bid_size"))
+                .or_else(|| parse_number(ticker.get("best_bid_quantity")));
+            let ask_size = parse_number(ticker.get("best_ask_size"))
+                .or_else(|| parse_number(ticker.get("best_ask_quantity")));
+            let pressure = size_pressure(bid_size, ask_size);
+            let activity = composite_activity(
+                parse_number(ticker.get("last_size")),
+                bid_size.zip(ask_size).map(|(b, a)| b + a),
+            );
             if let (Some(best_bid), Some(best_ask)) = (bid, ask) {
-                return Some((best_bid + best_ask) / 2.0);
+                if best_bid > 0.0 && best_ask > 0.0 {
+                    return CexFeedSample::new((best_bid + best_ask) / 2.0, pressure, activity);
+                }
+            }
+            if let Some(m) = mid {
+                return CexFeedSample::new(m, pressure, activity);
             }
         }
     }
@@ -239,17 +345,23 @@ fn parse_coinbase_ticker_price(payload: &str) -> Option<f64> {
     None
 }
 
-fn parse_binance_book_mid(payload: &str) -> Option<f64> {
+fn parse_binance_book_sample(payload: &str) -> Option<CexFeedSample> {
     let parsed = serde_json::from_str::<Value>(payload).ok()?;
     let bid = parse_number(parsed.get("b"));
     let ask = parse_number(parsed.get("a"));
+    let bid_size = parse_number(parsed.get("B"));
+    let ask_size = parse_number(parsed.get("A"));
     match (bid, ask) {
-        (Some(b), Some(a)) if b > 0.0 && a > 0.0 => Some((a + b) / 2.0),
+        (Some(b), Some(a)) if b > 0.0 && a > 0.0 => CexFeedSample::new(
+            (a + b) / 2.0,
+            size_pressure(bid_size, ask_size),
+            composite_activity(None, bid_size.zip(ask_size).map(|(x, y)| x + y)),
+        ),
         _ => None,
     }
 }
 
-fn parse_okx_ticker_mid(payload: &str) -> Option<f64> {
+fn parse_okx_ticker_sample(payload: &str) -> Option<CexFeedSample> {
     let parsed = serde_json::from_str::<Value>(payload).ok()?;
     if parsed.get("event").and_then(|v| v.as_str()).is_some() {
         return None;
@@ -266,15 +378,22 @@ fn parse_okx_ticker_mid(payload: &str) -> Option<f64> {
     let row = data.first()?;
     let bid = parse_number(row.get("bidPx"));
     let ask = parse_number(row.get("askPx"));
+    let bid_size = parse_number(row.get("bidSz"));
+    let ask_size = parse_number(row.get("askSz"));
+    let activity = composite_activity(
+        parse_number(row.get("lastSz")),
+        parse_number(row.get("vol24h")).or_else(|| parse_number(row.get("volCcy24h"))),
+    );
     if let (Some(b), Some(a)) = (bid, ask) {
         if b > 0.0 && a > 0.0 {
-            return Some((a + b) / 2.0);
+            return CexFeedSample::new((a + b) / 2.0, size_pressure(bid_size, ask_size), activity);
         }
     }
     parse_number(row.get("last"))
+        .and_then(|mid| CexFeedSample::new(mid, size_pressure(bid_size, ask_size), activity))
 }
 
-fn parse_bybit_ticker_mid(payload: &str) -> Option<f64> {
+fn parse_bybit_ticker_sample(payload: &str) -> Option<CexFeedSample> {
     let parsed = serde_json::from_str::<Value>(payload).ok()?;
     let topic = parsed.get("topic")?.as_str()?;
     if topic != "tickers.BTCUSDT" {
@@ -283,15 +402,22 @@ fn parse_bybit_ticker_mid(payload: &str) -> Option<f64> {
     let data = parsed.get("data")?;
     let bid = parse_number(data.get("bid1Price"));
     let ask = parse_number(data.get("ask1Price"));
+    let bid_size = parse_number(data.get("bid1Size"));
+    let ask_size = parse_number(data.get("ask1Size"));
+    let activity = composite_activity(
+        parse_number(data.get("volume24h")),
+        parse_number(data.get("turnover24h")),
+    );
     if let (Some(b), Some(a)) = (bid, ask) {
         if b > 0.0 && a > 0.0 {
-            return Some((a + b) / 2.0);
+            return CexFeedSample::new((a + b) / 2.0, size_pressure(bid_size, ask_size), activity);
         }
     }
     parse_number(data.get("lastPrice"))
+        .and_then(|mid| CexFeedSample::new(mid, size_pressure(bid_size, ask_size), activity))
 }
 
-fn parse_kraken_ticker_mid(payload: &str) -> Option<f64> {
+fn parse_kraken_ticker_sample(payload: &str) -> Option<CexFeedSample> {
     let parsed = serde_json::from_str::<Value>(payload).ok()?;
     if parsed.is_object() {
         return None;
@@ -314,14 +440,46 @@ fn parse_kraken_ticker_mid(payload: &str) -> Option<f64> {
         .and_then(|v| v.first())
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<f64>().ok());
+    let ask_size = data
+        .get("a")
+        .and_then(|v| v.as_array())
+        .and_then(|v| v.get(1))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok());
     let bid = data
         .get("b")
         .and_then(|v| v.as_array())
         .and_then(|v| v.first())
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<f64>().ok());
+    let bid_size = data
+        .get("b")
+        .and_then(|v| v.as_array())
+        .and_then(|v| v.get(1))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok());
     match (bid, ask) {
-        (Some(b), Some(a)) if b > 0.0 && a > 0.0 => Some((a + b) / 2.0),
+        (Some(b), Some(a)) if b > 0.0 && a > 0.0 => CexFeedSample::new(
+            (a + b) / 2.0,
+            size_pressure(bid_size, ask_size),
+            bid_size.zip(ask_size).map(|(x, y)| x + y).unwrap_or(0.0),
+        ),
+        _ => None,
+    }
+}
+
+fn parse_bitfinex_ticker_sample(data: &[Value]) -> Option<CexFeedSample> {
+    let bid = data.first().and_then(|v| v.as_f64());
+    let bid_size = data.get(1).and_then(|v| v.as_f64());
+    let ask = data.get(2).and_then(|v| v.as_f64());
+    let ask_size = data.get(3).and_then(|v| v.as_f64());
+    let volume_24h = data.get(7).and_then(|v| v.as_f64()).map(|v| v.abs());
+    match (bid, ask) {
+        (Some(b), Some(a)) if b > 0.0 && a > 0.0 => CexFeedSample::new(
+            (a + b) / 2.0,
+            size_pressure(bid_size, ask_size),
+            composite_activity(volume_24h, bid_size.zip(ask_size).map(|(x, y)| x.abs() + y.abs())),
+        ),
         _ => None,
     }
 }
@@ -416,6 +574,72 @@ fn reliability_weighted_median(
         }
     }
     weighted.last().map(|(px, _)| *px)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CexVolumeSignal {
+    pressure: f64,
+    activity_ratio: f64,
+    venues: usize,
+}
+
+fn compute_cex_volume_signal(
+    quotes: &HashMap<&'static str, CexVenueQuote>,
+    now_ms: i64,
+    stale_ms: i64,
+) -> Option<CexVolumeSignal> {
+    let mut valid: Vec<(&str, CexVenueQuote)> = quotes
+        .iter()
+        .filter_map(|(venue, quote)| {
+            if quote.price <= 0.0 || !quote.price.is_finite() {
+                return None;
+            }
+            if now_ms.saturating_sub(quote.timestamp_ms) > stale_ms {
+                return None;
+            }
+            Some((*venue, *quote))
+        })
+        .collect();
+
+    if valid.len() < 2 {
+        return None;
+    }
+
+    let activity_values: Vec<f64> = valid.iter().map(|(_, quote)| quote.activity.max(0.0)).collect();
+    let median_activity = median_price(activity_values.clone()).unwrap_or(0.0);
+    let avg_activity = activity_values.iter().sum::<f64>() / (activity_values.len() as f64).max(1.0);
+    let activity_ratio = if median_activity > 0.0 {
+        (avg_activity / median_activity).clamp(0.0, 8.0)
+    } else {
+        1.0
+    };
+
+    let venue_count = valid.len();
+    let mut weighted_pressure = 0.0;
+    let mut weight_sum = 0.0;
+    for (venue, quote) in valid.drain(..) {
+        let base = venue_base_weight(venue);
+        let age_ms = now_ms.saturating_sub(quote.timestamp_ms) as f64;
+        let freshness = (1.0 - age_ms / stale_ms as f64).clamp(0.1, 1.0);
+        let act_mult = if median_activity > 0.0 {
+            (quote.activity / median_activity).clamp(0.25, 4.0)
+        } else {
+            1.0
+        };
+        let weight = base * freshness * act_mult;
+        weighted_pressure += weight * quote.pressure;
+        weight_sum += weight;
+    }
+
+    if weight_sum <= 0.0 {
+        return None;
+    }
+
+    Some(CexVolumeSignal {
+        pressure: (weighted_pressure / weight_sum).clamp(-1.0, 1.0),
+        activity_ratio,
+        venues: venue_count,
+    })
 }
 
 fn open_position_redis_key(strategy_id: &str) -> String {
@@ -575,6 +799,30 @@ fn next_backoff_secs(current: u64) -> u64 {
     (current * 2).clamp(1, 30)
 }
 
+fn ws_read_timeout_ms() -> u64 {
+    std::env::var("SCANNER_WS_READ_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 5_000 && *v <= 180_000)
+        .unwrap_or(45_000)
+}
+
+async fn next_ws_message_or_reconnect<S>(
+    ws_stream: &mut S,
+) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>>
+where
+    S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let timeout_ms = ws_read_timeout_ms();
+    match timeout(Duration::from_millis(timeout_ms), ws_stream.next()).await {
+        Ok(next) => next,
+        Err(_) => {
+            warn!("WS feed read timed out after {}ms; reconnecting", timeout_ms);
+            None
+        }
+    }
+}
+
 fn is_transient_ws_error_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("connection reset")
@@ -596,7 +844,27 @@ fn is_transient_ws_error(error: &tokio_tungstenite::tungstenite::Error) -> bool 
     is_transient_ws_error_message(&error.to_string())
 }
 
-fn spawn_binance_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
+fn spawn_supervised_feed_task<F>(name: &'static str, mut spawn_once: F)
+where
+    F: FnMut() -> tokio::task::JoinHandle<()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut restart_backoff_secs = 1_u64;
+        loop {
+            let handle = spawn_once();
+            match handle.await {
+                Ok(()) => warn!("{} feed task exited; restarting", name),
+                Err(error) => error!("{} feed task crashed: {}; restarting", name, error),
+            }
+            sleep(Duration::from_secs(restart_backoff_secs)).await;
+            restart_backoff_secs = next_backoff_secs(restart_backoff_secs);
+        }
+    });
+}
+
+fn spawn_binance_feed(
+    quotes: Arc<RwLock<HashMap<&'static str, CexVenueQuote>>>,
+) -> tokio::task::JoinHandle<()> {
     let ws_url = binance_ws_url();
     tokio::spawn(async move {
         let mut backoff_secs = 1_u64;
@@ -605,13 +873,18 @@ fn spawn_binance_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                 Ok((mut ws_stream, _)) => {
                     info!("Binance WS connected for BTC pricing via {}", ws_url);
                     backoff_secs = 1;
-                    while let Some(msg) = ws_stream.next().await {
+                    while let Some(msg) = next_ws_message_or_reconnect(&mut ws_stream).await {
                         match msg {
                             Ok(Message::Text(text)) => {
-                                if let Some(price) = parse_binance_book_mid(&text) {
+                                if let Some(sample) = parse_binance_book_sample(&text) {
                                     let now_ms = Utc::now().timestamp_millis();
-                                    let mut writer = prices.write().await;
-                                    writer.insert("binance", (price, now_ms));
+                                    let mut writer = quotes.write().await;
+                                    writer.insert("binance", CexVenueQuote {
+                                        price: sample.mid,
+                                        pressure: sample.pressure,
+                                        activity: sample.activity,
+                                        timestamp_ms: now_ms,
+                                    });
                                 }
                             }
                             Ok(Message::Ping(payload)) => {
@@ -632,10 +905,12 @@ fn spawn_binance_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
             sleep(Duration::from_secs(backoff_secs)).await;
             backoff_secs = next_backoff_secs(backoff_secs);
         }
-    });
+    })
 }
 
-fn spawn_okx_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
+fn spawn_okx_feed(
+    quotes: Arc<RwLock<HashMap<&'static str, CexVenueQuote>>>,
+) -> tokio::task::JoinHandle<()> {
     let ws_url = okx_ws_url();
     tokio::spawn(async move {
         let subscribe_msg = serde_json::json!({
@@ -652,7 +927,7 @@ fn spawn_okx_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                     if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.clone())).await {
                         error!("OKX subscribe failed: {}", e);
                     }
-                    while let Some(msg) = ws_stream.next().await {
+                    while let Some(msg) = next_ws_message_or_reconnect(&mut ws_stream).await {
                         match msg {
                             Ok(Message::Text(text)) => {
                                 let trimmed = text.trim();
@@ -660,10 +935,15 @@ fn spawn_okx_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                                     let _ = ws_stream.send(Message::Text("pong".to_string())).await;
                                     continue;
                                 }
-                                if let Some(price) = parse_okx_ticker_mid(trimmed) {
+                                if let Some(sample) = parse_okx_ticker_sample(trimmed) {
                                     let now_ms = Utc::now().timestamp_millis();
-                                    let mut writer = prices.write().await;
-                                    writer.insert("okx", (price, now_ms));
+                                    let mut writer = quotes.write().await;
+                                    writer.insert("okx", CexVenueQuote {
+                                        price: sample.mid,
+                                        pressure: sample.pressure,
+                                        activity: sample.activity,
+                                        timestamp_ms: now_ms,
+                                    });
                                 }
                             }
                             Ok(Message::Ping(payload)) => {
@@ -684,10 +964,12 @@ fn spawn_okx_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
             sleep(Duration::from_secs(backoff_secs)).await;
             backoff_secs = next_backoff_secs(backoff_secs);
         }
-    });
+    })
 }
 
-fn spawn_bybit_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
+fn spawn_bybit_feed(
+    quotes: Arc<RwLock<HashMap<&'static str, CexVenueQuote>>>,
+) -> tokio::task::JoinHandle<()> {
     let ws_url = bybit_ws_url();
     tokio::spawn(async move {
         let subscribe_msg = serde_json::json!({
@@ -704,7 +986,7 @@ fn spawn_bybit_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                     if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.clone())).await {
                         error!("Bybit subscribe failed: {}", e);
                     }
-                    while let Some(msg) = ws_stream.next().await {
+                    while let Some(msg) = next_ws_message_or_reconnect(&mut ws_stream).await {
                         match msg {
                             Ok(Message::Text(text)) => {
                                 let trimmed = text.trim();
@@ -713,10 +995,15 @@ fn spawn_bybit_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                                     let _ = ws_stream.send(Message::Text("{\"op\":\"pong\"}".to_string())).await;
                                     continue;
                                 }
-                                if let Some(price) = parse_bybit_ticker_mid(trimmed) {
+                                if let Some(sample) = parse_bybit_ticker_sample(trimmed) {
                                     let now_ms = Utc::now().timestamp_millis();
-                                    let mut writer = prices.write().await;
-                                    writer.insert("bybit", (price, now_ms));
+                                    let mut writer = quotes.write().await;
+                                    writer.insert("bybit", CexVenueQuote {
+                                        price: sample.mid,
+                                        pressure: sample.pressure,
+                                        activity: sample.activity,
+                                        timestamp_ms: now_ms,
+                                    });
                                 }
                             }
                             Ok(Message::Ping(payload)) => {
@@ -737,10 +1024,12 @@ fn spawn_bybit_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
             sleep(Duration::from_secs(backoff_secs)).await;
             backoff_secs = next_backoff_secs(backoff_secs);
         }
-    });
+    })
 }
 
-fn spawn_kraken_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
+fn spawn_kraken_feed(
+    quotes: Arc<RwLock<HashMap<&'static str, CexVenueQuote>>>,
+) -> tokio::task::JoinHandle<()> {
     let ws_url = kraken_ws_url();
     tokio::spawn(async move {
         let subscribe_msg = serde_json::json!({
@@ -758,7 +1047,7 @@ fn spawn_kraken_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                     if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.clone())).await {
                         error!("Kraken subscribe failed: {}", e);
                     }
-                    while let Some(msg) = ws_stream.next().await {
+                    while let Some(msg) = next_ws_message_or_reconnect(&mut ws_stream).await {
                         match msg {
                             Ok(Message::Text(text)) => {
                                 let trimmed = text.trim();
@@ -777,10 +1066,15 @@ fn spawn_kraken_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                                     }
                                 }
 
-                                if let Some(price) = parse_kraken_ticker_mid(trimmed) {
+                                if let Some(sample) = parse_kraken_ticker_sample(trimmed) {
                                     let now_ms = Utc::now().timestamp_millis();
-                                    let mut writer = prices.write().await;
-                                    writer.insert("kraken", (price, now_ms));
+                                    let mut writer = quotes.write().await;
+                                    writer.insert("kraken", CexVenueQuote {
+                                        price: sample.mid,
+                                        pressure: sample.pressure,
+                                        activity: sample.activity,
+                                        timestamp_ms: now_ms,
+                                    });
                                 }
                             }
                             Ok(Message::Ping(payload)) => {
@@ -801,10 +1095,12 @@ fn spawn_kraken_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
             sleep(Duration::from_secs(backoff_secs)).await;
             backoff_secs = next_backoff_secs(backoff_secs);
         }
-    });
+    })
 }
 
-fn spawn_bitfinex_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
+fn spawn_bitfinex_feed(
+    quotes: Arc<RwLock<HashMap<&'static str, CexVenueQuote>>>,
+) -> tokio::task::JoinHandle<()> {
     let ws_url = bitfinex_ws_url();
     tokio::spawn(async move {
         let subscribe_msg = serde_json::json!({
@@ -823,7 +1119,7 @@ fn spawn_bitfinex_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                     if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.clone())).await {
                         error!("Bitfinex subscribe failed: {}", e);
                     }
-                    while let Some(msg) = ws_stream.next().await {
+                    while let Some(msg) = next_ws_message_or_reconnect(&mut ws_stream).await {
                         match msg {
                             Ok(Message::Text(text)) => {
                                 let trimmed = text.trim();
@@ -868,16 +1164,15 @@ fn spawn_bitfinex_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
                                 let Some(data) = arr.get(1).and_then(|d| d.as_array()) else {
                                     continue;
                                 };
-                                let bid = data.first().and_then(|v| v.as_f64());
-                                let ask = data.get(2).and_then(|v| v.as_f64());
-                                let price = match (bid, ask) {
-                                    (Some(b), Some(a)) if b > 0.0 && a > 0.0 => Some((a + b) / 2.0),
-                                    _ => None,
-                                };
-                                if let Some(px) = price {
+                                if let Some(sample) = parse_bitfinex_ticker_sample(data) {
                                     let now_ms = Utc::now().timestamp_millis();
-                                    let mut writer = prices.write().await;
-                                    writer.insert("bitfinex", (px, now_ms));
+                                    let mut writer = quotes.write().await;
+                                    writer.insert("bitfinex", CexVenueQuote {
+                                        price: sample.mid,
+                                        pressure: sample.pressure,
+                                        activity: sample.activity,
+                                        timestamp_ms: now_ms,
+                                    });
                                 }
                             }
                             Ok(Message::Ping(payload)) => {
@@ -898,7 +1193,101 @@ fn spawn_bitfinex_feed(prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>>) {
             sleep(Duration::from_secs(backoff_secs)).await;
             backoff_secs = next_backoff_secs(backoff_secs);
         }
-    });
+    })
+}
+
+fn spawn_coinbase_feed(
+    spot_writer: Arc<RwLock<(f64, i64)>>,
+    spot_history_writer: Arc<RwLock<VecDeque<(i64, f64)>>>,
+    cex_coinbase_writer: Arc<RwLock<HashMap<&'static str, CexVenueQuote>>>,
+    coinbase_ws_url: String,
+    coinbase_subscriptions: Vec<Value>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut backoff_secs = 1_u64;
+        loop {
+            match connect_async(coinbase_ws_url.as_str()).await {
+                Ok((mut ws_stream, _)) => {
+                    info!("Coinbase WS connected for BTC pricing via {}", coinbase_ws_url);
+                    backoff_secs = 1;
+                    let mut last_sequence: Option<u64> = None;
+                    for subscribe_msg in &coinbase_subscriptions {
+                        if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.to_string())).await {
+                            error!("Coinbase subscribe failed: {}", e);
+                        }
+                    }
+
+                    while let Some(msg) = next_ws_message_or_reconnect(&mut ws_stream).await {
+                        match msg {
+                            Ok(Message::Text(text)) => {
+                                if let Some(seq) = parse_coinbase_message_sequence(&text) {
+                                    if let Some(prev) = last_sequence {
+                                        if seq <= prev {
+                                            continue;
+                                        }
+                                        let expected = prev.saturating_add(1);
+                                        if seq > expected {
+                                            warn!(
+                                                "Coinbase ticker sequence gap detected (expected {}, got {}); reconnecting",
+                                                expected,
+                                                seq
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    last_sequence = Some(seq);
+                                }
+
+                                if let Some(sample) = parse_coinbase_ticker_sample(&text) {
+                                    let now_ms = Utc::now().timestamp_millis();
+                                    {
+                                        let mut writer = spot_writer.write().await;
+                                        *writer = (sample.mid, now_ms);
+                                    }
+                                    {
+                                        let mut writer = cex_coinbase_writer.write().await;
+                                        writer.insert("coinbase", CexVenueQuote {
+                                            price: sample.mid,
+                                            pressure: sample.pressure,
+                                            activity: sample.activity,
+                                            timestamp_ms: now_ms,
+                                        });
+                                    }
+                                    {
+                                        let mut history = spot_history_writer.write().await;
+                                        history.push_back((now_ms, sample.mid));
+                                        while let Some((ts, _)) = history.front() {
+                                            if now_ms - *ts > SPOT_HISTORY_WINDOW_MS {
+                                                history.pop_front();
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        while history.len() > SPOT_HISTORY_MAX_POINTS {
+                                            history.pop_front();
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Message::Ping(payload)) => {
+                                let _ = ws_stream.send(Message::Pong(payload)).await;
+                            }
+                            Ok(Message::Close(_)) => break,
+                            Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => continue,
+                            Ok(_) => continue,
+                            Err(e) => {
+                                error!("Coinbase ticker message error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => error!("Coinbase WS connection failed: {}", e),
+            }
+            sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = next_backoff_secs(backoff_secs);
+        }
+    })
 }
 
 fn parse_window_start_ts(slug: &str) -> Option<i64> {
@@ -1043,11 +1432,34 @@ fn expected_roi(prob: f64, price: f64) -> f64 {
     (prob / price) - 1.0
 }
 
-fn kelly_fraction(prob: f64, price: f64) -> f64 {
-    if !(prob.is_finite() && price.is_finite()) || price <= 0.0 || price >= 1.0 {
+fn kelly_fraction_fee_adjusted(prob: f64, price: f64, entry_cost_rate: f64) -> f64 {
+    if !(prob.is_finite() && price.is_finite() && entry_cost_rate.is_finite())
+        || price <= 0.0
+        || price >= 1.0
+        || entry_cost_rate < 0.0
+    {
         return 0.0;
     }
-    ((prob - price) / (1.0 - price)).clamp(0.0, 1.0)
+
+    let p = prob.clamp(0.0, 1.0);
+    let q = 1.0 - p;
+    let win_return = ((1.0 / price) - 1.0) - entry_cost_rate;
+    let loss_return = -1.0 - entry_cost_rate;
+    if win_return <= 0.0 || loss_return >= 0.0 {
+        return 0.0;
+    }
+
+    let gain = win_return;
+    let loss = -loss_return;
+    let numerator = (p * gain) - (q * loss);
+    if numerator <= 0.0 {
+        return 0.0;
+    }
+    let denominator = gain * loss;
+    if denominator <= 0.0 {
+        return 0.0;
+    }
+    (numerator / denominator).clamp(0.0, 1.0)
 }
 
 /// Intraday seasonality multiplier based on historical trade outcome patterns.
@@ -1228,6 +1640,128 @@ impl Btc5mLagStrategy {
             .filter(|value| value.is_finite() && *value <= 0.0 && *value >= -100.0)
             .unwrap_or(DEFAULT_MAX_DRAWDOWN_PCT)
     }
+
+    fn take_profit_min_return() -> f64 {
+        std::env::var("BTC_5M_TAKE_PROFIT_MIN_RETURN")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.01 && *value <= 5.0)
+            .unwrap_or(DEFAULT_TAKE_PROFIT_MIN_RETURN)
+    }
+
+    fn take_profit_min_bid() -> f64 {
+        std::env::var("BTC_5M_TAKE_PROFIT_MIN_BID")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.50 && *value <= 0.99)
+            .unwrap_or(DEFAULT_TAKE_PROFIT_MIN_BID)
+    }
+
+    fn take_profit_min_hold_ms() -> i64 {
+        std::env::var("BTC_5M_TAKE_PROFIT_MIN_HOLD_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|value| *value >= 0 && *value <= 300_000)
+            .unwrap_or(DEFAULT_TAKE_PROFIT_MIN_HOLD_MS)
+    }
+
+    fn live_order_type() -> String {
+        let raw = std::env::var("BTC_5M_LIVE_ORDER_TYPE").unwrap_or_else(|_| "FAK".to_string());
+        let normalized = raw.trim().to_ascii_uppercase();
+        match normalized.as_str() {
+            "FOK" | "FAK" | "GTC" | "GTD" => normalized,
+            _ => "FAK".to_string(),
+        }
+    }
+
+    fn theta_sniper_enabled() -> bool {
+        std::env::var("BTC_5M_THETA_SNIPER_ENABLED")
+            .ok()
+            .map(|value| value != "0" && value.to_lowercase() != "false")
+            .unwrap_or(true)
+    }
+
+    fn theta_sniper_window_secs() -> i64 {
+        std::env::var("BTC_5M_THETA_SNIPER_WINDOW_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|value| *value >= 10 && *value <= 180)
+            .unwrap_or(DEFAULT_THETA_SNIPER_WINDOW_SECS)
+    }
+
+    fn theta_sniper_min_divergence() -> f64 {
+        std::env::var("BTC_5M_THETA_SNIPER_MIN_DIVERGENCE_BPS")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 100.0 && *value <= 5_000.0)
+            .map(|value| value / 10_000.0)
+            .unwrap_or(DEFAULT_THETA_SNIPER_MIN_DIVERGENCE_BPS / 10_000.0)
+    }
+
+    fn theta_sniper_max_book_age_ms() -> i64 {
+        std::env::var("BTC_5M_THETA_SNIPER_MAX_BOOK_AGE_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|value| *value >= 100 && *value <= 3_000)
+            .unwrap_or(DEFAULT_THETA_SNIPER_MAX_BOOK_AGE_MS)
+    }
+
+    fn theta_sniper_size_mult() -> f64 {
+        std::env::var("BTC_5M_THETA_SNIPER_SIZE_MULT")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.05 && *value <= 1.0)
+            .unwrap_or(DEFAULT_THETA_SNIPER_SIZE_MULT)
+    }
+
+    fn theta_sniper_extra_edge() -> f64 {
+        std::env::var("BTC_5M_THETA_SNIPER_EXTRA_EDGE_BPS")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0 && *value <= 500.0)
+            .map(|value| value / 10_000.0)
+            .unwrap_or(DEFAULT_THETA_SNIPER_EXTRA_EDGE_BPS / 10_000.0)
+    }
+
+    fn min_top5_ask_depth_usd() -> f64 {
+        std::env::var("BTC_5M_MIN_TOP5_ASK_DEPTH_USD")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 10.0 && *value <= 10_000.0)
+            .unwrap_or(DEFAULT_MIN_TOP5_ASK_DEPTH_USD)
+    }
+
+    fn maker_entry_enabled() -> bool {
+        std::env::var("BTC_5M_MAKER_ENTRY_ENABLED")
+            .ok()
+            .map(|value| value != "0" && value.to_lowercase() != "false")
+            .unwrap_or(true)
+    }
+
+    fn maker_entry_max_edge() -> f64 {
+        std::env::var("BTC_5M_MAKER_ENTRY_MAX_EDGE_BPS")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 10.0 && *value <= 500.0)
+            .map(|value| value / 10_000.0)
+            .unwrap_or(DEFAULT_MAKER_ENTRY_MAX_EDGE_BPS / 10_000.0)
+    }
+
+    fn maker_entry_min_time_remaining_secs() -> i64 {
+        std::env::var("BTC_5M_MAKER_ENTRY_MIN_TIME_REMAINING_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|value| *value >= 30 && *value <= 240)
+            .unwrap_or(DEFAULT_MAKER_ENTRY_MIN_TIME_REMAINING_SECS)
+    }
+
+    fn maker_entry_min_fill_prob() -> f64 {
+        std::env::var("BTC_5M_MAKER_ENTRY_MIN_FILL_PROB")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.05 && *value <= 0.95)
+            .unwrap_or(DEFAULT_MAKER_ENTRY_MIN_FILL_PROB)
+    }
 }
 
 #[async_trait]
@@ -1250,107 +1784,73 @@ impl Strategy for Btc5mLagStrategy {
         let live_preview_cooldown_ms = live_preview_cooldown_ms();
         let sigma_iv_weight = iv_blend_weight();
         let sigma_iv_max_stale_ms = iv_max_stale_ms();
+        let take_profit_min_hold_ms = Self::take_profit_min_hold_ms();
+        let take_profit_min_return = Self::take_profit_min_return();
+        let take_profit_min_bid = Self::take_profit_min_bid();
+        let live_order_type = Self::live_order_type();
+        let theta_sniper_enabled = Self::theta_sniper_enabled();
+        let theta_sniper_window_secs = Self::theta_sniper_window_secs();
+        let theta_sniper_min_divergence = Self::theta_sniper_min_divergence();
+        let theta_sniper_max_book_age_ms = Self::theta_sniper_max_book_age_ms();
+        let theta_sniper_size_mult = Self::theta_sniper_size_mult();
+        let theta_sniper_extra_edge = Self::theta_sniper_extra_edge();
+        let min_top5_ask_depth_usd = Self::min_top5_ask_depth_usd();
+        let maker_entry_enabled = Self::maker_entry_enabled();
+        let maker_entry_max_edge = Self::maker_entry_max_edge();
+        let maker_entry_min_time_remaining_secs = Self::maker_entry_min_time_remaining_secs();
+        let maker_entry_min_fill_prob = Self::maker_entry_min_fill_prob();
 
         // 3E: Consecutive loss circuit breaker (local)
         let mut consecutive_losses: u32 = 0;
         const MAX_CONSECUTIVE_LOSSES: u32 = 3;
 
-        // Cross-exchange price feeds (Coinbase + public CEX tickers).
+        // Cross-exchange price + micro-liquidity feeds (Coinbase + public CEX tickers).
         // Used for UI telemetry + "cross-exchange signal flow" and can be used to harden the spot signal.
-        let cex_prices: Arc<RwLock<HashMap<&'static str, (f64, i64)>>> = Arc::new(RwLock::new(HashMap::new()));
+        let cex_quotes: Arc<RwLock<HashMap<&'static str, CexVenueQuote>>> = Arc::new(RwLock::new(HashMap::new()));
 
-        // Coinbase ticker feed (primary + also mirrored into cex_prices).
+        // Coinbase ticker feed (primary + also mirrored into cex_quotes).
         let spot_writer = self.latest_spot_price.clone();
         let spot_history_writer = self.spot_history.clone();
-        let cex_coinbase_writer = cex_prices.clone();
+        let cex_coinbase_writer = cex_quotes.clone();
         let coinbase_ws_url = coinbase_ws_url();
         let coinbase_subscriptions = coinbase_ticker_subscriptions(&coinbase_ws_url);
 
-        tokio::spawn(async move {
-            let mut backoff_secs = 1_u64;
-            loop {
-                match connect_async(coinbase_ws_url.as_str()).await {
-                    Ok((mut ws_stream, _)) => {
-                        info!("Coinbase WS connected for BTC pricing via {}", coinbase_ws_url);
-                        backoff_secs = 1;
-                        let mut last_sequence: Option<u64> = None;
-                        for subscribe_msg in &coinbase_subscriptions {
-                            if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.to_string())).await {
-                                error!("Coinbase subscribe failed: {}", e);
-                            }
-                        }
-
-                        while let Some(msg) = ws_stream.next().await {
-                            match msg {
-                                Ok(Message::Text(text)) => {
-                                    if let Some(seq) = parse_coinbase_message_sequence(&text) {
-                                        if let Some(prev) = last_sequence {
-                                            if seq <= prev {
-                                                continue;
-                                            }
-                                            let expected = prev.saturating_add(1);
-                                            if seq > expected {
-                                                warn!(
-                                                    "Coinbase ticker sequence gap detected (expected {}, got {}); reconnecting",
-                                                    expected,
-                                                    seq
-                                                );
-                                                break;
-                                            }
-                                        }
-                                        last_sequence = Some(seq);
-                                    }
-
-                                    if let Some(price) = parse_coinbase_ticker_price(&text) {
-                                        let now_ms = Utc::now().timestamp_millis();
-                                        {
-                                            let mut writer = spot_writer.write().await;
-                                            *writer = (price, now_ms);
-                                        }
-                                        {
-                                            let mut writer = cex_coinbase_writer.write().await;
-                                            writer.insert("coinbase", (price, now_ms));
-                                        }
-                                        {
-                                            let mut history = spot_history_writer.write().await;
-                                            history.push_back((now_ms, price));
-                                            while let Some((ts, _)) = history.front() {
-                                                if now_ms - *ts > SPOT_HISTORY_WINDOW_MS {
-                                                    history.pop_front();
-                                                } else {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(Message::Ping(payload)) => {
-                                    let _ = ws_stream.send(Message::Pong(payload)).await;
-                                }
-                                Ok(Message::Close(_)) => break,
-                                Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => continue,
-                                Ok(_) => continue,
-                                Err(e) => {
-                                    error!("Coinbase ticker message error: {}", e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => error!("Coinbase WS connection failed: {}", e),
-                }
-                sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = next_backoff_secs(backoff_secs);
-            }
+        spawn_supervised_feed_task("BTC_5M_COINBASE", move || {
+            spawn_coinbase_feed(
+                spot_writer.clone(),
+                spot_history_writer.clone(),
+                cex_coinbase_writer.clone(),
+                coinbase_ws_url.clone(),
+                coinbase_subscriptions.clone(),
+            )
         });
 
         // Additional public CEX feeds (no auth).
-        spawn_binance_feed(cex_prices.clone());
-        spawn_okx_feed(cex_prices.clone());
-        spawn_bybit_feed(cex_prices.clone());
-        spawn_kraken_feed(cex_prices.clone());
-        spawn_bitfinex_feed(cex_prices.clone());
-        spawn_deribit_iv_feed("BTC", self.latest_spot_price.clone(), self.implied_vol.clone());
+        let binance_prices = cex_quotes.clone();
+        spawn_supervised_feed_task("BTC_5M_BINANCE", move || {
+            spawn_binance_feed(binance_prices.clone())
+        });
+        let okx_prices = cex_quotes.clone();
+        spawn_supervised_feed_task("BTC_5M_OKX", move || {
+            spawn_okx_feed(okx_prices.clone())
+        });
+        let bybit_prices = cex_quotes.clone();
+        spawn_supervised_feed_task("BTC_5M_BYBIT", move || {
+            spawn_bybit_feed(bybit_prices.clone())
+        });
+        let kraken_prices = cex_quotes.clone();
+        spawn_supervised_feed_task("BTC_5M_KRAKEN", move || {
+            spawn_kraken_feed(kraken_prices.clone())
+        });
+        let bitfinex_prices = cex_quotes.clone();
+        spawn_supervised_feed_task("BTC_5M_BITFINEX", move || {
+            spawn_bitfinex_feed(bitfinex_prices.clone())
+        });
+        let iv_spot = self.latest_spot_price.clone();
+        let iv_sink = self.implied_vol.clone();
+        spawn_supervised_feed_task("BTC_5M_DERIBIT_IV", move || {
+            spawn_deribit_iv_feed("BTC", iv_spot.clone(), iv_sink.clone())
+        });
 
         // Resume any open PAPER-mode position after restarts so reserved notional
         // is released/settled and the UI can hydrate open positions correctly.
@@ -1508,10 +2008,10 @@ impl Strategy for Btc5mLagStrategy {
 
                             if end_spot <= 0.0 {
                                 // Fall back to reliability-weighted median if Coinbase is unavailable.
-                                let cex_snapshot = { cex_prices.read().await.clone() };
+                                let cex_snapshot = { cex_quotes.read().await.clone() };
                                 let venue_entries: Vec<(&str, f64, i64)> = cex_snapshot
                                     .iter()
-                                    .map(|(venue, (px, ts_ms))| (*venue, *px, *ts_ms))
+                                    .map(|(venue, quote)| (*venue, quote.price, quote.timestamp_ms))
                                     .collect();
                                 end_spot = reliability_weighted_median(&venue_entries, now_ms, spot_max_age_ms)
                                     .unwrap_or(0.0);
@@ -1545,10 +2045,10 @@ impl Strategy for Btc5mLagStrategy {
                                         coinbase_px
                                     } else {
                                         // Try cross-exchange median as a last resort.
-                                        let cex_snap = { cex_prices.read().await.clone() };
+                                        let cex_snap = { cex_quotes.read().await.clone() };
                                         let cex_vals: Vec<f64> = cex_snap.values()
-                                            .filter(|(px, _)| *px > 0.0)
-                                            .map(|(px, _)| *px)
+                                            .filter(|quote| quote.price > 0.0)
+                                            .map(|quote| quote.price)
                                             .collect();
                                         median_price(cex_vals).unwrap_or(0.0)
                                     }
@@ -1842,10 +2342,10 @@ impl Strategy for Btc5mLagStrategy {
                         if spot <= 0.0 || now_ms - spot_ts_ms > spot_max_age_ms {
                             // If Coinbase stalls, continue with the reliability-weighted CEX median
                             // instead of freezing BTC_5M scans and starving downstream consumers.
-                            let cex_snapshot = { cex_prices.read().await.clone() };
+                            let cex_snapshot = { cex_quotes.read().await.clone() };
                             let venue_entries: Vec<(&str, f64, i64)> = cex_snapshot
                                 .iter()
-                                .map(|(venue, (px, ts_ms))| (*venue, *px, *ts_ms))
+                                .map(|(venue, quote)| (*venue, quote.price, quote.timestamp_ms))
                                 .collect();
                             if let Some(fallback_spot) = reliability_weighted_median(&venue_entries, now_ms, spot_max_age_ms) {
                                 spot = fallback_spot;
@@ -1863,127 +2363,156 @@ impl Strategy for Btc5mLagStrategy {
                             }
                         }
 
-                        // 3D: Early exit on strong adverse signal — only after 30s of holding.
+                        // 3D: Early exits for risk control and profit capture.
                         if let Some(ref pos) = open_position {
                             let hold_ms = now_ms - pos.entry_ts_ms;
-                            if hold_ms > 30_000 {
-                                let spot_move = if spot > 0.0 && pos.window_start_spot > 0.0 {
-                                    (spot - pos.window_start_spot) / pos.window_start_spot
-                                } else { 0.0 };
-                                let adverse_threshold = std::env::var("BTC_5M_EARLY_EXIT_ADVERSE_BPS")
-                                    .ok().and_then(|v| v.parse::<f64>().ok())
-                                    .unwrap_or(30.0) / 10_000.0;
-                                let adverse = match pos.side {
-                                    Side::Up => spot_move < -adverse_threshold,
-                                    Side::Down => spot_move > adverse_threshold,
-                                };
-                                if adverse {
-                                    let side_label = match pos.side { Side::Up => "UP", Side::Down => "DOWN" };
-                                    let execution_id = pos.execution_id.clone();
-                                    let best_bid = match pos.side {
-                                        Side::Up => book.yes.best_bid,
-                                        Side::Down => book.no.best_bid,
-                                    };
-                                    let mark_mid = match pos.side {
-                                        Side::Up => book.yes.mid(),
-                                        Side::Down => book.no.mid(),
-                                    };
-                                    let mut exit_price = if best_bid.is_finite() && best_bid > 0.0 {
-                                        best_bid
-                                    } else if mark_mid.is_finite() && mark_mid > 0.0 {
-                                        mark_mid
-                                    } else {
-                                        pos.entry_price
-                                    };
-                                    exit_price = exit_price.clamp(0.001, 0.999);
-                                    let gross_return = ((exit_price - pos.entry_price) / pos.entry_price).max(-0.999);
-                                    let net_return = (gross_return - cost_model.round_trip_cost_rate()).max(-0.999);
-                                    let pnl = pos.notional_usd * net_return;
-                                    let new_bankroll = settle_sim_position_for_strategy(&mut conn, self.strategy_id(), pos.notional_usd, pnl).await;
-                                    if pnl < 0.0 { consecutive_losses = consecutive_losses.saturating_add(1); } else { consecutive_losses = 0; }
+                            let side_label = match pos.side { Side::Up => "UP", Side::Down => "DOWN" };
+                            let execution_id = pos.execution_id.clone();
+                            let best_bid = match pos.side {
+                                Side::Up => book.yes.best_bid,
+                                Side::Down => book.no.best_bid,
+                            };
+                            let mark_mid = match pos.side {
+                                Side::Up => book.yes.mid(),
+                                Side::Down => book.no.mid(),
+                            };
+                            let mut exit_price = if best_bid.is_finite() && best_bid > 0.0 {
+                                best_bid
+                            } else if mark_mid.is_finite() && mark_mid > 0.0 {
+                                mark_mid
+                            } else {
+                                pos.entry_price
+                            };
+                            exit_price = exit_price.clamp(0.001, 0.999);
+                            let gross_return = ((exit_price - pos.entry_price) / pos.entry_price).max(-0.999);
+                            let net_return = (gross_return - cost_model.round_trip_cost_rate()).max(-0.999);
+                            let spot_move = if spot > 0.0 && pos.window_start_spot > 0.0 {
+                                (spot - pos.window_start_spot) / pos.window_start_spot
+                            } else { 0.0 };
 
-                                    let pnl_msg = serde_json::json!({
-                                        "execution_id": execution_id.clone(),
+                            let adverse_threshold = std::env::var("BTC_5M_EARLY_EXIT_ADVERSE_BPS")
+                                .ok().and_then(|v| v.parse::<f64>().ok())
+                                .unwrap_or(30.0) / 10_000.0;
+                            let adverse = hold_ms > 30_000 && match pos.side {
+                                Side::Up => spot_move < -adverse_threshold,
+                                Side::Down => spot_move > adverse_threshold,
+                            };
+                            let take_profit = hold_ms >= take_profit_min_hold_ms
+                                && best_bid.is_finite()
+                                && best_bid >= take_profit_min_bid
+                                && net_return >= take_profit_min_return;
+
+                            if take_profit || adverse {
+                                let close_reason = if take_profit { "TAKE_PROFIT" } else { "SIGNAL_SL" };
+                                let close_action = if take_profit { "TAKE_PROFIT_EARLY" } else { "EARLY_EXIT" };
+                                let settle_side = if take_profit { "TAKE_PROFIT" } else { "EARLY_EXIT" };
+                                let pnl = pos.notional_usd * net_return;
+                                let new_bankroll = settle_sim_position_for_strategy(&mut conn, self.strategy_id(), pos.notional_usd, pnl).await;
+                                if pnl < 0.0 { consecutive_losses = consecutive_losses.saturating_add(1); } else { consecutive_losses = 0; }
+
+                                let pnl_msg = serde_json::json!({
+                                    "execution_id": execution_id.clone(),
+                                    "strategy": self.strategy_id(),
+                                    "variant": variant.as_str(),
+                                    "pnl": pnl,
+                                    "notional": pos.notional_usd,
+                                    "timestamp": now_ms,
+                                    "bankroll": new_bankroll,
+                                    "mode": "PAPER",
+                                    "details": {
+                                        "action": close_action,
+                                        "reason": close_reason,
+                                        "side": side_label,
+                                        "entry_price": pos.entry_price,
+                                        "exit_price": exit_price,
+                                        "spot": spot,
+                                        "spot_move": spot_move,
+                                        "adverse_threshold": adverse_threshold,
+                                        "take_profit_min_bid": take_profit_min_bid,
+                                        "take_profit_min_return": take_profit_min_return,
+                                        "take_profit_min_hold_ms": take_profit_min_hold_ms,
+                                        "window_start_spot": pos.window_start_spot,
+                                        "gross_return": gross_return,
+                                        "net_return": net_return,
+                                        "hold_ms": hold_ms,
+                                        "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
+                                        "token_id": pos.token_id.clone(),
+                                        "condition_id": pos.condition_id.clone(),
+                                        "slug": pos.slug.clone(),
+                                    }
+                                });
+                                publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
+
+                                let settle_msg = serde_json::json!({
+                                    "execution_id": execution_id,
+                                    "market": "BTC 5m Engine",
+                                    "side": settle_side,
+                                    "price": exit_price,
+                                    "size": pos.notional_usd,
+                                    "timestamp": now_ms,
+                                    "mode": "PAPER",
+                                    "details": {
                                         "strategy": self.strategy_id(),
-                                        "variant": variant.as_str(),
+                                        "position_side": side_label,
+                                        "reason": close_reason,
                                         "pnl": pnl,
-                                        "notional": pos.notional_usd,
-                                        "timestamp": now_ms,
-                                        "bankroll": new_bankroll,
-                                        "mode": "PAPER",
-                                        "details": {
-                                            "action": "EARLY_EXIT",
-                                            "reason": "SIGNAL_SL",
-                                            "side": side_label,
-                                            "entry_price": pos.entry_price,
-                                            "exit_price": exit_price,
-                                            "spot": spot,
-                                            "spot_move": spot_move,
-                                            "adverse_threshold": adverse_threshold,
-                                            "window_start_spot": pos.window_start_spot,
-                                            "gross_return": gross_return,
-                                            "net_return": net_return,
-                                            "hold_ms": hold_ms,
-                                            "round_trip_cost_rate": cost_model.round_trip_cost_rate(),
-                                            "token_id": pos.token_id.clone(),
-                                            "condition_id": pos.condition_id.clone(),
-                                            "slug": pos.slug.clone(),
-                                        }
-                                    });
-                                    publish_event(&mut conn, "strategy:pnl", pnl_msg.to_string()).await;
+                                        "net_return": net_return,
+                                        "spot_move": spot_move,
+                                        "adverse_threshold": adverse_threshold,
+                                        "take_profit_min_bid": take_profit_min_bid,
+                                        "take_profit_min_return": take_profit_min_return,
+                                        "take_profit_min_hold_ms": take_profit_min_hold_ms,
+                                        "hold_ms": hold_ms,
+                                        "window_start_spot": pos.window_start_spot,
+                                        "end_spot": spot,
+                                        "slug": pos.slug.clone(),
+                                    }
+                                });
+                                publish_execution_event(&mut conn, settle_msg).await;
+                                clear_open_position(&mut conn, self.strategy_id()).await;
+                                open_position = None;
 
-                                    let settle_msg = serde_json::json!({
-                                        "execution_id": execution_id,
-                                        "market": "BTC 5m Engine",
-                                        "side": "EARLY_EXIT",
-                                        "price": exit_price,
-                                        "size": pos.notional_usd,
-                                        "timestamp": now_ms,
-                                        "mode": "PAPER",
-                                        "details": {
-                                            "strategy": self.strategy_id(),
-                                            "position_side": side_label,
-                                            "reason": "SIGNAL_SL",
-                                            "pnl": pnl,
-                                            "net_return": net_return,
-                                            "spot_move": spot_move,
-                                            "adverse_threshold": adverse_threshold,
-                                            "hold_ms": hold_ms,
-                                            "window_start_spot": pos.window_start_spot,
-                                            "end_spot": spot,
-                                            "slug": pos.slug.clone(),
-                                        }
-                                    });
-                                    publish_execution_event(&mut conn, settle_msg).await;
-                                    clear_open_position(&mut conn, self.strategy_id()).await;
-                                    open_position = None;
+                                if take_profit {
+                                    info!(
+                                        "[BTC_5M] Early take-profit exit: bid={:.3} pnl={:.2} net_return={:.4} hold_ms={}",
+                                        best_bid,
+                                        pnl,
+                                        net_return,
+                                        hold_ms,
+                                    );
+                                } else {
                                     warn!(
                                         "[BTC_5M] Early exit on adverse signal: spot_move={:.4} pnl={:.2} return={:.4}",
                                         spot_move,
                                         pnl,
                                         net_return,
                                     );
-                                    publish_heartbeat(&mut conn, self.heartbeat_id()).await;
-                                    continue;
                                 }
+                                publish_heartbeat(&mut conn, self.heartbeat_id()).await;
+                                continue;
                             }
                         }
 
                         // Reliability-weighted cross-exchange median for fair value.
-                        let cex_snapshot = { cex_prices.read().await.clone() };
+                        let cex_snapshot = { cex_quotes.read().await.clone() };
                         let mut cex_prices_json = serde_json::Map::new();
                         let mut venue_entries: Vec<(&str, f64, i64)> = Vec::new();
-                        for (venue, (px, ts_ms)) in cex_snapshot.iter() {
-                            if *px > 0.0 {
-                                cex_prices_json.insert((*venue).to_string(), serde_json::json!(*px));
+                        for (venue, quote) in cex_snapshot.iter() {
+                            if quote.price > 0.0 {
+                                cex_prices_json.insert((*venue).to_string(), serde_json::json!(quote.price));
                             }
-                            venue_entries.push((*venue, *px, *ts_ms));
+                            venue_entries.push((*venue, quote.price, quote.timestamp_ms));
                         }
                         let cex_mid = reliability_weighted_median(&venue_entries, now_ms, spot_max_age_ms)
                             .unwrap_or(spot);
+                        let cex_volume_signal = compute_cex_volume_signal(&cex_snapshot, now_ms, spot_max_age_ms)
+                            .unwrap_or_default();
 
                         let remaining_seconds = expiry_ts - now_ts;
-                        if remaining_seconds <= entry_expiry_cutoff_secs() {
+                        let theta_sniper_active = theta_sniper_enabled
+                            && remaining_seconds > 0
+                            && remaining_seconds <= theta_sniper_window_secs;
+                        if remaining_seconds <= entry_expiry_cutoff_secs() && !theta_sniper_active {
                             publish_heartbeat(&mut conn, self.heartbeat_id()).await;
                             continue;
                         }
@@ -2113,16 +2642,104 @@ impl Strategy for Btc5mLagStrategy {
                         } else {
                             (Side::Down, down_price, fair_no, down_expected, down_net_expected, target_market.no_token.clone(), no_spread)
                         };
+                        let best_side_label = match best_side { Side::Up => "UP", Side::Down => "DOWN" };
 
                         let best_price_ok = match best_side {
                             Side::Up => up_price_ok,
                             Side::Down => down_price_ok,
                         };
+                        let (
+                            side_bid_depth_notional,
+                            side_ask_depth_notional,
+                            side_bid_depth_size,
+                            side_ask_depth_size,
+                            side_bid_depth_levels,
+                            side_ask_depth_levels,
+                        ) = match best_side {
+                            Side::Up => (
+                                book.yes_depth.bid_notional_top5,
+                                book.yes_depth.ask_notional_top5,
+                                book.yes_depth.bid_size_top5,
+                                book.yes_depth.ask_size_top5,
+                                book.yes_depth.bid_levels,
+                                book.yes_depth.ask_levels,
+                            ),
+                            Side::Down => (
+                                book.no_depth.bid_notional_top5,
+                                book.no_depth.ask_notional_top5,
+                                book.no_depth.bid_size_top5,
+                                book.no_depth.ask_size_top5,
+                                book.no_depth.bid_levels,
+                                book.no_depth.ask_levels,
+                            ),
+                        };
+                        let side_depth_notional_sum = side_bid_depth_notional + side_ask_depth_notional;
+                        let side_depth_imbalance = if side_depth_notional_sum > 0.0 {
+                            ((side_bid_depth_notional - side_ask_depth_notional) / side_depth_notional_sum).clamp(-1.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let side_depth_mid = if (side_bid_depth_size + side_ask_depth_size) > 0.0 {
+                            (side_bid_depth_notional + side_ask_depth_notional)
+                                / (side_bid_depth_size + side_ask_depth_size)
+                        } else {
+                            best_price
+                        };
+                        let depth_ok = side_ask_depth_notional >= min_top5_ask_depth_usd;
                         let yes_book_age_ms = now_ms.saturating_sub(book.yes_update_ms);
                         let no_book_age_ms = now_ms.saturating_sub(book.no_update_ms);
-                        let freshness_ok = spot_age_for_gate_ms <= spot_max_age_ms
+
+                        let best_taker_entry_cost_rate = match best_side {
+                            Side::Up => up_taker_fee + slippage_rate,
+                            Side::Down => down_taker_fee + slippage_rate,
+                        };
+                        let maker_mode_candidate = maker_entry_enabled
+                            && remaining_seconds >= maker_entry_min_time_remaining_secs
+                            && best_net_expected > 0.0
+                            && best_net_expected <= maker_entry_max_edge;
+                        let maker_entry_price = (best_price - (best_spread * 0.50)).clamp(0.001, best_price);
+                        let side_book_age_ms = match best_side {
+                            Side::Up => yes_book_age_ms,
+                            Side::Down => no_book_age_ms,
+                        };
+                        let maker_sample = if maker_mode_candidate {
+                            let uniform_sample = ((now_ms.rem_euclid(10_000)) as f64) / 10_000.0;
+                            simulate_maker_entry_fill(
+                                maker_entry_price,
+                                best_spread,
+                                side_book_age_ms,
+                                best_net_expected,
+                                cost_model,
+                                uniform_sample,
+                            )
+                        } else {
+                            simulate_maker_entry_fill(
+                                maker_entry_price,
+                                best_spread,
+                                side_book_age_ms,
+                                best_net_expected,
+                                cost_model,
+                                1.0,
+                            )
+                        };
+                        let maker_active = maker_mode_candidate && maker_sample.fill_probability >= maker_entry_min_fill_prob;
+                        let best_entry_cost_rate = if maker_active {
+                            cost_model.maker_side_cost_rate()
+                        } else {
+                            best_taker_entry_cost_rate
+                        };
+                        let effective_best_net_expected = best_expected - best_entry_cost_rate;
+                        let freshness_ok_base = spot_age_for_gate_ms <= spot_max_age_ms
                             && yes_book_age_ms <= book_max_age_ms
                             && no_book_age_ms <= book_max_age_ms;
+                        let freshness_ok = if theta_sniper_active {
+                            freshness_ok_base
+                                && spot_age_for_gate_ms <= theta_sniper_max_book_age_ms
+                                && yes_book_age_ms <= theta_sniper_max_book_age_ms
+                                && no_book_age_ms <= theta_sniper_max_book_age_ms
+                        } else {
+                            freshness_ok_base
+                        };
 
                         // Divergence-first execution gate. Net expectancy already includes fees/slippage;
                         // this enforces a separate fair-vs-market gap buffer for model uncertainty.
@@ -2154,6 +2771,11 @@ impl Strategy for Btc5mLagStrategy {
                                 + (divergence_vol_mult * sigma_term)
                         )
                             .clamp(0.0, 0.25);
+                        let required_divergence = if theta_sniper_active {
+                            required_divergence.max(theta_sniper_min_divergence)
+                        } else {
+                            required_divergence
+                        };
                         let fair_market_divergence = (best_prob - best_price).clamp(-1.0, 1.0);
                         let divergence_ok = fair_market_divergence >= required_divergence;
 
@@ -2180,7 +2802,12 @@ impl Strategy for Btc5mLagStrategy {
                             }
                         };
                         let base_edge_with_vol = (min_net_expected + vol_adjustment).max(0.0);
-                        let effective_min_edge_base = base_edge_with_vol + fair_price_penalty;
+                        let theta_edge_penalty = if theta_sniper_active {
+                            theta_sniper_extra_edge
+                        } else {
+                            0.0
+                        };
+                        let effective_min_edge_base = base_edge_with_vol + fair_price_penalty + theta_edge_penalty;
 
                         // ── Momentum / Trend Alignment Filter ──
                         // Read RSI + SMA from Redis (published by ML service → backend).
@@ -2332,6 +2959,101 @@ impl Strategy for Btc5mLagStrategy {
                             0.0
                         };
 
+                        // ── Cross-Exchange Volume Divergence Overlay ──
+                        // Uses per-venue top-of-book size pressure + activity as a short-horizon momentum prior.
+                        let cex_volume_signal_enabled: bool = std::env::var("BTC_5M_CEX_VOLUME_SIGNAL_ENABLED")
+                            .ok()
+                            .map(|v| v != "0" && v.to_lowercase() != "false")
+                            .unwrap_or(true);
+                        let cex_volume_min_venues: usize = std::env::var("BTC_5M_CEX_VOLUME_MIN_VENUES")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .filter(|v| *v >= 2 && *v <= 6)
+                            .unwrap_or(3);
+                        let cex_volume_min_pressure: f64 = std::env::var("BTC_5M_CEX_VOLUME_MIN_PRESSURE")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(0.10)
+                            .clamp(0.02, 0.95);
+                        let cex_volume_min_activity_ratio: f64 = std::env::var("BTC_5M_CEX_VOLUME_MIN_ACTIVITY_RATIO")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(0.90)
+                            .clamp(0.50, 5.0);
+                        let cex_volume_bonus_bps: f64 = std::env::var("BTC_5M_CEX_VOLUME_BONUS_BPS")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(35.0)
+                            .clamp(0.0, 300.0);
+                        let cex_volume_penalty_bps: f64 = std::env::var("BTC_5M_CEX_VOLUME_PENALTY_BPS")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(45.0)
+                            .clamp(0.0, 400.0);
+                        let mut cex_volume_signal_penalty = 0.0;
+                        let mut cex_volume_signal_bonus = 0.0;
+                        let mut cex_volume_signal_label = "NONE";
+                        if cex_volume_signal_enabled {
+                            let pressure = cex_volume_signal.pressure;
+                            let activity_ratio = cex_volume_signal.activity_ratio;
+                            let strong = cex_volume_signal.venues >= cex_volume_min_venues
+                                && pressure.abs() >= cex_volume_min_pressure
+                                && activity_ratio >= cex_volume_min_activity_ratio;
+                            if strong {
+                                let aligned = match best_side {
+                                    Side::Up => pressure > 0.0,
+                                    Side::Down => pressure < 0.0,
+                                };
+                                let pressure_scale = (pressure.abs() / 0.60).clamp(0.0, 1.0);
+                                let activity_scale = (activity_ratio / 2.0).clamp(0.5, 1.5);
+                                if aligned {
+                                    cex_volume_signal_bonus = (cex_volume_bonus_bps / 10_000.0)
+                                        * pressure_scale
+                                        * activity_scale;
+                                    cex_volume_signal_label = "CEX_VOLUME_ALIGNED";
+                                } else {
+                                    cex_volume_signal_penalty = (cex_volume_penalty_bps / 10_000.0)
+                                        * pressure_scale
+                                        * activity_scale;
+                                    cex_volume_signal_label = "CEX_VOLUME_DIVERGENT";
+                                }
+                            } else {
+                                cex_volume_signal_label = "CEX_VOLUME_WEAK";
+                            }
+                        }
+
+                        // ── Polymarket L2 Depth Signal ──
+                        // Reward when near-side book has stronger bid support; penalize when ask overhang dominates.
+                        let depth_signal_enabled: bool = std::env::var("BTC_5M_DEPTH_SIGNAL_ENABLED")
+                            .ok()
+                            .map(|v| v != "0" && v.to_lowercase() != "false")
+                            .unwrap_or(true);
+                        let depth_signal_bonus_bps: f64 = std::env::var("BTC_5M_DEPTH_SIGNAL_BONUS_BPS")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(30.0)
+                            .clamp(0.0, 300.0);
+                        let depth_signal_penalty_bps: f64 = std::env::var("BTC_5M_DEPTH_SIGNAL_PENALTY_BPS")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(35.0)
+                            .clamp(0.0, 400.0);
+                        let mut depth_signal_penalty = 0.0;
+                        let mut depth_signal_bonus = 0.0;
+                        let mut depth_signal_label = "NONE";
+                        if depth_signal_enabled {
+                            let strength = side_depth_imbalance.abs().clamp(0.0, 1.0);
+                            if side_depth_imbalance > 0.0 {
+                                depth_signal_bonus = (depth_signal_bonus_bps / 10_000.0) * strength;
+                                depth_signal_label = "DEPTH_ALIGNED";
+                            } else if side_depth_imbalance < -0.05 {
+                                depth_signal_penalty = (depth_signal_penalty_bps / 10_000.0) * strength;
+                                depth_signal_label = "DEPTH_AGAINST";
+                            } else {
+                                depth_signal_label = "DEPTH_NEUTRAL";
+                            }
+                        }
+
                         // ── ML Model Signal Adjustment ──
                         // Use supervised probability signal as an additive filter:
                         // - disagreement raises threshold (penalty)
@@ -2469,14 +3191,21 @@ impl Strategy for Btc5mLagStrategy {
                         }
 
                         let total_signal_penalty =
-                            momentum_penalty + regime_penalty + spread_penalty + model_signal_penalty;
+                            momentum_penalty
+                                + regime_penalty
+                                + spread_penalty
+                                + model_signal_penalty
+                                + cex_volume_signal_penalty
+                                + depth_signal_penalty;
+                        let total_signal_bonus =
+                            model_signal_bonus + cex_volume_signal_bonus + depth_signal_bonus;
                         let non_negative_signal_penalty = total_signal_penalty.max(0.0);
                         let now_utc = Utc::now();
                         let hour_utc = now_utc.hour();
                         let day_of_week = now_utc.weekday().num_days_from_sunday();
                         let seasonality = seasonality_multiplier(hour_utc, day_of_week);
                         let threshold_before_seasonality =
-                            (effective_min_edge_base + non_negative_signal_penalty - model_signal_bonus).max(0.0);
+                            (effective_min_edge_base + non_negative_signal_penalty - total_signal_bonus).max(0.0);
                         // Seasonality > 1.0 means favorable window: lower threshold.
                         let effective_min_edge = (threshold_before_seasonality / seasonality).max(0.0);
 
@@ -2484,12 +3213,13 @@ impl Strategy for Btc5mLagStrategy {
                             && parity_ok
                             && best_price_ok
                             && divergence_ok
+                            && depth_ok
                             && !coinflip_blocked
-                            && best_net_expected >= effective_min_edge;
+                            && effective_best_net_expected >= effective_min_edge;
 
                         // Adaptive sizing: scale down weak/fragile edges and scale toward full
                         // risk-budget when edge quality and model confidence are both strong.
-                        let kelly = kelly_fraction(best_prob, best_price);
+                        let kelly = kelly_fraction_fee_adjusted(best_prob, best_price, best_entry_cost_rate);
                         let kelly_floor: f64 = std::env::var("BTC_5M_KELLY_SCALE_FLOOR")
                             .ok()
                             .and_then(|v| v.parse::<f64>().ok())
@@ -2507,8 +3237,8 @@ impl Strategy for Btc5mLagStrategy {
                             .unwrap_or(0.40)
                             .clamp(0.10, 1.0);
                         let edge_strength_ratio = if effective_min_edge > 0.0 {
-                            (best_net_expected / effective_min_edge).max(0.0)
-                        } else if best_net_expected > 0.0 {
+                            (effective_best_net_expected / effective_min_edge).max(0.0)
+                        } else if effective_best_net_expected > 0.0 {
                             2.0
                         } else {
                             0.0
@@ -2517,9 +3247,11 @@ impl Strategy for Btc5mLagStrategy {
                             (kelly_floor + (1.0 - kelly_floor) * kelly).clamp(kelly_floor, 1.0);
                         let edge_scale =
                             (edge_strength_ratio / edge_scale_target_ratio).clamp(edge_scale_floor, 1.0);
-                        let dynamic_size_scale = (kelly_scale * edge_scale).clamp(0.10, 1.0);
+                        let mut dynamic_size_scale = (kelly_scale * edge_scale).clamp(0.10, 1.0);
+                        if theta_sniper_active {
+                            dynamic_size_scale = (dynamic_size_scale * theta_sniper_size_mult).clamp(0.05, 1.0);
+                        }
 
-                        let best_side_label = match best_side { Side::Up => "UP", Side::Down => "DOWN" };
                         let reason = if !freshness_ok {
                             format!(
                                 "Freshness gate blocked entry (spot={}ms>{}ms or yes/no age {}ms/{}ms>{}ms)",
@@ -2556,6 +3288,13 @@ impl Strategy for Btc5mLagStrategy {
                                 (divergence_spread_mult * best_spread) * 10_000.0,
                                 (divergence_vol_mult * sigma_term) * 10_000.0,
                             )
+                        } else if !depth_ok {
+                            format!(
+                                "{} top-5 ask depth ${:.2} below minimum ${:.2}",
+                                best_side_label,
+                                side_ask_depth_notional,
+                                min_top5_ask_depth_usd,
+                            )
                         } else if coinflip_blocked {
                             format!(
                                 "{} COINFLIP BLOCKED: price {:.2}c within {:.1}c of 0.50 (no structural edge)",
@@ -2563,23 +3302,23 @@ impl Strategy for Btc5mLagStrategy {
                                 best_price * 100.0,
                                 coinflip_block_band * 100.0,
                             )
-                        } else if best_net_expected < effective_min_edge {
+                        } else if effective_best_net_expected < effective_min_edge {
                             format!(
-                                "{} expected net {:.1}bps below adaptive threshold {:.1}bps (base+vol {:.1} + fair {:.1} + signal {:.1} - model bonus {:.1}, seasonality {:.2}x)",
+                                "{} expected net {:.1}bps below adaptive threshold {:.1}bps (base+vol {:.1} + fair {:.1} + signal {:.1} - bonus {:.1}, seasonality {:.2}x)",
                                 best_side_label,
-                                best_net_expected * 10_000.0,
+                                effective_best_net_expected * 10_000.0,
                                 effective_min_edge * 10_000.0,
                                 base_edge_with_vol * 10_000.0,
                                 fair_price_penalty * 10_000.0,
                                 non_negative_signal_penalty * 10_000.0,
-                                model_signal_bonus * 10_000.0,
+                                total_signal_bonus * 10_000.0,
                                 seasonality,
                             )
                         } else {
                             format!(
                                 "{} expected net {:.1}bps cleared adaptive threshold {:.1}bps (edge ratio {:.2}x)",
                                 best_side_label,
-                                best_net_expected * 10_000.0,
+                                effective_best_net_expected * 10_000.0,
                                 effective_min_edge * 10_000.0,
                                 edge_strength_ratio,
                             )
@@ -2587,13 +3326,13 @@ impl Strategy for Btc5mLagStrategy {
 
                         // Encode direction in the scan score sign so peer-consensus logic can reason about UP vs DOWN.
                         //
-                        // IMPORTANT: `best_net_expected` can be negative (no edge). We still want the sign to represent
+                        // IMPORTANT: `effective_best_net_expected` can be negative (no edge). We still want the sign to represent
                         // the *direction we'd trade* (UP vs DOWN), so we sign the magnitude.
                         let direction_sign = match best_side {
                             Side::Up => 1.0,
                             Side::Down => -1.0,
                         };
-                        let scan_score = direction_sign * best_net_expected.abs();
+                        let scan_score = direction_sign * effective_best_net_expected.abs();
 
                         // Expose any open position in the scan telemetry so the UI can hydrate the POSITIONS rail
                         // even if it missed the ENTRY execution log (e.g. page refresh mid-window).
@@ -2656,9 +3395,24 @@ impl Strategy for Btc5mLagStrategy {
                                 "expected_net_up": up_net_expected,
                                 "expected_net_down": down_net_expected,
                                 "best_price": best_price,
+                                "best_depth_mid": side_depth_mid,
                                 "best_prob": best_prob,
                                 "best_expected_roi": best_expected,
-                                "best_net_expected_roi": best_net_expected,
+                                "best_net_expected_roi": effective_best_net_expected,
+                                "best_net_expected_taker_roi": best_net_expected,
+                                "entry_style": if maker_active { "MAKER" } else { "TAKER" },
+                                "edge_to_spread_ratio": if best_spread > 0.0 {
+                                    (effective_best_net_expected / best_spread).max(-20.0).min(20.0)
+                                } else {
+                                    0.0
+                                },
+                                "obi": side_depth_imbalance,
+                                "buy_pressure": ((cex_volume_signal.pressure + 1.0) / 2.0).clamp(0.0, 1.0),
+                                "uptick_ratio": ((cex_volume_signal.pressure + 1.0) / 2.0).clamp(0.0, 1.0),
+                                "cluster_confidence": cex_volume_signal.pressure.abs().clamp(0.0, 1.0),
+                                "flow_acceleration": (cex_volume_signal.activity_ratio - 1.0).clamp(-2.0, 4.0),
+                                "dynamic_cost_rate": best_entry_cost_rate,
+                                "momentum_sigma": sigma_term,
                                 "fair_market_divergence_bps": fair_market_divergence * 10_000.0,
                                 "required_divergence_bps": required_divergence * 10_000.0,
                                 "divergence_ok": divergence_ok,
@@ -2667,6 +3421,7 @@ impl Strategy for Btc5mLagStrategy {
                                 "divergence_spread_component_bps": (divergence_spread_mult * best_spread) * 10_000.0,
                                 "divergence_vol_component_bps": (divergence_vol_mult * sigma_term) * 10_000.0,
                                 "kelly_fraction": kelly,
+                                "kelly_entry_cost_bps": best_entry_cost_rate * 10_000.0,
                                 "kelly_scale": kelly_scale,
                                 "edge_scale": edge_scale,
                                 "dynamic_size_scale": dynamic_size_scale,
@@ -2686,11 +3441,21 @@ impl Strategy for Btc5mLagStrategy {
                                 "coinflip_blocked": coinflip_blocked,
                                 "coinflip_block_band": coinflip_block_band,
                                 "freshness_ok": freshness_ok,
+                                "theta_sniper_active": theta_sniper_active,
+                                "theta_sniper_window_secs": theta_sniper_window_secs,
+                                "theta_sniper_min_divergence_bps": theta_sniper_min_divergence * 10_000.0,
                                 "spot_age_ms": spot_age_for_gate_ms,
                                 "spot_age_max_ms": spot_max_age_ms,
                                 "yes_book_age_ms": yes_book_age_ms,
                                 "no_book_age_ms": no_book_age_ms,
                                 "book_age_max_ms": book_max_age_ms,
+                                "depth_ok": depth_ok,
+                                "depth_min_top5_ask_usd": min_top5_ask_depth_usd,
+                                "depth_side_bid_notional_top5": side_bid_depth_notional,
+                                "depth_side_ask_notional_top5": side_ask_depth_notional,
+                                "depth_side_bid_levels": side_bid_depth_levels,
+                                "depth_side_ask_levels": side_ask_depth_levels,
+                                "depth_side_imbalance": side_depth_imbalance,
                                 "fair_price_penalty_bps": fair_price_penalty * 10_000.0,
                                 "momentum_penalty_bps": momentum_penalty * 10_000.0,
                                 "momentum_label": momentum_label,
@@ -2699,6 +3464,15 @@ impl Strategy for Btc5mLagStrategy {
                                 "regime_penalty_bps": regime_penalty * 10_000.0,
                                 "regime_label": regime_label,
                                 "spread_penalty_bps": spread_penalty * 10_000.0,
+                                "cex_volume_signal_pressure": cex_volume_signal.pressure,
+                                "cex_volume_signal_activity_ratio": cex_volume_signal.activity_ratio,
+                                "cex_volume_signal_venues": cex_volume_signal.venues,
+                                "cex_volume_signal_label": cex_volume_signal_label,
+                                "cex_volume_signal_penalty_bps": cex_volume_signal_penalty * 10_000.0,
+                                "cex_volume_signal_bonus_bps": cex_volume_signal_bonus * 10_000.0,
+                                "depth_signal_label": depth_signal_label,
+                                "depth_signal_penalty_bps": depth_signal_penalty * 10_000.0,
+                                "depth_signal_bonus_bps": depth_signal_bonus * 10_000.0,
                                 "model_signal_penalty_bps": model_signal_penalty * 10_000.0,
                                 "model_signal_bonus_bps": model_signal_bonus * 10_000.0,
                                 "model_signal_label": model_signal_label,
@@ -2714,6 +3488,11 @@ impl Strategy for Btc5mLagStrategy {
                                 "model_signal_edge": model_signal_edge,
                                 "total_signal_penalty_bps": total_signal_penalty * 10_000.0,
                                 "total_signal_penalty_non_negative_bps": non_negative_signal_penalty * 10_000.0,
+                                "total_signal_bonus_bps": total_signal_bonus * 10_000.0,
+                                "maker_entry_candidate": maker_mode_candidate,
+                                "maker_entry_fill_prob": maker_sample.fill_probability,
+                                "maker_entry_min_fill_prob": maker_entry_min_fill_prob,
+                                "maker_entry_price": maker_entry_price,
                                 "rsi_14": ml.as_ref().map(|f| f.rsi_14).unwrap_or(-1.0),
                                 "sma_20": ml.as_ref().map(|f| f.sma_20).unwrap_or(-1.0),
                                 "ml_prob_up": ml.as_ref().and_then(|f| f.ml_prob_up).unwrap_or(0.5),
@@ -2727,6 +3506,17 @@ impl Strategy for Btc5mLagStrategy {
                             }),
                         );
                         publish_event(&mut conn, "arbitrage:scan", scan_msg.to_string()).await;
+
+                        let effective_live_order_type = if maker_active {
+                            "GTC".to_string()
+                        } else {
+                            live_order_type.clone()
+                        };
+                        let intended_entry_price = if maker_active {
+                            maker_entry_price
+                        } else {
+                            best_price
+                        };
 
                         let just_entered_live = entered_live_mode(&mut conn, self.strategy_id(), mode).await;
                         if mode == TradingMode::Live {
@@ -2755,18 +3545,22 @@ impl Strategy for Btc5mLagStrategy {
                                         "execution_id": execution_id,
                                         "market": "BTC 5m Engine",
                                         "side": format!("LIVE_DRY_RUN_{}", side_label),
-                                        "price": best_price,
+                                        "price": intended_entry_price,
                                         "size": size,
+                                        "order_type": effective_live_order_type.clone(),
                                         "timestamp": now_ms,
                                         "mode": "LIVE_DRY_RUN",
                                         "details": {
                                             "strategy": self.strategy_id(),
                                             "side": side_label,
+                                            "order_type": effective_live_order_type.clone(),
+                                            "maker_intent": maker_active,
                                             "spot": spot,
                                             "window_start_spot": window_start_spot,
                                             "fair_yes": fair_yes,
-                                            "expected_net_return": best_net_expected,
+                                            "expected_net_return": effective_best_net_expected,
                                             "kelly_fraction": kelly,
+                                            "kelly_entry_cost_bps": best_entry_cost_rate * 10_000.0,
                                             "kelly_scale": kelly_scale,
                                             "edge_scale": edge_scale,
                                             "edge_strength_ratio": edge_strength_ratio,
@@ -2795,12 +3589,14 @@ impl Strategy for Btc5mLagStrategy {
                                             "preflight": {
                                                 "venue": "POLYMARKET",
                                                 "strategy": self.strategy_id(),
+                                                "order_type": effective_live_order_type.clone(),
+                                                "maker_intent": maker_active,
                                                 "orders": [
                                                     {
                                                         "token_id": best_token,
                                                         "condition_id": target_market.market_id.clone(),
                                                         "side": "BUY",
-                                                        "price": best_price,
+                                                        "price": intended_entry_price,
                                                         "size": size,
                                                         "size_unit": "USD_NOTIONAL"
                                                     }
@@ -2837,46 +3633,60 @@ impl Strategy for Btc5mLagStrategy {
                                 Self::max_position_fraction(),
                             ).await;
                             let size = raw_size * dynamic_size_scale;
-                            if size >= 10.0 && reserve_sim_notional_for_strategy(&mut conn, self.strategy_id(), size).await {
+                            if size >= 10.0 {
                                 let side_label = match best_side { Side::Up => "UP", Side::Down => "DOWN" };
                                 let execution_id = Uuid::new_v4().to_string();
-                                let pos = Position {
-                                    execution_id: execution_id.clone(),
-                                    side: best_side,
-                                    entry_price: best_price,
-                                    notional_usd: size,
-                                    entry_ts_ms: now_ms,
-                                    window_start_spot,
-                                    window_start_ts,
-                                    expiry_ts,
-                                    token_id: best_token.clone(),
-                                    condition_id: target_market.market_id.clone(),
-                                    fair_yes,
-                                    sigma,
-                                    slug: target_market.slug.clone(),
+                                if maker_active && !maker_sample.filled {
+                                    let miss_msg = serde_json::json!({
+                                        "execution_id": execution_id.clone(),
+                                        "market": "BTC 5m Engine",
+                                        "market_id": target_market.market_id.clone(),
+                                        "side": "ENTRY_MAKER_MISS",
+                                        "price": maker_entry_price,
+                                        "size": size,
+                                        "timestamp": now_ms,
+                                        "mode": "PAPER",
+                                        "details": {
+                                            "strategy": self.strategy_id(),
+                                            "side": side_label,
+                                            "entry_style": "MAKER",
+                                            "fill_probability": maker_sample.fill_probability,
+                                            "min_fill_probability": maker_entry_min_fill_prob,
+                                            "expected_net_return": effective_best_net_expected,
+                                            "reason": "MAKER_NOT_FILLED",
+                                        }
+                                    });
+                                    publish_execution_event(&mut conn, miss_msg).await;
+                                    publish_heartbeat(&mut conn, self.heartbeat_id()).await;
+                                    continue;
+                                }
+                                let executed_entry_price = if maker_active {
+                                    maker_sample.execution_price.clamp(0.001, 0.999)
+                                } else {
+                                    intended_entry_price
                                 };
-                                persist_open_position(&mut conn, self.strategy_id(), &pos).await;
-                                open_position = Some(pos);
-
                                 let exec_msg = serde_json::json!({
-                                    "execution_id": execution_id,
+                                    "execution_id": execution_id.clone(),
                                     "market": "BTC 5m Engine",
                                     "market_id": target_market.market_id.clone(),
                                     "side": "ENTRY",
-                                    "price": best_price,
+                                    "price": executed_entry_price,
                                     "size": size,
                                     "timestamp": now_ms,
                                     "mode": "PAPER",
                                     "details": {
                                         "strategy": self.strategy_id(),
                                         "side": side_label,
+                                        "entry_style": if maker_active { "MAKER" } else { "TAKER" },
+                                        "order_type": if maker_active { "GTC" } else { "FOK" },
                                         "token_id": best_token.clone(),
                                         "condition_id": target_market.market_id.clone(),
                                         "spot": spot,
                                         "window_start_spot": window_start_spot,
                                         "fair_yes": fair_yes,
-                                        "expected_net_return": best_net_expected,
+                                        "expected_net_return": effective_best_net_expected,
                                         "kelly_fraction": kelly,
+                                        "kelly_entry_cost_bps": best_entry_cost_rate * 10_000.0,
                                         "kelly_scale": kelly_scale,
                                         "edge_scale": edge_scale,
                                         "edge_strength_ratio": edge_strength_ratio,
@@ -2895,13 +3705,47 @@ impl Strategy for Btc5mLagStrategy {
                                         "sigma_iv_fresh": iv_is_fresh,
                                         "sigma_iv_age_ms": iv_age_ms,
                                         "ml_features_age_ms": ml_age_ms.unwrap_or(-1),
+                                        "maker_fill_probability": maker_sample.fill_probability,
+                                        "maker_adverse_bps": maker_sample.adverse_bps,
                                         "seasonality_multiplier": seasonality,
                                         "sigma_annualized": sigma,
                                         "seconds_to_expiry": remaining_seconds,
-                                        "slug": target_market.slug,
+                                        "slug": target_market.slug.clone(),
                                     }
                                 });
                                 publish_execution_event(&mut conn, exec_msg).await;
+                                let decision = await_execution_decision(&mut conn, &execution_id).await;
+                                if decision != ExecutionDecision::Accepted {
+                                    warn!(
+                                        "[BTC_5M] Entry blocked by backend decision {:?} execution_id={}",
+                                        decision, execution_id
+                                    );
+                                    publish_heartbeat(&mut conn, self.heartbeat_id()).await;
+                                    continue;
+                                }
+
+                                if !reserve_sim_notional_for_strategy(&mut conn, self.strategy_id(), size).await {
+                                    publish_heartbeat(&mut conn, self.heartbeat_id()).await;
+                                    continue;
+                                }
+
+                                let pos = Position {
+                                    execution_id: execution_id.clone(),
+                                    side: best_side,
+                                    entry_price: executed_entry_price,
+                                    notional_usd: size,
+                                    entry_ts_ms: now_ms,
+                                    window_start_spot,
+                                    window_start_ts,
+                                    expiry_ts,
+                                    token_id: best_token.clone(),
+                                    condition_id: target_market.market_id.clone(),
+                                    fair_yes,
+                                    sigma,
+                                    slug: target_market.slug.clone(),
+                                };
+                                persist_open_position(&mut conn, self.strategy_id(), &pos).await;
+                                open_position = Some(pos);
                             }
                         }
 

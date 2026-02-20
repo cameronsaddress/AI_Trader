@@ -29,7 +29,9 @@ use crate::strategies::control::{
     TradingMode,
 };
 use crate::strategies::market_data::{update_books_from_market_ws, BinaryBook, TokenBinding};
-use crate::strategies::simulation::{polymarket_taker_fee, SimCostModel};
+use crate::strategies::simulation::{
+    estimate_maker_fill_probability, polymarket_taker_fee, simulate_maker_entry_fill, SimCostModel,
+};
 use crate::strategies::Strategy;
 
 const BOOK_STALE_MS: i64 = 2_000;
@@ -46,6 +48,8 @@ const MAX_PARITY_DEVIATION: f64 = 0.03;
 const TAKE_PROFIT_PCT: f64 = 0.012;
 const STOP_LOSS_PCT: f64 = -0.020;
 const MAX_HOLD_MS: i64 = 120_000;
+const FORCE_STALE_CLOSE_MS: i64 = 10_000;
+const STALE_FORCE_SLIPPAGE_BPS: f64 = 10.0;
 const STRATEGY_ID: &str = "AS_MARKET_MAKER";
 
 fn gamma() -> f64 {
@@ -316,7 +320,7 @@ impl Strategy for AsMarketMakerStrategy {
                                     Some(b) => b,
                                     None => { keep.push(pos); continue; }
                                 };
-                                if now_ms - book.last_update_ms > BOOK_STALE_MS { keep.push(pos); continue; }
+                                let book_age_ms = now_ms.saturating_sub(book.last_update_ms);
                                 let mid = match pos.side {
                                     Side::Yes => {
                                         if book.yes.best_bid > 0.0 { book.yes.best_bid } else { book.yes.mid() }
@@ -325,13 +329,28 @@ impl Strategy for AsMarketMakerStrategy {
                                         if book.no.best_bid > 0.0 { book.no.best_bid } else { book.no.mid() }
                                     }
                                 };
-                                if mid <= 0.0 { keep.push(pos); continue; }
+                                if mid <= 0.0 {
+                                    keep.push(pos);
+                                    continue;
+                                }
+                                let mut exit_price = mid;
+                                let mut reason: Option<&str> = None;
+                                if book_age_ms > FORCE_STALE_CLOSE_MS {
+                                    // Harden stale-book behavior: force-close if data is stale too long.
+                                    exit_price = (mid * (1.0 - (STALE_FORCE_SLIPPAGE_BPS / 10_000.0))).clamp(0.001, 0.999);
+                                    reason = Some("STALE_FORCE_CLOSE");
+                                } else if book_age_ms > BOOK_STALE_MS {
+                                    keep.push(pos);
+                                    continue;
+                                }
                                 let age = now_ms - pos.timestamp_ms;
-                                let gross = (mid / pos.entry_price) - 1.0;
-                                let reason = if gross >= TAKE_PROFIT_PCT { Some("TP") }
-                                    else if gross <= STOP_LOSS_PCT { Some("SL") }
-                                    else if age >= MAX_HOLD_MS { Some("TIMEOUT") }
-                                    else { None };
+                                let gross = (exit_price / pos.entry_price) - 1.0;
+                                if reason.is_none() {
+                                    reason = if gross >= TAKE_PROFIT_PCT { Some("TP") }
+                                        else if gross <= STOP_LOSS_PCT { Some("SL") }
+                                        else if age >= MAX_HOLD_MS { Some("TIMEOUT") }
+                                        else { None };
+                                }
                                 if let Some(r) = reason {
                                     let cost = cost_model.round_trip_cost_rate();
                                     let net = gross - cost;
@@ -360,7 +379,7 @@ impl Strategy for AsMarketMakerStrategy {
                                             "question": pos.question,
                                             "side": match pos.side { Side::Yes => "YES", Side::No => "NO" },
                                             "entry": pos.entry_price,
-                                            "exit": mid,
+                                            "exit": exit_price,
                                             "gross_return": gross,
                                             "net_return": net,
                                             "round_trip_cost_rate": cost,
@@ -373,7 +392,7 @@ impl Strategy for AsMarketMakerStrategy {
                                         "execution_id": pos.execution_id,
                                         "market": "AS Market Maker",
                                         "side": "EXIT",
-                                        "price": mid,
+                                        "price": exit_price,
                                         "size": pos.size,
                                         "timestamp": now_ms,
                                         "mode": format!("{:?}", mode),
@@ -384,7 +403,7 @@ impl Strategy for AsMarketMakerStrategy {
                                             "question": pos.question,
                                             "token_side": match pos.side { Side::Yes => "YES", Side::No => "NO" },
                                             "entry_price": pos.entry_price,
-                                            "exit_price": mid,
+                                            "exit_price": exit_price,
                                             "pnl": pnl,
                                             "gross_return": gross,
                                             "net_return": net,
@@ -417,7 +436,10 @@ impl Strategy for AsMarketMakerStrategy {
                             let parity = (ym + nm - 1.0).abs();
                             if parity > MAX_PARITY_DEVIATION { continue; }
                             let exp = match market.expiry_ts { Some(t) => t, None => continue };
-                            let ste = exp - now_ms / 1000;
+                            let ste = exp
+                                .saturating_mul(1_000)
+                                .saturating_sub(now_ms)
+                                / 1_000;
                             if ste < min_tte_secs { continue; }
                             let tte = ste as f64 / (365.25 * 24.0 * 3600.0);
 
@@ -507,6 +529,11 @@ impl Strategy for AsMarketMakerStrategy {
                                 let sz = compute_strategy_bet_size(&mut conn, STRATEGY_ID, cash, &cfg, 1.0, 0.15)
                                     .await
                                     .min(max_position_notional());
+                                let modeled_fill_probability = estimate_maker_fill_probability(
+                                    hs * 2.0,
+                                    book_age_ms,
+                                    ne,
+                                );
                                 if sz >= 1.0 && mode == TradingMode::Live {
                                     let eid = Uuid::new_v4().to_string();
                                     let sl = match side { Side::Yes => "YES", Side::No => "NO" };
@@ -531,6 +558,7 @@ impl Strategy for AsMarketMakerStrategy {
                                             "sigma": sigma,
                                             "tte_years": tte,
                                             "book_age_ms": book_age_ms,
+                                            "modeled_fill_probability": modeled_fill_probability,
                                             "maker_intent": true,
                                             "variant": variant,
                                             "preflight": {
@@ -553,38 +581,87 @@ impl Strategy for AsMarketMakerStrategy {
                                     });
                                     publish_execution_event(&mut conn, preview_msg).await;
                                     last_entry_ts = now_ms;
-                                } else if sz >= 1.0 && reserve_sim_notional_for_strategy(&mut conn, STRATEGY_ID, sz).await {
-                                    let eid = Uuid::new_v4().to_string();
-                                    let sl = match side { Side::Yes => "YES", Side::No => "NO" };
-                                    positions.push(Position {
-                                        execution_id: eid.clone(), market_id: mid.clone(),
-                                        question: market.question.clone(), side, entry_price: ep,
-                                        size: sz, timestamp_ms: now_ms,
-                                    });
-                                    last_entry_ts = now_ms;
-                                    info!("[AS_MM] ENTRY {} {} @ {:.2}c edge={:.1}bp", market.question, sl, ep*100.0, ne*1e4);
-                                    let exec_msg = serde_json::json!({
-                                        "execution_id": eid,
-                                        "market": "AS Market Maker",
-                                        "side": "ENTRY",
-                                        "price": ep,
-                                        "size": sz,
-                                        "timestamp": now_ms,
-                                        "mode": format!("{:?}", mode),
-                                        "details": {
-                                            "condition_id": mid,
-                                            "question": market.question,
-                                            "token_side": sl,
-                                            "net_edge_bps": ne*1e4,
-                                            "reservation_price": res,
-                                            "half_spread": hs,
-                                            "sigma": sigma,
-                                            "tte_years": tte,
-                                            "book_age_ms": book_age_ms,
-                                            "variant": variant,
-                                        }
-                                    });
-                                    publish_execution_event(&mut conn, exec_msg).await;
+                                } else if sz >= 1.0 {
+                                    let fill_outcome = simulate_maker_entry_fill(
+                                        ep,
+                                        hs * 2.0,
+                                        book_age_ms,
+                                        ne,
+                                        cost_model,
+                                        rand::random::<f64>(),
+                                    );
+                                    if !fill_outcome.filled {
+                                        last_entry_ts = now_ms;
+                                        let miss_msg = serde_json::json!({
+                                            "execution_id": Uuid::new_v4().to_string(),
+                                            "market": "AS Market Maker",
+                                            "side": "ENTRY_MISS",
+                                            "price": ep,
+                                            "size": sz,
+                                            "timestamp": now_ms,
+                                            "mode": format!("{:?}", mode),
+                                            "details": {
+                                                "condition_id": mid,
+                                                "question": market.question,
+                                                "token_side": match side { Side::Yes => "YES", Side::No => "NO" },
+                                                "net_edge_bps": ne*1e4,
+                                                "reservation_price": res,
+                                                "half_spread": hs,
+                                                "sigma": sigma,
+                                                "tte_years": tte,
+                                                "book_age_ms": book_age_ms,
+                                                "modeled_fill_probability": fill_outcome.fill_probability,
+                                                "fill_model": "MAKER_QUEUE_SIM",
+                                                "reason": "NO_PASSIVE_FILL",
+                                                "variant": variant,
+                                            }
+                                        });
+                                        publish_execution_event(&mut conn, miss_msg).await;
+                                    } else if reserve_sim_notional_for_strategy(&mut conn, STRATEGY_ID, sz).await {
+                                        let eid = Uuid::new_v4().to_string();
+                                        let sl = match side { Side::Yes => "YES", Side::No => "NO" };
+                                        let filled_entry_price = fill_outcome.execution_price;
+                                        positions.push(Position {
+                                            execution_id: eid.clone(), market_id: mid.clone(),
+                                            question: market.question.clone(), side, entry_price: filled_entry_price,
+                                            size: sz, timestamp_ms: now_ms,
+                                        });
+                                        last_entry_ts = now_ms;
+                                        info!(
+                                            "[AS_MM] ENTRY {} {} @ {:.2}c edge={:.1}bp fill_p={:.2}",
+                                            market.question,
+                                            sl,
+                                            filled_entry_price * 100.0,
+                                            ne * 1e4,
+                                            fill_outcome.fill_probability,
+                                        );
+                                        let exec_msg = serde_json::json!({
+                                            "execution_id": eid,
+                                            "market": "AS Market Maker",
+                                            "side": "ENTRY",
+                                            "price": filled_entry_price,
+                                            "size": sz,
+                                            "timestamp": now_ms,
+                                            "mode": format!("{:?}", mode),
+                                            "details": {
+                                                "condition_id": mid,
+                                                "question": market.question,
+                                                "token_side": sl,
+                                                "net_edge_bps": ne*1e4,
+                                                "reservation_price": res,
+                                                "half_spread": hs,
+                                                "sigma": sigma,
+                                                "tte_years": tte,
+                                                "book_age_ms": book_age_ms,
+                                                "modeled_fill_probability": fill_outcome.fill_probability,
+                                                "modeled_adverse_bps": fill_outcome.adverse_bps,
+                                                "quoted_entry_price": ep,
+                                                "fill_model": "MAKER_QUEUE_SIM",
+                                                "variant": variant,
+                                            }
+                                        });
+                                        publish_execution_event(&mut conn, exec_msg).await;
+                                    }
                                 }
                             }
                         }

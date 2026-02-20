@@ -459,7 +459,29 @@ Important files and logs:
 - Model report: `reports/models/signal_model_report.json`
 - Model artifact: `reports/models/signal_model_latest.json`
 
-## 17. Opportunities Not Yet Fully Leveraged
+## 17. Redis Backup Operations
+
+Redis snapshots are handled by the `redis-backup` compose sidecar (`ops` profile).
+
+One-shot snapshot:
+
+```bash
+docker compose -f infrastructure/docker-compose.yml --profile ops run --rm redis-backup \
+  /bin/sh -lc "apk add --no-cache bash redis aws-cli >/dev/null && /usr/local/bin/redis_backup.sh"
+```
+
+Continuous snapshots:
+
+```bash
+docker compose -f infrastructure/docker-compose.yml --profile ops up -d redis-backup
+```
+
+Host invocation note:
+
+- `scripts/redis_backup.sh` now detects missing local `redis-cli` and automatically falls back to the sidecar command above when Docker Compose is available.
+- Host/sidecar runs authenticate via `REDIS_PASSWORD` + `REDIS_HOST`/`REDIS_PORT` (not URI auth), so passwords with special URL characters are handled safely.
+
+## 18. Opportunities Not Yet Fully Leveraged
 
 High-value additions still available:
 
